@@ -308,9 +308,14 @@ class DisplacementNet(tf.keras.Model):
             zb = tf.repeat(z, repeats=N, axis=0)
         else:
             zb = z  # assume B==N
+        zb = tf.cast(zb, tf.float32)
 
         # positional encoding
-        x_feat = self.pe(x)  # (N, pe_dim)
+        # Positional encoding can inherit a mixed policy dtype (float16) from
+        # the caller even though the dense trunk expects float32.  Always cast
+        # the encoded features back to float32 before concatenation to avoid
+        # dtype mismatches when `zb` stays in float32.
+        x_feat = tf.cast(self.pe(x), tf.float32)  # (N, pe_dim)
         h = tf.concat([x_feat, zb], axis=-1)
 
         # trunk with residual skips from input h0
