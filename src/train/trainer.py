@@ -421,7 +421,11 @@ class Trainer:
             if cfg.mixed_precision:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
             self.model = create_displacement_model(cfg.model_cfg)
-            self.optimizer = tf.keras.optimizers.Adam(cfg.lr)
+            base_optimizer = tf.keras.optimizers.Adam(cfg.lr)
+            if cfg.mixed_precision:
+                base_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
+                print("[trainer] 已启用 LossScaleOptimizer 以配合混合精度训练。")
+            self.optimizer = base_optimizer
             pb.update(1)
 
             # 8) checkpoint
@@ -455,11 +459,20 @@ class Trainer:
         with tf.GradientTape() as tape:
             Pi, parts, stats = total.energy(self.model.u_fn, params={"P": P_tf})
             loss = Pi
+
         vars_ = self.model.encoder.trainable_variables + self.model.field.trainable_variables
-        grads = tape.gradient(loss, vars_)
+
+        if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+            scaled_loss = self.optimizer.get_scaled_loss(loss)
+            scaled_grads = tape.gradient(scaled_loss, vars_)
+            grads = self.optimizer.get_unscaled_gradients(scaled_grads)
+        else:
+            grads = tape.gradient(loss, vars_)
+
         if self.cfg.grad_clip_norm:
             grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
-        self.optimizer.apply_gradients(zip(grads, vars_))
+        grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
+        self.optimizer.apply_gradients(grads_and_vars)
         return Pi, parts, stats
 
     # ----------------- 训练 -----------------
