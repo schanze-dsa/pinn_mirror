@@ -519,8 +519,12 @@ class Trainer:
         if self.cfg.grad_clip_norm:
             grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
         grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
+        grad_norm = tf.constant(0.0, dtype=tf.float32)
+        if grads_and_vars:
+            grad_tensors = [g for g, _ in grads_and_vars]
+            grad_norm = tf.linalg.global_norm(grad_tensors)
         self.optimizer.apply_gradients(grads_and_vars)
-        return Pi, parts, stats
+        return Pi, parts, stats, grad_norm
 
     # ----------------- 训练 -----------------
     def run(self):
