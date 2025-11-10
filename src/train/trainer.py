@@ -108,6 +108,10 @@ class TrainerConfig:
     # 预紧力范围（N）
     preload_min: float = 200.0
     preload_max: float = 1000.0
+    preload_sequence: List[List[float]] = field(default_factory=list)
+    preload_sequence_repeat: int = 1
+    preload_sequence_shuffle: bool = False
+    preload_sequence_jitter: float = 0.0
 
     # 物理项/模型配置
     model_cfg: ModelConfig = field(default_factory=ModelConfig)
@@ -149,6 +153,9 @@ class TrainerConfig:
     viz_units: str = "mm"
     viz_draw_wireframe: bool = False
     viz_write_data: bool = True             # export displacement samples next to figure
+    viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
+    viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
+    viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
     save_best_on: str = "Pi"   # or "E_int"
 
 
@@ -164,6 +171,48 @@ class Trainer:
         self._pi_baseline: Optional[float] = None
         self._pi_ema: Optional[float] = None
         self._prev_pi: Optional[float] = None
+        self._preload_sequence: List[np.ndarray] = []
+        self._preload_sequence_index: int = 0
+        self._preload_sequence_hold: int = 0
+        self._preload_current_target: Optional[np.ndarray] = None
+
+        if cfg.preload_sequence:
+            sanitized: List[np.ndarray] = []
+            for idx, entry in enumerate(cfg.preload_sequence):
+                try:
+                    arr = np.array(entry, dtype=np.float32).reshape(-1)
+                except Exception:
+                    print(
+                        f"[preload] 忽略 preload_sequence[{idx}]，无法解析为浮点数组：{entry}"
+                    )
+                    continue
+                if arr.size == 0:
+                    print(f"[preload] 忽略 preload_sequence[{idx}]，未提供数值。")
+                    continue
+                if arr.size == 1:
+                    arr = np.repeat(arr, 3)
+                if arr.size != 3:
+                    print(
+                        f"[preload] 忽略 preload_sequence[{idx}]，需要 3 个数值，实际 {arr.size} 个。"
+                    )
+                    continue
+                sanitized.append(arr.astype(np.float32))
+
+            if sanitized:
+                if cfg.preload_sequence_shuffle:
+                    perm = np.random.permutation(len(sanitized))
+                    sanitized = [sanitized[i] for i in perm]
+                self._preload_sequence = sanitized
+                self._preload_current_target = self._preload_sequence[0].copy()
+                hold = max(1, cfg.preload_sequence_repeat)
+                print(
+                    f"[preload] 已启用顺序载荷：{len(self._preload_sequence)} 组，"
+                    f"每组持续 {hold} 步。"
+                )
+                if cfg.preload_sequence_jitter > 0:
+                    print(
+                        f"[preload] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
+                    )
 
         # 显存增长
         gpus = tf.config.list_physical_devices('GPU')
@@ -363,6 +412,34 @@ class Trainer:
 
     # ----------------- 采样三螺栓预紧力 -----------------
     def _sample_P(self) -> np.ndarray:
+        if self._preload_sequence:
+            if self._preload_current_target is None:
+                self._preload_current_target = self._preload_sequence[
+                    self._preload_sequence_index
+                ].copy()
+            target = self._preload_current_target.copy()
+            jitter = float(self.cfg.preload_sequence_jitter or 0.0)
+            if jitter > 0.0:
+                noise = np.random.uniform(-jitter, jitter, size=target.shape)
+                target = target + noise.astype(np.float32)
+            lo, hi = self.cfg.preload_min, self.cfg.preload_max
+            target = np.clip(target, lo, hi)
+
+            self._preload_sequence_hold += 1
+            if self._preload_sequence_hold >= max(1, self.cfg.preload_sequence_repeat):
+                self._preload_sequence_hold = 0
+                self._preload_sequence_index = (self._preload_sequence_index + 1) % len(
+                    self._preload_sequence
+                )
+                if self._preload_sequence_index == 0 and self.cfg.preload_sequence_shuffle:
+                    perm = np.random.permutation(len(self._preload_sequence))
+                    self._preload_sequence = [self._preload_sequence[i] for i in perm]
+                self._preload_current_target = self._preload_sequence[
+                    self._preload_sequence_index
+                ].copy()
+
+            return target.astype(np.float32)
+
         lo, hi = self.cfg.preload_min, self.cfg.preload_max
         return np.random.uniform(lo, hi, size=(3,)).astype(np.float32)
 
@@ -770,89 +847,28 @@ class Trainer:
                     else:
                         should_log = step == 1 or step % self.cfg.log_every == 0
                         if should_log:
-                        try:
-                            p1, p2, p3 = [int(x) for x in P_np.tolist()]
-                            pin = float(Pi.numpy())
-                            eint = (
-                                float(parts.get("E_int", tf.constant(0.0)).numpy())
-                                if "E_int" in parts
-                                else 0.0
-                            )
-                            en = (
-                                float(parts.get("E_n", tf.constant(0.0)).numpy())
-                                if "E_n" in parts
-                                else 0.0
-                            )
-                            et = (
-                                float(parts.get("E_t", tf.constant(0.0)).numpy())
-                                if "E_t" in parts
-                                else 0.0
-                            )
-                            wpre = (
-                                float(parts.get("W_pre", tf.constant(0.0)).numpy())
-                                if "W_pre" in parts
-                                else 0.0
-                            )
-
-                            bolt_txt = ""
-                            preload_stats = None
-                            if isinstance(stats, dict):
-                                preload_stats = stats.get("preload") or stats.get("preload_stats")
-                            if isinstance(preload_stats, dict):
-                                bd = preload_stats.get("bolt_deltas") or preload_stats.get("bolt_delta")
-                                if bd is not None:
-                                    if hasattr(bd, "numpy"):
-                                        bd = bd.numpy()
-                                    try:
-                                        b1, b2, b3 = [float(x) for x in list(bd)[:3]]
-                                        bolt_txt = f" Δ=[{b1:.3e},{b2:.3e},{b3:.3e}]"
-                                    except Exception:
-                                        pass
-
-                            pen_ratio = None
-                            stick_ratio = None
-                            slip_ratio = None
-                            mean_gap = None
-                            if isinstance(stats, dict):
-                                val = stats.get("n_pen_ratio")
-                                if val is not None:
-                                    pen_ratio = float(val.numpy())
-                                val = stats.get("t_stick_ratio")
-                                if val is not None:
-                                    stick_ratio = float(val.numpy())
-                                val = stats.get("t_slip_ratio")
-                                if val is not None:
-                                    slip_ratio = float(val.numpy())
-                                val = stats.get("n_mean_gap")
-                                if val is not None:
-                                    mean_gap = float(val.numpy())
-
-                            grad_disp = f"grad={grad_val:.2e}"
-                            rel_disp = f"Πrel={rel_pi:.3f}"
-                            delta_disp = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
-                            pen_disp = f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
-                            stick_disp = f"stick={stick_ratio * 100:.1f}%" if stick_ratio is not None else "stick=--"
-                            slip_disp = f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
-                            gap_disp = f"⟨gap⟩={mean_gap:.2e}" if mean_gap is not None else "⟨gap⟩=--"
-
-                            p_train.set_postfix_str(
-                                f"P=[{p1},{p2},{p3}]N Π={pin:.3e} Eint={eint:.3e} "
-                                f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
-                                f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
+                            postfix, log_note = self._format_train_log_postfix(
+                                P_np,
+                                Pi,
+                                parts,
+                                stats,
+                                grad_val,
+                                rel_pi,
+                                rel_delta,
                             )
                             if postfix:
                                 p_train.set_postfix_str(postfix)
 
-                        metric_name = self.cfg.save_best_on.lower()
-                        metric_val = (
-                            pi_val
-                            if metric_name == "pi"
-                            else float(parts["E_int"].numpy())
-                        )
-                        if metric_val < self.best_metric:
-                            self.best_metric = metric_val
-                            self.ckpt_manager.save(checkpoint_number=step)
-                            log_note += " | 已保存"
+                            metric_name = self.cfg.save_best_on.lower()
+                            metric_val = (
+                                pi_val
+                                if metric_name == "pi"
+                                else float(parts["E_int"].numpy())
+                            )
+                            if metric_val < self.best_metric:
+                                self.best_metric = metric_val
+                                self.ckpt_manager.save(checkpoint_number=step)
+                                log_note += " | 已保存"
                     if (
                         self.cfg.log_every > 0
                         and not (step == 1 or step % self.cfg.log_every == 0)
@@ -1047,6 +1063,9 @@ class Trainer:
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
+            refine_subdivisions=self.cfg.viz_refine_subdivisions,
+            refine_max_points=self.cfg.viz_refine_max_points,
+            eval_batch_size=self.cfg.viz_eval_batch_size,
         )
 
         self.last_viz_data_path = data_path
@@ -1558,6 +1577,9 @@ class Trainer:
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
+            refine_subdivisions=self.cfg.viz_refine_subdivisions,
+            refine_max_points=self.cfg.viz_refine_max_points,
+            eval_batch_size=self.cfg.viz_eval_batch_size,
         )
 
     def _visualize_after_training(self, n_samples: int = 5):

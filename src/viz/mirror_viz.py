@@ -30,11 +30,85 @@ Author: you
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.tri import Triangulation
+
+
+def _eval_displacement_batched(u_fn, params, points: np.ndarray, batch_size: int) -> np.ndarray:
+    """Evaluate ``u_fn`` on ``points`` in batches to control memory usage."""
+
+    if points.size == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+
+    try:
+        import tensorflow as tf
+    except ImportError as exc:  # pragma: no cover - tensorflow is required upstream
+        raise RuntimeError("TensorFlow is required for evaluating the PINN model") from exc
+
+    if batch_size is None or batch_size <= 0:
+        batch_size = points.shape[0]
+
+    outputs = []
+    n = points.shape[0]
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        chunk = tf.convert_to_tensor(points[start:end], dtype=tf.float32)
+        u_chunk = u_fn(chunk, params)
+        outputs.append(np.asarray(u_chunk.numpy(), dtype=np.float64))
+    return np.concatenate(outputs, axis=0)
+
+
+def _refine_surface_samples(X3D: np.ndarray,
+                            UV: np.ndarray,
+                            tri_idx: np.ndarray,
+                            subdivisions: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Uniformly subdivide each triangle ``subdivisions`` times per edge.
+
+    Returns refined ``(X_ref, UV_ref, tri_ref)`` suitable for plotting.
+    """
+
+    m = int(max(0, subdivisions))
+    if m <= 0:
+        return X3D, UV, tri_idx
+
+    pts3d: List[np.ndarray] = []
+    pts2d: List[np.ndarray] = []
+    tris: List[List[int]] = []
+    base_idx = 0
+
+    for (i0, i1, i2) in tri_idx:
+        X0, X1, X2 = X3D[[i0, i1, i2]]
+        uv0, uv1, uv2 = UV[[i0, i1, i2]]
+        local: Dict[Tuple[int, int], int] = {}
+
+        for i in range(m + 1):
+            for j in range(m + 1 - i):
+                w1 = i / m
+                w2 = j / m
+                w0 = 1.0 - w1 - w2
+                pts3d.append(w0 * X0 + w1 * X1 + w2 * X2)
+                pts2d.append(w0 * uv0 + w1 * uv1 + w2 * uv2)
+                local[(i, j)] = base_idx
+                base_idx += 1
+
+        for i in range(m):
+            for j in range(m - i):
+                a = local[(i, j)]
+                b = local[(i + 1, j)]
+                c = local[(i, j + 1)]
+                tris.append([a, b, c])
+                if i + j < m - 1:
+                    d = local[(i + 1, j + 1)]
+                    tris.append([b, d, c])
+
+    return (
+        np.asarray(pts3d, dtype=np.float64),
+        np.asarray(pts2d, dtype=np.float64),
+        np.asarray(tris, dtype=np.int32),
+    )
 from matplotlib import colors
 
 from inp_io.inp_parser import AssemblyModel
@@ -109,7 +183,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            data_out_path: Optional[str] = "auto",
                            style: str = "smooth",
                            cmap: Optional[str] = None,
-                           draw_wireframe: bool = False):
+                           draw_wireframe: bool = False,
+                           refine_subdivisions: int = 0,
+                           refine_max_points: Optional[int] = None,
+                           eval_batch_size: int = 65_536):
     """
     Visualize deflection along the global mirror normal of the given surface.
 
@@ -134,6 +211,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            ``"turbo"`` for smooth/flat styles and
                            ``"coolwarm"`` for contour mode.
         draw_wireframe   : Whether to overlay triangle edges.
+        refine_subdivisions : Uniform barycentric subdivisions per surface triangle.
+        refine_max_points   : Optional guardrail limiting the total evaluation points.
+        eval_batch_size     : Batch size when querying ``u_fn`` for visualization.
 
     Returns:
         (fig, ax, data_path)
@@ -150,15 +230,36 @@ def plot_mirror_deflection(asm: AssemblyModel,
     UV = _project_to_plane(X3D, c, e1, e2)  # (Nu,2)
 
     # 3) Evaluate displacement and take scalar deflection along normal
-    #    NOTE: u_fn expects TF tensors; here we batch on all surface nodes.
-    import tensorflow as tf
-    Xtf = tf.convert_to_tensor(X3D, dtype=tf.float32)
-    u = u_fn(Xtf, params)                          # (Nu,3) TF
-    u_np = u.numpy().astype(np.float64)
-    d = u_np @ n  # (Nu,) scalar deflection along global mirror normal
+    u_base = _eval_displacement_batched(u_fn, params, X3D, eval_batch_size)
+    d_base = u_base @ n  # (Nu,) scalar deflection along global mirror normal
+
+    # Optional barycentric refinement for smoother visualization
+    applied_subdiv = max(0, int(refine_subdivisions or 0))
+    max_pts = None if refine_max_points is None else int(refine_max_points)
+    if applied_subdiv > 0 and max_pts is not None and max_pts > 0:
+        per_tri = (applied_subdiv + 1) * (applied_subdiv + 2) // 2
+        estimate = int(per_tri * tri_idx.shape[0])
+        while estimate > max_pts and applied_subdiv > 0:
+            applied_subdiv -= 1
+            per_tri = (applied_subdiv + 1) * (applied_subdiv + 2) // 2
+            estimate = int(per_tri * tri_idx.shape[0])
+        if applied_subdiv < max(0, int(refine_subdivisions or 0)):
+            print(
+                "[viz] refine_subdivisions clipped to",
+                applied_subdiv,
+                f"to respect max_points={max_pts}.",
+            )
+
+    if applied_subdiv > 0:
+        X_plot, UV_plot, tri_plot = _refine_surface_samples(X3D, UV, tri_idx, applied_subdiv)
+        u_plot = _eval_displacement_batched(u_fn, params, X_plot, eval_batch_size)
+        d_plot = u_plot @ n
+    else:
+        X_plot, UV_plot, tri_plot = X3D, UV, tri_idx
+        u_plot, d_plot = u_base, d_base
 
     # 4) Triangulation in 2D
-    tri = Triangulation(UV[:, 0], UV[:, 1], tri_idx)
+    tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1], tri_plot)
 
     # 5) Draw
     fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
@@ -170,18 +271,18 @@ def plot_mirror_deflection(asm: AssemblyModel,
     default_cmap = "turbo" if style_key in {"smooth", "flat"} else "coolwarm"
     cmap = cmap or default_cmap
 
-    vmax = float(np.max(np.abs(d))) + 1e-16 if symmetric else float(np.max(d))
-    vmin = -vmax if symmetric else float(np.min(d))
+    vmax = float(np.max(np.abs(d_plot))) + 1e-16 if symmetric else float(np.max(d_plot))
+    vmin = -vmax if symmetric else float(np.min(d_plot))
 
     if style_key == "contour":
         contour_kwargs = {"levels": levels, "cmap": cmap}
         if symmetric:
             contour_kwargs.update(vmin=vmin, vmax=vmax)
-        cs = ax.tricontourf(tri, d, **contour_kwargs)
+        cs = ax.tricontourf(tri, d_plot, **contour_kwargs)
     else:
         norm = colors.Normalize(vmin=vmin, vmax=vmax)
         shading = "gouraud" if style_key == "smooth" else "flat"
-        cs = ax.tripcolor(tri, d, shading=shading, cmap=cmap, norm=norm, edgecolors="none")
+        cs = ax.tripcolor(tri, d_plot, shading=shading, cmap=cmap, norm=norm, edgecolors="none")
 
     if draw_wireframe:
         ax.triplot(tri, lw=0.35, color="#444444", alpha=0.45)
@@ -228,6 +329,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
             header.append(
                 "# preload=[" + ", ".join(f"{float(p):.6f}" for p in P_values[:3]) + "] N"
             )
+        header.append(f"# refine_subdivisions_applied={applied_subdiv}")
+        header.append("# note: exported samples correspond to original FE nodes.")
         header.append(
             "# columns: node_id x y z u_x u_y u_z deflection_normal u_plane v_plane"
         )
@@ -237,8 +340,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
                 fp.write(
                     f"{int(nid):10d} "
                     f"{X3D[idx, 0]: .8f} {X3D[idx, 1]: .8f} {X3D[idx, 2]: .8f} "
-                    f"{u_np[idx, 0]: .8f} {u_np[idx, 1]: .8f} {u_np[idx, 2]: .8f} "
-                    f"{d[idx]: .8f} {UV[idx, 0]: .8f} {UV[idx, 1]: .8f}\n"
+                    f"{u_base[idx, 0]: .8f} {u_base[idx, 1]: .8f} {u_base[idx, 2]: .8f} "
+                    f"{d_base[idx]: .8f} {UV[idx, 0]: .8f} {UV[idx, 1]: .8f}\n"
                 )
 
     if out_path:
