@@ -237,6 +237,21 @@ class Trainer:
             return device.split(":")[-1]
         return device
 
+    @staticmethod
+    def _wrap_bar_text(text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+        return _wrap_white(str(text))
+
+    def _set_pbar_desc(self, pbar, text: str) -> None:
+        pbar.set_description_str(self._wrap_bar_text(text))
+
+    def _set_pbar_postfix(self, pbar, text: str) -> None:
+        if text is None:
+            pbar.set_postfix_str(text)
+            return
+        pbar.set_postfix_str(self._wrap_bar_text(text))
+
     # ----------------- 采样三螺栓预紧力 -----------------
     def _sample_P(self) -> np.ndarray:
         lo, hi = self.cfg.preload_min, self.cfg.preload_max
@@ -524,7 +539,7 @@ class Trainer:
                     step_pb_kwargs["colour"] = self.cfg.step_bar_color
                 with tqdm(**step_pb_kwargs) as p_step:
                     # 1) 接触重采样
-                    p_step.set_description_str(f"step {step}: 接触重采样")
+                    self._set_pbar_desc(p_step, f"step {step}: 接触重采样")
                     t0 = time.perf_counter()
                     contact_note = "跳过"
                     if self.contact is not None and (
@@ -550,13 +565,14 @@ class Trainer:
                             print(f"[contact] 第 {step} 步接触重采样失败：{exc}")
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("resample", elapsed))
-                    p_step.set_postfix_str(
+                    self._set_pbar_postfix(
+                        p_step,
                         f"{contact_note} | {self._format_seconds(elapsed)}"
                     )
                     p_step.update(1)
 
                     # 2) 前向 + 反传（随机采样三螺栓预紧力）
-                    p_step.set_description_str(f"step {step}: 前向/反传")
+                    self._set_pbar_desc(p_step, f"step {step}: 前向/反传")
                     t0 = time.perf_counter()
                     P_np = self._sample_P()
                     P_tf = tf.convert_to_tensor(P_np, dtype=tf.float32)
@@ -586,13 +602,14 @@ class Trainer:
                         f"Π={pi_val:.2e} {rel_txt} {d_txt} "
                         f"grad={grad_val:.2e} {ema_txt}"
                     )
-                    p_step.set_postfix_str(
+                    self._set_pbar_postfix(
+                        p_step,
                         f"{train_note} | {self._format_seconds(elapsed)} | dev={device}"
                     )
                     p_step.update(1)
 
                     # 3) ALM 更新
-                    p_step.set_description_str(f"step {step}: ALM 更新")
+                    self._set_pbar_desc(p_step, f"step {step}: ALM 更新")
                     t0 = time.perf_counter()
                     alm_note = "跳过"
                     if (
@@ -604,13 +621,14 @@ class Trainer:
                         alm_note = "已更新"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("alm", elapsed))
-                    p_step.set_postfix_str(
+                    self._set_pbar_postfix(
+                        p_step,
                         f"{alm_note} | {self._format_seconds(elapsed)}"
                     )
                     p_step.update(1)
 
                     # 4) 日志 & ckpt
-                    p_step.set_description_str(f"step {step}: 日志/检查点")
+                    self._set_pbar_desc(p_step, f"step {step}: 日志/检查点")
                     t0 = time.perf_counter()
                     log_note = "跳过"
                     if step % self.cfg.log_every == 0 or step == 1:
@@ -696,7 +714,8 @@ class Trainer:
                             log_note += " | 已保存"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("log", elapsed))
-                    p_step.set_postfix_str(
+                    self._set_pbar_postfix(
+                        p_step,
                         f"{log_note} | {self._format_seconds(elapsed)}"
                     )
                     p_step.update(1)
@@ -716,7 +735,8 @@ class Trainer:
                             f"{label_map.get(name, name)}:{t / total_spent * 100:.0f}%"
                             for name, t in self._step_stage_times
                         )
-                        p_train.set_postfix_str(
+                        self._set_pbar_postfix(
+                            p_train,
                             f"step{step}耗时 {self._format_seconds(total_spent)} ({parts_txt})"
                         )
                     self._step_stage_times.clear()
