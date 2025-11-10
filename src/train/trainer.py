@@ -519,8 +519,12 @@ class Trainer:
         if self.cfg.grad_clip_norm:
             grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
         grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
+        grad_norm = tf.constant(0.0, dtype=tf.float32)
+        if grads_and_vars:
+            grad_tensors = [g for g, _ in grads_and_vars]
+            grad_norm = tf.linalg.global_norm(grad_tensors)
         self.optimizer.apply_gradients(grads_and_vars)
-        return Pi, parts, stats
+        return Pi, parts, stats, grad_norm
 
     # ----------------- 训练 -----------------
     def run(self):
@@ -542,27 +546,41 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: 接触重采样")
                     t0 = time.perf_counter()
                     contact_note = "跳过"
-                    if self.contact is not None and (
-                        step == 1 or (
-                            self.cfg.resample_contact_every > 0
-                            and (step - 1) % self.cfg.resample_contact_every == 0
-                        )
-                    ):
-                        try:
-                            cmap = resample_contact_map(
-                                self.asm,
-                                self._cp_specs,
-                                self.cfg.n_contact_points_per_pair,
-                                base_seed=self.cfg.contact_seed,
-                                step_index=step,
+                    if self.contact is None:
+                        contact_note = "跳过 (无接触体)"
+                    else:
+                        should_resample = step == 1
+                        if not should_resample and self.cfg.resample_contact_every > 0:
+                            should_resample = (
+                                (step - 1) % self.cfg.resample_contact_every == 0
                             )
-                            self.contact.reset_for_new_batch()
-                            cat = cmap.concatenate()
-                            self.contact.build_from_cat(cat, extra_weights=None, auto_orient=True)
-                            contact_note = f"更新 {len(cmap)} 点"
-                        except Exception as exc:
-                            contact_note = "更新失败"
-                            print(f"[contact] 第 {step} 步接触重采样失败：{exc}")
+
+                        if should_resample:
+                            try:
+                                cmap = resample_contact_map(
+                                    self.asm,
+                                    self._cp_specs,
+                                    self.cfg.n_contact_points_per_pair,
+                                    base_seed=self.cfg.contact_seed,
+                                    step_index=step,
+                                )
+                                self.contact.reset_for_new_batch()
+                                cat = cmap.concatenate()
+                                self.contact.build_from_cat(
+                                    cat, extra_weights=None, auto_orient=True
+                                )
+                                contact_note = f"更新 {len(cmap)} 点"
+                            except Exception as exc:
+                                contact_note = "更新失败"
+                                print(f"[contact] 第 {step} 步接触重采样失败：{exc}")
+                        else:
+                            if self.cfg.resample_contact_every <= 0:
+                                contact_note = "跳过 (沿用首步采样)"
+                            else:
+                                remaining = self.cfg.resample_contact_every - (
+                                    (step - 1) % self.cfg.resample_contact_every
+                                )
+                                contact_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("resample", elapsed))
                     self._set_pbar_postfix(
@@ -612,13 +630,18 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: ALM 更新")
                     t0 = time.perf_counter()
                     alm_note = "跳过"
-                    if (
-                        self.contact is not None
-                        and self.cfg.alm_update_every > 0
-                        and step % self.cfg.alm_update_every == 0
-                    ):
+                    if self.contact is None:
+                        alm_note = "跳过 (无接触体)"
+                    elif self.cfg.alm_update_every <= 0:
+                        alm_note = "跳过 (已禁用)"
+                    elif step % self.cfg.alm_update_every == 0:
                         total.update_multipliers(self.model.u_fn, params={"P": P_tf})
                         alm_note = "已更新"
+                    else:
+                        remaining = self.cfg.alm_update_every - (
+                            step % self.cfg.alm_update_every
+                        )
+                        alm_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("alm", elapsed))
                     self._set_pbar_postfix(
@@ -631,7 +654,11 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: 日志/检查点")
                     t0 = time.perf_counter()
                     log_note = "跳过"
-                    if step % self.cfg.log_every == 0 or step == 1:
+                    if self.cfg.log_every <= 0:
+                        log_note = "跳过 (已禁用)"
+                    else:
+                        should_log = step == 1 or step % self.cfg.log_every == 0
+                        if should_log:
                         try:
                             p1, p2, p3 = [int(x) for x in P_np.tolist()]
                             pin = float(Pi.numpy())
@@ -707,11 +734,21 @@ class Trainer:
                             log_note = "记录异常"
 
                         metric_name = self.cfg.save_best_on.lower()
-                        metric_val = pi_val if metric_name == "pi" else float(parts["E_int"].numpy())
+                        metric_val = (
+                            pi_val
+                            if metric_name == "pi"
+                            else float(parts["E_int"].numpy())
+                        )
                         if metric_val < self.best_metric:
                             self.best_metric = metric_val
                             self.ckpt_manager.save(checkpoint_number=step)
                             log_note += " | 已保存"
+                    if (
+                        self.cfg.log_every > 0
+                        and not (step == 1 or step % self.cfg.log_every == 0)
+                    ):
+                        remaining = self.cfg.log_every - (step % self.cfg.log_every)
+                        log_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("log", elapsed))
                     self._set_pbar_postfix(
