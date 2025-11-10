@@ -145,7 +145,17 @@ class GaussianFourierFeatures(tf.keras.layers.Layer):
 
 class MLP(tf.keras.layers.Layer):
     """Simple MLP block with configurable depth/width/activation."""
-    def __init__(self, width: int, depth: int, act: str, final_dim: Optional[int] = None, w0: float = 30.0, siren: bool = False):
+
+    def __init__(
+        self,
+        width: int,
+        depth: int,
+        act: str,
+        final_dim: Optional[int] = None,
+        w0: float = 30.0,
+        siren: bool = False,
+        dtype: tf.dtypes.DType = tf.float32,
+    ):
         super().__init__()
         self.width = width
         self.depth = depth
@@ -153,12 +163,23 @@ class MLP(tf.keras.layers.Layer):
         self.final_dim = final_dim
         self.siren = siren
         self.w0 = w0
+        self._dense_dtype = dtype
 
         self.layers_dense = []
         for i in range(depth):
-            self.layers_dense.append(tf.keras.layers.Dense(width, kernel_initializer=self._kernel_init(i)))
+            self.layers_dense.append(
+                tf.keras.layers.Dense(
+                    width,
+                    kernel_initializer=self._kernel_init(i),
+                    dtype=self._dense_dtype,
+                )
+            )
         if final_dim is not None:
-            self.final_dense = tf.keras.layers.Dense(final_dim, kernel_initializer="glorot_uniform")
+            self.final_dense = tf.keras.layers.Dense(
+                final_dim,
+                kernel_initializer="glorot_uniform",
+                dtype=self._dense_dtype,
+            )
         else:
             self.final_dense = None
 
@@ -203,7 +224,13 @@ class ParamEncoder(tf.keras.layers.Layer):
     def __init__(self, cfg: EncoderConfig):
         super().__init__()
         self.cfg = cfg
-        self.mlp = MLP(width=cfg.width, depth=cfg.depth, act=cfg.act, final_dim=cfg.out_dim)
+        self.mlp = MLP(
+            width=cfg.width,
+            depth=cfg.depth,
+            act=cfg.act,
+            final_dim=cfg.out_dim,
+            dtype=tf.float32,
+        )
 
     def call(self, P_hat: tf.Tensor) -> tf.Tensor:
         # Ensure 2D: (B,3)
@@ -230,12 +257,23 @@ class DisplacementNet(tf.keras.Model):
 
         # main trunk
         in_dim_total = self.pe.out_dim + cfg.cond_dim
-        self.in_linear = tf.keras.layers.Dense(cfg.width, kernel_initializer="he_uniform")
+        self.in_linear = tf.keras.layers.Dense(
+            cfg.width,
+            kernel_initializer="he_uniform",
+        )
         self.blocks = []
         for _ in range(cfg.depth):
-            self.blocks.append(tf.keras.layers.Dense(cfg.width, kernel_initializer="he_uniform"))
+            self.blocks.append(
+                tf.keras.layers.Dense(
+                    cfg.width,
+                    kernel_initializer="he_uniform",
+                )
+            )
         self.act = _get_activation(cfg.act)
-        self.out_linear = tf.keras.layers.Dense(cfg.out_dim, kernel_initializer="glorot_uniform")
+        self.out_linear = tf.keras.layers.Dense(
+            cfg.out_dim,
+            kernel_initializer="glorot_uniform",
+        )
 
         self.residual_skips = set(cfg.residual_skips)
         self.w0 = cfg.w0
@@ -247,9 +285,18 @@ class DisplacementNet(tf.keras.Model):
         Returns:
             u: (N,3)
         """
+        # Determine the compute dtype dictated by mixed-precision policy.
+        target_dtype = tf.as_dtype(self.in_linear.compute_dtype or tf.float32)
+
+        # Mixed-precision policies may feed float16 inputs. Cast incoming
+        # samples to the layer's compute dtype so downstream dense layers keep
+        # running in the policy's precision without extra conversions.
+        x = tf.cast(x, target_dtype)
+
         # Broadcast z to N samples
         if z.shape.rank == 1:
             z = tf.reshape(z, (1, -1))
+        z = tf.cast(z, target_dtype)
         # If B>1 and N>1, support either B==N (per-point conditioning) or B==1 (global)
         N = tf.shape(x)[0]
         B = tf.shape(z)[0]
@@ -261,9 +308,13 @@ class DisplacementNet(tf.keras.Model):
             zb = tf.repeat(z, repeats=N, axis=0)
         else:
             zb = z  # assume B==N
+        zb = tf.cast(zb, target_dtype)
 
         # positional encoding
-        x_feat = self.pe(x)  # (N, pe_dim)
+        # Positional encoding follows the same compute dtype as the trunk so
+        # concatenation remains in-policy while still supporting mixed
+        # precision execution.
+        x_feat = tf.cast(self.pe(x), target_dtype)  # (N, pe_dim)
         h = tf.concat([x_feat, zb], axis=-1)
 
         # trunk with residual skips from input h0
@@ -278,7 +329,8 @@ class DisplacementNet(tf.keras.Model):
                 hcur = hcur + h0  # simple residual skip
 
         u = self.out_linear(hcur)  # (N,3)
-        return u
+        # 在半精度策略下，强制回落到 float32，避免在物理能量项中产生 NaN
+        return tf.cast(u, tf.float32)
 
 
 # -----------------------------
