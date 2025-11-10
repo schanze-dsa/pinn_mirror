@@ -11,7 +11,6 @@ trainer.py — 主训练循环（精简日志 + 分阶段进度提示）。
 from __future__ import annotations
 import os
 import sys
-import inspect
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
@@ -421,7 +420,11 @@ class Trainer:
             if cfg.mixed_precision:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
             self.model = create_displacement_model(cfg.model_cfg)
-            self.optimizer = tf.keras.optimizers.Adam(cfg.lr)
+            base_optimizer = tf.keras.optimizers.Adam(cfg.lr)
+            if cfg.mixed_precision:
+                base_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
+                print("[trainer] 已启用 LossScaleOptimizer 以配合混合精度训练。")
+            self.optimizer = base_optimizer
             pb.update(1)
 
             # 8) checkpoint
@@ -455,11 +458,20 @@ class Trainer:
         with tf.GradientTape() as tape:
             Pi, parts, stats = total.energy(self.model.u_fn, params={"P": P_tf})
             loss = Pi
+
         vars_ = self.model.encoder.trainable_variables + self.model.field.trainable_variables
-        grads = tape.gradient(loss, vars_)
+
+        if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+            scaled_loss = self.optimizer.get_scaled_loss(loss)
+            scaled_grads = tape.gradient(scaled_loss, vars_)
+            grads = self.optimizer.get_unscaled_gradients(scaled_grads)
+        else:
+            grads = tape.gradient(loss, vars_)
+
         if self.cfg.grad_clip_norm:
             grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
-        self.optimizer.apply_gradients(zip(grads, vars_))
+        grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
+        self.optimizer.apply_gradients(grads_and_vars)
         return Pi, parts, stats
 
     # ----------------- 训练 -----------------
@@ -1168,41 +1180,18 @@ class Trainer:
 
     # ----------------- 可视化（鲁棒多签名） -----------------
     def _call_viz(self, P: np.ndarray, out_path: str, title: str):
-        params = inspect.signature(plot_mirror_deflection_by_name).parameters
-        names = set(params.keys())
-        kw = {"asm": self.asm, "u_fn": self.model.u_fn}
-
         bare = self.cfg.mirror_surface_name
-        asm_key = self.cfg.mirror_surface_asm_key or f'ASM::"{bare}"'
-        if "surf_name" in names:
-            kw["surf_name"] = bare
-        if "mirror_surface_bare_name" in names:
-            kw["mirror_surface_bare_name"] = bare
-        if "asm_key" in names:
-            kw["asm_key"] = asm_key
-        if "asm_surface_name" in names:
-            kw["asm_surface_name"] = asm_key
-        if "full_name" in names:
-            kw["full_name"] = asm_key
+        params = {"P": tf.convert_to_tensor(P.reshape(-1), dtype=tf.float32)}
 
-        if "P" in names:
-            kw["P"] = P.astype(np.float32)
-        if "preload" in names:
-            kw["preload"] = P.astype(np.float32)
-
-        if "out_path" in names:
-            kw["out_path"] = out_path
-        elif "save_path" in names:
-            kw["save_path"] = out_path
-        elif "path" in names:
-            kw["path"] = out_path
-
-        if "title" in names:
-            kw["title"] = title
-        elif "fig_title" in names:
-            kw["fig_title"] = title
-
-        return plot_mirror_deflection_by_name(**kw)
+        return plot_mirror_deflection_by_name(
+            self.asm,
+            bare,
+            self.model.u_fn,
+            params,
+            P_values=tuple(float(x) for x in P.reshape(-1)),
+            out_path=out_path,
+            title_prefix=title,
+        )
 
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
