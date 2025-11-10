@@ -142,6 +142,13 @@ class TrainerConfig:
     ckpt_dir: str = "checkpoints"
     viz_samples_after_train: int = 5
     viz_title_prefix: str = "Mirror Deflection (trained PINN)"
+    viz_style: str = "smooth"              # smooth Gouraud-shaded map by default
+    viz_colormap: str = "turbo"             # Abaqus-like rainbow palette
+    viz_levels: int = 24                    # used when style="contour"
+    viz_symmetric: bool = True              # keep color limits symmetric around 0
+    viz_units: str = "mm"
+    viz_draw_wireframe: bool = False
+    viz_write_data: bool = True             # export displacement samples next to figure
     save_best_on: str = "Pi"   # or "E_int"
 
 
@@ -210,6 +217,7 @@ class Trainer:
         self.ckpt = None
         self.ckpt_manager = None
         self.best_metric = float("inf")
+        self.last_viz_data_path: Optional[str] = None
 
         # —— 体检/调试可读
         self.X_vol = None
@@ -519,8 +527,12 @@ class Trainer:
         if self.cfg.grad_clip_norm:
             grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
         grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
+        grad_norm = tf.constant(0.0, dtype=tf.float32)
+        if grads_and_vars:
+            grad_tensors = [g for g, _ in grads_and_vars]
+            grad_norm = tf.linalg.global_norm(grad_tensors)
         self.optimizer.apply_gradients(grads_and_vars)
-        return Pi, parts, stats
+        return Pi, parts, stats, grad_norm
 
     # ----------------- 训练 -----------------
     def run(self):
@@ -542,27 +554,41 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: 接触重采样")
                     t0 = time.perf_counter()
                     contact_note = "跳过"
-                    if self.contact is not None and (
-                        step == 1 or (
-                            self.cfg.resample_contact_every > 0
-                            and (step - 1) % self.cfg.resample_contact_every == 0
-                        )
-                    ):
-                        try:
-                            cmap = resample_contact_map(
-                                self.asm,
-                                self._cp_specs,
-                                self.cfg.n_contact_points_per_pair,
-                                base_seed=self.cfg.contact_seed,
-                                step_index=step,
+                    if self.contact is None:
+                        contact_note = "跳过 (无接触体)"
+                    else:
+                        should_resample = step == 1
+                        if not should_resample and self.cfg.resample_contact_every > 0:
+                            should_resample = (
+                                (step - 1) % self.cfg.resample_contact_every == 0
                             )
-                            self.contact.reset_for_new_batch()
-                            cat = cmap.concatenate()
-                            self.contact.build_from_cat(cat, extra_weights=None, auto_orient=True)
-                            contact_note = f"更新 {len(cmap)} 点"
-                        except Exception as exc:
-                            contact_note = "更新失败"
-                            print(f"[contact] 第 {step} 步接触重采样失败：{exc}")
+
+                        if should_resample:
+                            try:
+                                cmap = resample_contact_map(
+                                    self.asm,
+                                    self._cp_specs,
+                                    self.cfg.n_contact_points_per_pair,
+                                    base_seed=self.cfg.contact_seed,
+                                    step_index=step,
+                                )
+                                self.contact.reset_for_new_batch()
+                                cat = cmap.concatenate()
+                                self.contact.build_from_cat(
+                                    cat, extra_weights=None, auto_orient=True
+                                )
+                                contact_note = f"更新 {len(cmap)} 点"
+                            except Exception as exc:
+                                contact_note = "更新失败"
+                                print(f"[contact] 第 {step} 步接触重采样失败：{exc}")
+                        else:
+                            if self.cfg.resample_contact_every <= 0:
+                                contact_note = "跳过 (沿用首步采样)"
+                            else:
+                                remaining = self.cfg.resample_contact_every - (
+                                    (step - 1) % self.cfg.resample_contact_every
+                                )
+                                contact_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("resample", elapsed))
                     self._set_pbar_postfix(
@@ -602,6 +628,8 @@ class Trainer:
                         f"Π={pi_val:.2e} {rel_txt} {d_txt} "
                         f"grad={grad_val:.2e} {ema_txt}"
                     )
+                    if step == 1:
+                        train_note += " | 首轮包含图追踪/缓存构建"
                     self._set_pbar_postfix(
                         p_step,
                         f"{train_note} | {self._format_seconds(elapsed)} | dev={device}"
@@ -612,13 +640,18 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: ALM 更新")
                     t0 = time.perf_counter()
                     alm_note = "跳过"
-                    if (
-                        self.contact is not None
-                        and self.cfg.alm_update_every > 0
-                        and step % self.cfg.alm_update_every == 0
-                    ):
+                    if self.contact is None:
+                        alm_note = "跳过 (无接触体)"
+                    elif self.cfg.alm_update_every <= 0:
+                        alm_note = "跳过 (已禁用)"
+                    elif step % self.cfg.alm_update_every == 0:
                         total.update_multipliers(self.model.u_fn, params={"P": P_tf})
                         alm_note = "已更新"
+                    else:
+                        remaining = self.cfg.alm_update_every - (
+                            step % self.cfg.alm_update_every
+                        )
+                        alm_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("alm", elapsed))
                     self._set_pbar_postfix(
@@ -631,87 +664,101 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: 日志/检查点")
                     t0 = time.perf_counter()
                     log_note = "跳过"
-                    if step % self.cfg.log_every == 0 or step == 1:
-                        try:
-                            p1, p2, p3 = [int(x) for x in P_np.tolist()]
-                            pin = float(Pi.numpy())
-                            eint = (
-                                float(parts.get("E_int", tf.constant(0.0)).numpy())
-                                if "E_int" in parts
-                                else 0.0
-                            )
-                            en = (
-                                float(parts.get("E_n", tf.constant(0.0)).numpy())
-                                if "E_n" in parts
-                                else 0.0
-                            )
-                            et = (
-                                float(parts.get("E_t", tf.constant(0.0)).numpy())
-                                if "E_t" in parts
-                                else 0.0
-                            )
-                            wpre = (
-                                float(parts.get("W_pre", tf.constant(0.0)).numpy())
-                                if "W_pre" in parts
-                                else 0.0
-                            )
+                    if self.cfg.log_every <= 0:
+                        log_note = "跳过 (已禁用)"
+                    else:
+                        should_log = step == 1 or step % self.cfg.log_every == 0
+                        if should_log:
+                            try:
+                                p1, p2, p3 = [int(x) for x in P_np.tolist()]
+                                pin = float(Pi.numpy())
+                                eint = (
+                                    float(parts.get("E_int", tf.constant(0.0)).numpy())
+                                    if "E_int" in parts
+                                    else 0.0
+                                )
+                                en = (
+                                    float(parts.get("E_n", tf.constant(0.0)).numpy())
+                                    if "E_n" in parts
+                                    else 0.0
+                                )
+                                et = (
+                                    float(parts.get("E_t", tf.constant(0.0)).numpy())
+                                    if "E_t" in parts
+                                    else 0.0
+                                )
+                                wpre = (
+                                    float(parts.get("W_pre", tf.constant(0.0)).numpy())
+                                    if "W_pre" in parts
+                                    else 0.0
+                                )
 
-                            bolt_txt = ""
-                            preload_stats = None
-                            if isinstance(stats, dict):
-                                preload_stats = stats.get("preload") or stats.get("preload_stats")
-                            if isinstance(preload_stats, dict):
-                                bd = preload_stats.get("bolt_deltas") or preload_stats.get("bolt_delta")
-                                if bd is not None:
-                                    if hasattr(bd, "numpy"):
-                                        bd = bd.numpy()
-                                    try:
-                                        b1, b2, b3 = [float(x) for x in list(bd)[:3]]
-                                        bolt_txt = f" Δ=[{b1:.3e},{b2:.3e},{b3:.3e}]"
-                                    except Exception:
-                                        pass
+                                bolt_txt = ""
+                                preload_stats = None
+                                if isinstance(stats, dict):
+                                    preload_stats = stats.get("preload") or stats.get("preload_stats")
+                                if isinstance(preload_stats, dict):
+                                    bd = preload_stats.get("bolt_deltas") or preload_stats.get("bolt_delta")
+                                    if bd is not None:
+                                        if hasattr(bd, "numpy"):
+                                            bd = bd.numpy()
+                                        try:
+                                            b1, b2, b3 = [float(x) for x in list(bd)[:3]]
+                                            bolt_txt = f" Δ=[{b1:.3e},{b2:.3e},{b3:.3e}]"
+                                        except Exception:
+                                            pass
 
-                            pen_ratio = None
-                            stick_ratio = None
-                            slip_ratio = None
-                            mean_gap = None
-                            if isinstance(stats, dict):
-                                val = stats.get("n_pen_ratio")
-                                if val is not None:
-                                    pen_ratio = float(val.numpy())
-                                val = stats.get("t_stick_ratio")
-                                if val is not None:
-                                    stick_ratio = float(val.numpy())
-                                val = stats.get("t_slip_ratio")
-                                if val is not None:
-                                    slip_ratio = float(val.numpy())
-                                val = stats.get("n_mean_gap")
-                                if val is not None:
-                                    mean_gap = float(val.numpy())
+                                pen_ratio = None
+                                stick_ratio = None
+                                slip_ratio = None
+                                mean_gap = None
+                                if isinstance(stats, dict):
+                                    val = stats.get("n_pen_ratio")
+                                    if val is not None:
+                                        pen_ratio = float(val.numpy())
+                                    val = stats.get("t_stick_ratio")
+                                    if val is not None:
+                                        stick_ratio = float(val.numpy())
+                                    val = stats.get("t_slip_ratio")
+                                    if val is not None:
+                                        slip_ratio = float(val.numpy())
+                                    val = stats.get("n_mean_gap")
+                                    if val is not None:
+                                        mean_gap = float(val.numpy())
 
-                            grad_disp = f"grad={grad_val:.2e}"
-                            rel_disp = f"Πrel={rel_pi:.3f}"
-                            delta_disp = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
-                            pen_disp = f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
-                            stick_disp = f"stick={stick_ratio * 100:.1f}%" if stick_ratio is not None else "stick=--"
-                            slip_disp = f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
-                            gap_disp = f"⟨gap⟩={mean_gap:.2e}" if mean_gap is not None else "⟨gap⟩=--"
+                                grad_disp = f"grad={grad_val:.2e}"
+                                rel_disp = f"Πrel={rel_pi:.3f}"
+                                delta_disp = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
+                                pen_disp = f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
+                                stick_disp = f"stick={stick_ratio * 100:.1f}%" if stick_ratio is not None else "stick=--"
+                                slip_disp = f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
+                                gap_disp = f"⟨gap⟩={mean_gap:.2e}" if mean_gap is not None else "⟨gap⟩=--"
 
-                            p_train.set_postfix_str(
-                                f"P=[{p1},{p2},{p3}]N Π={pin:.3e} Eint={eint:.3e} "
-                                f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
-                                f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
-                            )
-                            log_note = "已记录"
-                        except Exception:
-                            log_note = "记录异常"
+                                p_train.set_postfix_str(
+                                    f"P=[{p1},{p2},{p3}]N Π={pin:.3e} Eint={eint:.3e} "
+                                    f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
+                                    f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
+                                )
+                                log_note = "已记录"
+                            except Exception:
+                                log_note = "记录异常"
 
                         metric_name = self.cfg.save_best_on.lower()
-                        metric_val = pi_val if metric_name == "pi" else float(parts["E_int"].numpy())
+                        metric_val = (
+                            pi_val
+                            if metric_name == "pi"
+                            else float(parts["E_int"].numpy())
+                        )
                         if metric_val < self.best_metric:
                             self.best_metric = metric_val
                             self.ckpt_manager.save(checkpoint_number=step)
                             log_note += " | 已保存"
+                    if (
+                        self.cfg.log_every > 0
+                        and not (step == 1 or step % self.cfg.log_every == 0)
+                    ):
+                        remaining = self.cfg.log_every - (step % self.cfg.log_every)
+                        log_note = f"跳过 (距下次还有 {remaining} 步)"
                     elapsed = time.perf_counter() - t0
                     self._step_stage_times.append(("log", elapsed))
                     self._set_pbar_postfix(
@@ -735,10 +782,12 @@ class Trainer:
                             f"{label_map.get(name, name)}:{t / total_spent * 100:.0f}%"
                             for name, t in self._step_stage_times
                         )
-                        self._set_pbar_postfix(
-                            p_train,
+                        summary_note = (
                             f"step{step}耗时 {self._format_seconds(total_spent)} ({parts_txt})"
                         )
+                        if step == 1:
+                            summary_note += " | 首轮额外包括图追踪/初次缓存"
+                        self._set_pbar_postfix(p_train, summary_note)
                     self._step_stage_times.clear()
 
             # 训练结束：再存一次
@@ -831,7 +880,8 @@ class Trainer:
                                  preload: Any,
                                  out_path: Optional[str] = None,
                                  title_prefix: Optional[str] = None,
-                                 show: bool = False) -> str:
+                                 show: bool = False,
+                                 data_out_path: Optional[str] = "auto") -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -866,7 +916,22 @@ class Trainer:
                 f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
             )
 
-        plot_mirror_deflection_by_name(
+        resolved_data_path: Optional[str]
+        if data_out_path is None:
+            resolved_data_path = None
+        else:
+            key = str(data_out_path).strip().lower()
+            if key == "auto":
+                if self.cfg.viz_write_data and out_path:
+                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
+                else:
+                    resolved_data_path = None
+            elif key in {"", "none"}:
+                resolved_data_path = None
+            else:
+                resolved_data_path = data_out_path
+
+        _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
             self.model.u_fn,
@@ -874,9 +939,19 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
             show=show,
+            data_out_path=resolved_data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
+        self.last_viz_data_path = data_path
+        if data_path:
+            print(f"[viz] displacement data -> {data_path}")
         print(f"[viz] saved -> {out_path}")
         return out_path
 
@@ -965,7 +1040,8 @@ class Trainer:
                                  preload: Any,
                                  out_path: Optional[str] = None,
                                  title_prefix: Optional[str] = None,
-                                 show: bool = False) -> str:
+                                 show: bool = False,
+                                 data_out_path: Optional[str] = "auto") -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -1000,7 +1076,22 @@ class Trainer:
                 f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
             )
 
-        plot_mirror_deflection_by_name(
+        resolved_data_path: Optional[str]
+        if data_out_path is None:
+            resolved_data_path = None
+        else:
+            key = str(data_out_path).strip().lower()
+            if key == "auto":
+                if self.cfg.viz_write_data and out_path:
+                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
+                else:
+                    resolved_data_path = None
+            elif key in {"", "none"}:
+                resolved_data_path = None
+            else:
+                resolved_data_path = data_out_path
+
+        _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
             self.model.u_fn,
@@ -1008,9 +1099,19 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
             show=show,
+            data_out_path=resolved_data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
+        self.last_viz_data_path = data_path
+        if data_path:
+            print(f"[viz] displacement data -> {data_path}")
         print(f"[viz] saved -> {out_path}")
         return out_path
 
@@ -1099,7 +1200,8 @@ class Trainer:
                                  preload: Any,
                                  out_path: Optional[str] = None,
                                  title_prefix: Optional[str] = None,
-                                 show: bool = False) -> str:
+                                 show: bool = False,
+                                 data_out_path: Optional[str] = "auto") -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -1134,7 +1236,22 @@ class Trainer:
                 f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
             )
 
-        plot_mirror_deflection_by_name(
+        resolved_data_path: Optional[str]
+        if data_out_path is None:
+            resolved_data_path = None
+        else:
+            key = str(data_out_path).strip().lower()
+            if key == "auto":
+                if self.cfg.viz_write_data and out_path:
+                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
+                else:
+                    resolved_data_path = None
+            elif key in {"", "none"}:
+                resolved_data_path = None
+            else:
+                resolved_data_path = data_out_path
+
+        _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
             self.model.u_fn,
@@ -1142,9 +1259,19 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
             show=show,
+            data_out_path=resolved_data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
+        self.last_viz_data_path = data_path
+        if data_path:
+            print(f"[viz] displacement data -> {data_path}")
         print(f"[viz] saved -> {out_path}")
         return out_path
 
@@ -1233,7 +1360,8 @@ class Trainer:
                                  preload: Any,
                                  out_path: Optional[str] = None,
                                  title_prefix: Optional[str] = None,
-                                 show: bool = False) -> str:
+                                 show: bool = False,
+                                 data_out_path: Optional[str] = "auto") -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -1268,7 +1396,22 @@ class Trainer:
                 f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
             )
 
-        plot_mirror_deflection_by_name(
+        resolved_data_path: Optional[str]
+        if data_out_path is None:
+            resolved_data_path = None
+        else:
+            key = str(data_out_path).strip().lower()
+            if key == "auto":
+                if self.cfg.viz_write_data and out_path:
+                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
+                else:
+                    resolved_data_path = None
+            elif key in {"", "none"}:
+                resolved_data_path = None
+            else:
+                resolved_data_path = data_out_path
+
+        _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
             self.model.u_fn,
@@ -1276,9 +1419,19 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
             show=show,
+            data_out_path=resolved_data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
+        self.last_viz_data_path = data_path
+        if data_path:
+            print(f"[viz] displacement data -> {data_path}")
         print(f"[viz] saved -> {out_path}")
         return out_path
 
@@ -1286,6 +1439,9 @@ class Trainer:
     def _call_viz(self, P: np.ndarray, out_path: str, title: str):
         bare = self.cfg.mirror_surface_name
         params = {"P": tf.convert_to_tensor(P.reshape(-1), dtype=tf.float32)}
+        data_path = None
+        if self.cfg.viz_write_data and out_path:
+            data_path = os.path.splitext(out_path)[0] + ".txt"
 
         return plot_mirror_deflection_by_name(
             self.asm,
@@ -1295,6 +1451,13 @@ class Trainer:
             P_values=tuple(float(x) for x in P.reshape(-1)),
             out_path=out_path,
             title_prefix=title,
+            units=self.cfg.viz_units,
+            levels=self.cfg.viz_levels,
+            symmetric=self.cfg.viz_symmetric,
+            data_out_path=data_path,
+            style=self.cfg.viz_style,
+            cmap=self.cfg.viz_colormap,
+            draw_wireframe=self.cfg.viz_draw_wireframe,
         )
 
     def _visualize_after_training(self, n_samples: int = 5):
@@ -1307,7 +1470,7 @@ class Trainer:
             title = f"{self.cfg.viz_title_prefix}  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
             save_path = os.path.join(self.cfg.out_dir, f"deflection_{i+1:02d}.png")
             try:
-                self._call_viz(P, save_path, title)
+                _, _, data_path = self._call_viz(P, save_path, title)
                 if not os.path.exists(save_path):
                     try:
                         import matplotlib.pyplot as plt
@@ -1316,6 +1479,8 @@ class Trainer:
                     except Exception:
                         pass
                 print(f"[viz] saved -> {save_path}")
+                if data_path:
+                    print(f"[viz] displacement data -> {data_path}")
             except TypeError as e:
                 print("[viz] signature mismatch:", e)
             except Exception as e:

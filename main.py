@@ -316,6 +316,7 @@ def _run_inference(cfg,
                    preload_values,
                    ckpt_path: str = "",
                    out_path: str = "",
+                   data_out: str = "auto",
                    title_prefix: str = "",
                    show: bool = False,
                    export_saved_model: str = ""):
@@ -333,11 +334,14 @@ def _run_inference(cfg,
         out_path=out_path or None,
         title_prefix=title_prefix or None,
         show=show,
+        data_out_path=data_out,
     )
 
     print("\n✅ 推理完成！")
     print(f"   使用的检查点: {restored}")
     print(f"   生成的云图: {save_path}")
+    if trainer.last_viz_data_path:
+        print(f"   位移数据: {trainer.last_viz_data_path}")
 
 
 def main(argv=None):
@@ -347,6 +351,9 @@ def main(argv=None):
                         help="三个螺栓的预紧力，单位 N (仅在 --mode infer 时使用)")
     parser.add_argument("--ckpt", default="", help="指定要恢复的检查点路径；默认使用 checkpoints/ 下最新的")
     parser.add_argument("--out", default="", help="保存推理云图的路径；默认写入 outputs/ 目录")
+    parser.add_argument("--data", default="auto",
+                        help="云图对应的位移采样 txt 文件路径。使用 'auto' 表示与图片同名，"
+                             "使用 'none' 或空字符串表示不导出。")
     parser.add_argument("--title", default="", help="自定义云图标题前缀（默认沿用配置中的 viz_title_prefix）")
     parser.add_argument("--show", action="store_true", help="推理时显示 matplotlib 窗口")
     parser.add_argument("--export", default="", help="将模型导出为 TensorFlow SavedModel 的目录")
@@ -365,6 +372,7 @@ def main(argv=None):
             preload_values=args.preload,
             ckpt_path=args.ckpt,
             out_path=args.out,
+            data_out=args.data,
             title_prefix=args.title,
             show=args.show,
             export_saved_model=args.export,
