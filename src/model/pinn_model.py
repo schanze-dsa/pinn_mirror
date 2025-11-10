@@ -260,6 +260,7 @@ class DisplacementNet(tf.keras.Model):
         self.in_linear = tf.keras.layers.Dense(
             cfg.width,
             kernel_initializer="he_uniform",
+            dtype=tf.float32,
         )
         self.blocks = []
         for _ in range(cfg.depth):
@@ -267,12 +268,14 @@ class DisplacementNet(tf.keras.Model):
                 tf.keras.layers.Dense(
                     cfg.width,
                     kernel_initializer="he_uniform",
+                    dtype=tf.float32,
                 )
             )
         self.act = _get_activation(cfg.act)
         self.out_linear = tf.keras.layers.Dense(
             cfg.out_dim,
             kernel_initializer="glorot_uniform",
+            dtype=tf.float32,
         )
 
         self.residual_skips = set(cfg.residual_skips)
@@ -285,18 +288,15 @@ class DisplacementNet(tf.keras.Model):
         Returns:
             u: (N,3)
         """
-        # Determine the compute dtype dictated by mixed-precision policy.
-        target_dtype = tf.as_dtype(self.in_linear.compute_dtype or tf.float32)
-
-        # Mixed-precision policies may feed float16 inputs. Cast incoming
-        # samples to the layer's compute dtype so downstream dense layers keep
-        # running in the policy's precision without extra conversions.
-        x = tf.cast(x, target_dtype)
+        # Mixed-precision policies may feed float16 inputs even though the
+        # network itself operates in float32. Force the spatial samples and
+        # conditioning vectors back to float32 before further processing.
+        x = tf.cast(x, tf.float32)
 
         # Broadcast z to N samples
         if z.shape.rank == 1:
             z = tf.reshape(z, (1, -1))
-        z = tf.cast(z, target_dtype)
+        z = tf.cast(z, tf.float32)
         # If B>1 and N>1, support either B==N (per-point conditioning) or B==1 (global)
         N = tf.shape(x)[0]
         B = tf.shape(z)[0]
@@ -308,13 +308,14 @@ class DisplacementNet(tf.keras.Model):
             zb = tf.repeat(z, repeats=N, axis=0)
         else:
             zb = z  # assume B==N
-        zb = tf.cast(zb, target_dtype)
+        zb = tf.cast(zb, tf.float32)
 
         # positional encoding
-        # Positional encoding follows the same compute dtype as the trunk so
-        # concatenation remains in-policy while still supporting mixed
-        # precision execution.
-        x_feat = tf.cast(self.pe(x), target_dtype)  # (N, pe_dim)
+        # Positional encoding can inherit a mixed policy dtype (float16) from
+        # the caller even though the dense trunk expects float32.  Always cast
+        # the encoded features back to float32 before concatenation to avoid
+        # dtype mismatches when `zb` stays in float32.
+        x_feat = tf.cast(self.pe(x), tf.float32)  # (N, pe_dim)
         h = tf.concat([x_feat, zb], axis=-1)
 
         # trunk with residual skips from input h0
