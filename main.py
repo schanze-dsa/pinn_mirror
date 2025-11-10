@@ -193,16 +193,23 @@ def _prepare_config_with_autoguess():
     )
 
     # ===== 显存友好覆盖（建议先这样跑通，再逐步调回） =====
-    # 1) 模型更窄一些
-    cfg.model_cfg.width = 32                 # 64 -> 32
+    # 1) 提升模型表达能力（更宽更深的位移网络 + 更大的条件编码器）
+    cfg.model_cfg.encoder.width = 96
+    cfg.model_cfg.encoder.depth = 3
+    cfg.model_cfg.encoder.out_dim = 96
+    cfg.model_cfg.field.width = 320
+    cfg.model_cfg.field.depth = 9
+    cfg.model_cfg.field.residual_skips = (3, 6, 8)
 
     # 2) 把 Jacobian 前向+求导放在 CPU，并分块处理；关闭 pfor 降图复杂度
     cfg.elas_cfg.jac_chunk = 128             # 64/128/256 视显存调整
     cfg.elas_cfg.jac_device = "CPU"          # 关键：U+J 在 CPU，避免 GPU OOM
     cfg.elas_cfg.use_pfor = False            # 关闭 pfor
 
-    # 3) 降接触与预紧采样规模
-    cfg.n_contact_points_per_pair = min(cfg.n_contact_points_per_pair, 1500)
+    # 3) 增大接触采样密度，并将重采样频率下调为每步刷新
+    cfg.n_contact_points_per_pair = max(cfg.n_contact_points_per_pair, 6000)
+    cfg.resample_contact_every = 1
+    #    预紧端面采样仍保持较小值以兼顾显存
     cfg.preload_n_points_each = min(cfg.preload_n_points_each, 200)
 
     # 4) 混合精度（4080S 支持）
