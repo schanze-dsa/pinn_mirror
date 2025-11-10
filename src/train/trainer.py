@@ -13,7 +13,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Mapping
 
 import numpy as np
 import tensorflow as tf
@@ -259,6 +259,107 @@ class Trainer:
             pbar.set_postfix_str(text)
             return
         pbar.set_postfix_str(self._wrap_bar_text(text))
+
+    def _format_train_log_postfix(
+        self,
+        P_np: np.ndarray,
+        Pi: tf.Tensor,
+        parts: Mapping[str, tf.Tensor],
+        stats: Optional[Mapping[str, Any]],
+        grad_val: float,
+        rel_pi: float,
+        rel_delta: Optional[float],
+    ) -> Tuple[Optional[str], str]:
+        """Compose the detailed training log postfix for the outer progress bar.
+
+        Returns a tuple of ``(postfix, note)`` where ``postfix`` is the formatted
+        text (or ``None`` when formatting fails) and ``note`` summarises whether
+        logging succeeded.
+        """
+
+        try:
+            p1, p2, p3 = [int(x) for x in P_np.tolist()]
+            pin = float(Pi.numpy())
+            eint = (
+                float(parts.get("E_int", tf.constant(0.0)).numpy())
+                if "E_int" in parts
+                else 0.0
+            )
+            en = (
+                float(parts.get("E_n", tf.constant(0.0)).numpy())
+                if "E_n" in parts
+                else 0.0
+            )
+            et = (
+                float(parts.get("E_t", tf.constant(0.0)).numpy())
+                if "E_t" in parts
+                else 0.0
+            )
+            wpre = (
+                float(parts.get("W_pre", tf.constant(0.0)).numpy())
+                if "W_pre" in parts
+                else 0.0
+            )
+
+            bolt_txt = ""
+            preload_stats = None
+            if isinstance(stats, Mapping):
+                preload_stats = stats.get("preload") or stats.get("preload_stats")
+            if isinstance(preload_stats, Mapping):
+                bd = preload_stats.get("bolt_deltas") or preload_stats.get("bolt_delta")
+                if bd is not None:
+                    if hasattr(bd, "numpy"):
+                        bd = bd.numpy()
+                    try:
+                        b1, b2, b3 = [float(x) for x in list(bd)[:3]]
+                        bolt_txt = f" Δ=[{b1:.3e},{b2:.3e},{b3:.3e}]"
+                    except Exception:
+                        pass
+
+            pen_ratio = None
+            stick_ratio = None
+            slip_ratio = None
+            mean_gap = None
+            if isinstance(stats, Mapping):
+                val = stats.get("n_pen_ratio")
+                if val is not None:
+                    pen_ratio = float(val.numpy())
+                val = stats.get("t_stick_ratio")
+                if val is not None:
+                    stick_ratio = float(val.numpy())
+                val = stats.get("t_slip_ratio")
+                if val is not None:
+                    slip_ratio = float(val.numpy())
+                val = stats.get("n_mean_gap")
+                if val is not None:
+                    mean_gap = float(val.numpy())
+
+            grad_disp = f"grad={grad_val:.2e}"
+            rel_disp = f"Πrel={rel_pi:.3f}"
+            delta_disp = (
+                f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
+            )
+            pen_disp = (
+                f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
+            )
+            stick_disp = (
+                f"stick={stick_ratio * 100:.1f}%" if stick_ratio is not None else "stick=--"
+            )
+            slip_disp = (
+                f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
+            )
+            gap_disp = (
+                f"⟨gap⟩={mean_gap:.2e}" if mean_gap is not None else "⟨gap⟩=--"
+            )
+
+            postfix = (
+                f"P=[{p1},{p2},{p3}]N Π={pin:.3e} Eint={eint:.3e} "
+                f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
+                f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
+            )
+            return postfix, "已记录"
+        except Exception:
+            return None, "记录异常"
 
     # ----------------- 采样三螺栓预紧力 -----------------
     def _sample_P(self) -> np.ndarray:
@@ -739,9 +840,8 @@ class Trainer:
                                 f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
                                 f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
                             )
-                            log_note = "已记录"
-                        except Exception:
-                            log_note = "记录异常"
+                            if postfix:
+                                p_train.set_postfix_str(postfix)
 
                         metric_name = self.cfg.save_best_on.lower()
                         metric_val = (
