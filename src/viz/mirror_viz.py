@@ -11,29 +11,31 @@ Pipeline:
   3) Project surface nodes to 2D (u,v) in that plane
   4) Evaluate displacement field u(X; P) on unique surface nodes
   5) Take scalar deflection d = (u · n) along the global mirror normal
-  6) Plot tricontourf with triangles in (u,v)-space; title includes (P1,P2,P3)
+  6) Plot a smooth tripcolor (default) or tricontourf map in (u,v)-space; title includes (P1,P2,P3)
 
 Notes:
 - This module only handles visualization; it does not resample contact or modify physics.
 - Units: assumed consistent with your model; the colorbar label can be configured via `units="mm"`.
 
 Public API:
-    fig, ax = plot_mirror_deflection(
+    fig, ax, data_path = plot_mirror_deflection(
         asm, surface_key, u_fn, params, P_values=(P1,P2,P3),
         out_path="outputs/mirror_P1_...png", title_prefix="Mirror Deflection",
-        units="mm", levels=24, symmetric=True, show=False
+        units="mm", levels=24, symmetric=True, show=False,
+        data_out_path="auto", style="smooth", cmap="turbo"
     )
 
 Author: you
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.tri import Triangulation
+from matplotlib import colors
 
 from inp_io.inp_parser import AssemblyModel
 from mesh.surface_utils import TriSurface, resolve_surface_to_tris, _fetch_xyz
@@ -103,7 +105,11 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            units: str = "mm",
                            levels: int = 24,
                            symmetric: bool = True,
-                           show: bool = False):
+                           show: bool = False,
+                           data_out_path: Optional[str] = "auto",
+                           style: str = "smooth",
+                           cmap: Optional[str] = None,
+                           draw_wireframe: bool = False):
     """
     Visualize deflection along the global mirror normal of the given surface.
 
@@ -117,9 +123,20 @@ def plot_mirror_deflection(asm: AssemblyModel,
         levels           : number of contour levels
         symmetric        : if True, make color limits symmetric about 0 for diverging colormap
         show             : if True, call plt.show()
+        data_out_path    : Path to write displacement samples. If "auto" and
+                           ``out_path`` is provided, a ``.txt`` with the same
+                           stem is written. Use ``None``/"none" to disable.
+        style            : "smooth" to render a Gouraud-shaded tripcolor map
+                           (Abaqus-like), "flat" for flat shading, or
+                           "contour" to use tricontourf as in the legacy
+                           implementation.
+        cmap             : Optional matplotlib colormap name; defaults to
+                           ``"turbo"`` for smooth/flat styles and
+                           ``"coolwarm"`` for contour mode.
+        draw_wireframe   : Whether to overlay triangle edges.
 
     Returns:
-        (fig, ax)
+        (fig, ax, data_path)
     """
     # 1) Triangulate surface & collect unique nodes
     ts = resolve_surface_to_tris(asm, surface_key)
@@ -145,16 +162,29 @@ def plot_mirror_deflection(asm: AssemblyModel,
 
     # 5) Draw
     fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
-    # set symmetric levels if requested
-    if symmetric:
-        vmax = float(np.max(np.abs(d))) + 1e-16
-        vmin, vmax = -vmax, vmax
-        cs = ax.tricontourf(tri, d, levels=levels, vmin=vmin, vmax=vmax, cmap="coolwarm")
-    else:
-        cs = ax.tricontourf(tri, d, levels=levels, cmap="viridis")
 
-    # Wireframe edges (light)
-    ax.triplot(tri, lw=0.3, color="#666666", alpha=0.35)
+    style_key = (style or "smooth").strip().lower()
+    if style_key not in {"smooth", "flat", "contour"}:
+        style_key = "smooth"
+
+    default_cmap = "turbo" if style_key in {"smooth", "flat"} else "coolwarm"
+    cmap = cmap or default_cmap
+
+    vmax = float(np.max(np.abs(d))) + 1e-16 if symmetric else float(np.max(d))
+    vmin = -vmax if symmetric else float(np.min(d))
+
+    if style_key == "contour":
+        contour_kwargs = {"levels": levels, "cmap": cmap}
+        if symmetric:
+            contour_kwargs.update(vmin=vmin, vmax=vmax)
+        cs = ax.tricontourf(tri, d, **contour_kwargs)
+    else:
+        norm = colors.Normalize(vmin=vmin, vmax=vmax)
+        shading = "gouraud" if style_key == "smooth" else "flat"
+        cs = ax.tripcolor(tri, d, shading=shading, cmap=cmap, norm=norm, edgecolors="none")
+
+    if draw_wireframe:
+        ax.triplot(tri, lw=0.35, color="#444444", alpha=0.45)
 
     cbar = fig.colorbar(cs, ax=ax, shrink=0.92, pad=0.02)
     cbar.set_label(f"Deflection along normal [{units}]")
@@ -176,15 +206,50 @@ def plot_mirror_deflection(asm: AssemblyModel,
     ax.set_title(title)
 
     # Save / show
+    data_path: Optional[Path] = None
+    resolved_data = data_out_path
+    if isinstance(resolved_data, str):
+        key = resolved_data.strip().lower()
+        if key == "auto":
+            resolved_data = Path(out_path).with_suffix(".txt") if out_path else None
+        elif key in {"", "none"}:
+            resolved_data = None
+        else:
+            resolved_data = Path(resolved_data)
+
+    if isinstance(resolved_data, Path):
+        data_path = resolved_data
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        header = [
+            "# Mirror deflection samples exported by plot_mirror_deflection",
+            f"# surface={surface_key} units={units}",
+        ]
+        if P_values is not None:
+            header.append(
+                "# preload=[" + ", ".join(f"{float(p):.6f}" for p in P_values[:3]) + "] N"
+            )
+        header.append(
+            "# columns: node_id x y z u_x u_y u_z deflection_normal u_plane v_plane"
+        )
+        with data_path.open("w", encoding="utf-8") as fp:
+            fp.write("\n".join(header) + "\n")
+            for idx, nid in enumerate(nid_unique):
+                fp.write(
+                    f"{int(nid):10d} "
+                    f"{X3D[idx, 0]: .8f} {X3D[idx, 1]: .8f} {X3D[idx, 2]: .8f} "
+                    f"{u_np[idx, 0]: .8f} {u_np[idx, 1]: .8f} {u_np[idx, 2]: .8f} "
+                    f"{d[idx]: .8f} {UV[idx, 0]: .8f} {UV[idx, 1]: .8f}\n"
+                )
+
     if out_path:
-        import os
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=180)
     if show:
         plt.show()
     else:
         plt.close(fig)
-    return fig, ax
+    return fig, ax, (str(data_path) if data_path is not None else None)
 
 
 # -----------------------------
