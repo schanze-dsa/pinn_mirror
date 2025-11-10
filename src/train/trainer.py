@@ -11,7 +11,6 @@ trainer.py — 主训练循环（精简日志 + 分阶段进度提示）。
 from __future__ import annotations
 import os
 import sys
-import inspect
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
@@ -1181,41 +1180,18 @@ class Trainer:
 
     # ----------------- 可视化（鲁棒多签名） -----------------
     def _call_viz(self, P: np.ndarray, out_path: str, title: str):
-        params = inspect.signature(plot_mirror_deflection_by_name).parameters
-        names = set(params.keys())
-        kw = {"asm": self.asm, "u_fn": self.model.u_fn}
-
         bare = self.cfg.mirror_surface_name
-        asm_key = self.cfg.mirror_surface_asm_key or f'ASM::"{bare}"'
-        if "surf_name" in names:
-            kw["surf_name"] = bare
-        if "mirror_surface_bare_name" in names:
-            kw["mirror_surface_bare_name"] = bare
-        if "asm_key" in names:
-            kw["asm_key"] = asm_key
-        if "asm_surface_name" in names:
-            kw["asm_surface_name"] = asm_key
-        if "full_name" in names:
-            kw["full_name"] = asm_key
+        params = {"P": tf.convert_to_tensor(P.reshape(-1), dtype=tf.float32)}
 
-        if "P" in names:
-            kw["P"] = P.astype(np.float32)
-        if "preload" in names:
-            kw["preload"] = P.astype(np.float32)
-
-        if "out_path" in names:
-            kw["out_path"] = out_path
-        elif "save_path" in names:
-            kw["save_path"] = out_path
-        elif "path" in names:
-            kw["path"] = out_path
-
-        if "title" in names:
-            kw["title"] = title
-        elif "fig_title" in names:
-            kw["fig_title"] = title
-
-        return plot_mirror_deflection_by_name(**kw)
+        return plot_mirror_deflection_by_name(
+            self.asm,
+            bare,
+            self.model.u_fn,
+            params,
+            P_values=tuple(float(x) for x in P.reshape(-1)),
+            out_path=out_path,
+            title_prefix=title,
+        )
 
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
