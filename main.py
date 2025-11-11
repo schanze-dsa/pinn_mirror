@@ -193,23 +193,36 @@ def _prepare_config_with_autoguess():
     )
 
     # ===== 显存友好覆盖（建议先这样跑通，再逐步调回） =====
-    # 1) 模型更窄一些
-    cfg.model_cfg.width = 32                 # 64 -> 32
+    # 1) 提升模型表达能力（更宽更深的位移网络 + 更大的条件编码器）
+    cfg.model_cfg.encoder.width = 96
+    cfg.model_cfg.encoder.depth = 3
+    cfg.model_cfg.encoder.out_dim = 96
+    cfg.model_cfg.field.width = 320
+    cfg.model_cfg.field.depth = 9
+    cfg.model_cfg.field.residual_skips = (3, 6, 8)
 
     # 2) 把 Jacobian 前向+求导放在 CPU，并分块处理；关闭 pfor 降图复杂度
     cfg.elas_cfg.jac_chunk = 128             # 64/128/256 视显存调整
     cfg.elas_cfg.jac_device = "CPU"          # 关键：U+J 在 CPU，避免 GPU OOM
     cfg.elas_cfg.use_pfor = False            # 关闭 pfor
 
-    # 3) 降接触与预紧采样规模
-    cfg.n_contact_points_per_pair = min(cfg.n_contact_points_per_pair, 1500)
-    cfg.preload_n_points_each = min(cfg.preload_n_points_each, 200)
+    # 3) 增大接触采样密度，并将重采样频率下调为每步刷新
+    cfg.n_contact_points_per_pair = max(cfg.n_contact_points_per_pair, 6000)
+    cfg.resample_contact_every = 1
+    #    预紧端面采样使用高密度样本以放大不同预紧力的影响
+    cfg.preload_n_points_each = max(cfg.preload_n_points_each, 800)
 
     # 4) 混合精度（4080S 支持）
     cfg.mixed_precision = "mixed_float16"
 
-    # 5) 验证阶段可先减步数，跑通后再拉回 4000+
-    cfg.max_steps = min(cfg.max_steps, 1000)
+    # 5) 根据预紧力范围自动调整归一化（映射到约 [-1, 1]）
+    preload_lo, preload_hi = float(cfg.preload_min), float(cfg.preload_max)
+    if preload_hi <= preload_lo:
+        raise ValueError("PRELOAD_RANGE_N 的上限必须大于下限。")
+    preload_mid = 0.5 * (preload_lo + preload_hi)
+    preload_half_span = 0.5 * (preload_hi - preload_lo)
+    cfg.model_cfg.preload_shift = preload_mid
+    cfg.model_cfg.preload_scale = max(preload_half_span, 1e-3)
     # =================================================
 
     return cfg, asm
