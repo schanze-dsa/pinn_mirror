@@ -156,16 +156,15 @@ class ElasticityEnergy:
             # 导致外层对 Π 的求导拿不到关于权重的高阶梯度，训练一开始梯度就恒为 0。
             with tf.GradientTape(persistent=False) as tape:
                 tape.watch(Xc_s)
-                # u_fn 要求输入坐标（原尺度），我们提供 X = Xs * scale
                 Uc = u_fn(Xc_s * self._scale, params)    # 形状 (m,3)
                 Uc = tf.cast(Uc, tf.float32)             # 统一 float32 以便求导/后续相乘
                 if self.cfg.check_nan:
                     tf.debugging.check_numerics(Uc, "u(X) has NaN/Inf")
 
-            # 对 Xc_s 求导，再按链式法则除以 scale
+            # (m,3,3)，再按链式法则除以坐标缩放
             J_scaled = tape.batch_jacobian(
                 Uc, Xc_s, experimental_use_pfor=bool(self.cfg.use_pfor)
-            )  # (m,3,3)
+            )
             J = J_scaled / self._scale
             outs.append(J)
 

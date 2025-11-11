@@ -721,13 +721,17 @@ class Trainer:
         if not vars_:
             vars_ = self.model.encoder.trainable_variables + self.model.field.trainable_variables
 
+        use_loss_scaling = isinstance(
+            self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer
+        )
+
         with tf.GradientTape() as tape:
             if vars_:
                 tape.watch(vars_)
             Pi, parts, stats = total.energy(self.model.u_fn, params={"P": P_tf})
-            loss = Pi
+            loss = tf.cast(Pi, tf.float32)
 
-        if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+        if use_loss_scaling:
             scaled_loss = self.optimizer.get_scaled_loss(loss)
             scaled_grads = tape.gradient(scaled_loss, vars_)
             grads = self.optimizer.get_unscaled_gradients(scaled_grads)
@@ -737,12 +741,11 @@ class Trainer:
         if self.cfg.grad_clip_norm:
             grads = [tf.clip_by_norm(g, self.cfg.grad_clip_norm) if g is not None else None for g in grads]
         grads_and_vars = [(g, v) for g, v in zip(grads, vars_) if g is not None]
-        grad_norm = tf.constant(0.0, dtype=tf.float32)
-        if grads_and_vars:
-            grad_tensors = [g for g, _ in grads_and_vars]
-            grad_norm = tf.linalg.global_norm(grad_tensors)
-        else:
-            tf.print("[trainer] ⚠️ 检测到全部梯度为 None，参数未更新。请检查物理能量是否与网络输出连通。")
+        if not grads_and_vars:
+            raise RuntimeError("[trainer] 所有梯度均为 None，训练无法继续。请确认位移网络与能量项之间没有断开依赖。")
+
+        grad_tensors = [g for g, _ in grads_and_vars]
+        grad_norm = tf.linalg.global_norm(grad_tensors)
         self.optimizer.apply_gradients(grads_and_vars)
         return Pi, parts, stats, grad_norm
 
