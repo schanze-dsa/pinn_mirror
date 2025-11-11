@@ -152,7 +152,9 @@ class ElasticityEnergy:
             Xc = self.X_tf[s:e]                      # (m,3), float32
             Xc_s = Xc / self._scale                  # (m,3), float32
 
-            with tf.GradientTape(watch_accessed_variables=False, persistent=False) as tape:
+            # 不能把 watch_accessed_variables 设成 False，否则 tape 会忽略网络参数，
+            # 导致外层对 Π 的求导拿不到关于权重的高阶梯度，训练一开始梯度就恒为 0。
+            with tf.GradientTape(persistent=False) as tape:
                 tape.watch(Xc_s)
                 # u_fn 要求输入坐标（原尺度），我们提供 X = Xs * scale
                 Uc = u_fn(Xc_s * self._scale, params)    # 形状 (m,3)
