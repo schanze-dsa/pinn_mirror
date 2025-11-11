@@ -163,23 +163,10 @@ class ElasticityEnergy:
                 if self.cfg.check_nan:
                     tf.debugging.check_numerics(Uc, "u(X) has NaN/Inf")
 
-            cols = []
-            batch = tf.shape(Uc)[0]
-            for axis in range(3):
-                # 构造 (m,3) 的单位基向量场，对应雅可比的第 axis 列
-                basis = tf.broadcast_to(eye3[axis], (batch, 3))
-                grad = tape.gradient(Uc, Xc_s, output_gradients=basis)
-                if grad is None:
-                    raise RuntimeError(
-                        "[ElasticityEnergy] tape.gradient 返回 None，"
-                        "请检查位移网络与能量项的连接是否被破坏。"
-                    )
-                cols.append(grad)
-
-            del tape
-
             # (m,3,3)，再按链式法则除以坐标缩放
-            J_scaled = tf.stack(cols, axis=2)
+            J_scaled = tape.batch_jacobian(
+                Uc, Xc_s, experimental_use_pfor=bool(self.cfg.use_pfor)
+            )
             J = J_scaled / self._scale
             outs.append(J)
 
