@@ -721,14 +721,22 @@ class Trainer:
         if not vars_:
             vars_ = self.model.encoder.trainable_variables + self.model.field.trainable_variables
 
+        use_loss_scaling = isinstance(
+            self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer
+        )
+
         with tf.GradientTape() as tape:
             if vars_:
                 tape.watch(vars_)
             Pi, parts, stats = total.energy(self.model.u_fn, params={"P": P_tf})
             loss = Pi
+            if use_loss_scaling:
+                # 必须在梯度带上下文中对 loss 进行缩放，
+                # 否则 scaled_loss 与模型参数之间的依赖不会被记录，
+                # tape.gradient 会返回全 None。
+                scaled_loss = self.optimizer.get_scaled_loss(loss)
 
-        if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
-            scaled_loss = self.optimizer.get_scaled_loss(loss)
+        if use_loss_scaling:
             scaled_grads = tape.gradient(scaled_loss, vars_)
             grads = self.optimizer.get_unscaled_gradients(scaled_grads)
         else:
