@@ -230,10 +230,20 @@ class PreloadWork:
 
         P = tf.convert_to_tensor(params.get("P", [0.0, 0.0, 0.0]), dtype=tf.float32)  # (3,)
         nb = len(self._bolts)
-        # 截断/补零到 nb
-        if tf.shape(P)[0] != nb:
-            pad = tf.maximum(0, nb - tf.shape(P)[0])
-            P = tf.concat([P[:nb], tf.zeros((pad,), dtype=tf.float32)], axis=0)
+        nb_tf = tf.constant(nb, dtype=tf.int32)
+        # 截断/补零到 nb（保持在图模式下使用张量逻辑，避免 Python 布尔比较）
+        p_len = tf.shape(P)[0]
+
+        def _pad():
+            pad = nb_tf - p_len
+            zeros = tf.zeros((pad,), dtype=tf.float32)
+            return tf.concat([P, zeros], axis=0)
+
+        def _truncate():
+            return P[:nb]
+
+        P = tf.cond(p_len < nb_tf, _pad, _truncate)
+        P = P[:nb]
 
         deltas = []
         for bolt in self._bolts:
