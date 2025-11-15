@@ -67,6 +67,8 @@ class TotalConfig:
     w_bc: float = 1.0
     w_pre: float = 1.0           # multiplies the subtracted W_pre
 
+    adaptive_scheme: str = "contact_only"
+
     # ALM outer update cadence for contact (can be used by training loop)
     update_every_steps: int = 150
 
