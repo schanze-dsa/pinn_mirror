@@ -637,28 +637,33 @@ class Trainer:
         stage_count = int(len(stages))
         shift = tf.cast(self.cfg.model_cfg.preload_shift, tf.float32)
         scale = tf.cast(self.cfg.model_cfg.preload_scale, tf.float32)
+        n_bolts = int(case["P"].shape[0])
+        feat_dim = n_bolts
+        if masks is not None:
+            feat_dim += n_bolts
+        if lasts is not None:
+            feat_dim += n_bolts
+        if rank_tf is not None:
+            feat_dim += n_bolts
+
         for idx in range(stage_count):
             p_stage = tf.convert_to_tensor(stages[idx], dtype=tf.float32)
-            mask_stage = tf.convert_to_tensor(masks[idx], dtype=tf.float32)
-            last_stage = tf.convert_to_tensor(lasts[idx], dtype=tf.float32)
             norm = (p_stage - shift) / scale
-            feat_parts = [norm, mask_stage, last_stage]
+            feat_parts = [norm]
+            if masks is not None:
+                feat_parts.append(tf.convert_to_tensor(masks[idx], dtype=tf.float32))
+            if lasts is not None:
+                feat_parts.append(tf.convert_to_tensor(lasts[idx], dtype=tf.float32))
             if rank_tf is not None:
                 feat_parts.append(rank_tf)
             features = tf.concat(feat_parts, axis=0)
+            features.set_shape((feat_dim,))
             stage_entry: Dict[str, tf.Tensor] = {
                 "P": p_stage,
                 "P_hat": features,
-                "stage_index": tf.constant(idx, dtype=tf.int32),
-                "stage_mask": mask_stage,
-                "stage_last": last_stage,
-                "stage_order": order_tf,
-                "stage_count": tf.constant(stage_count, dtype=tf.int32),
             }
-            if rank_tf is not None:
-                stage_entry["stage_rank"] = rank_tf
             stage_params.append(stage_entry)
-        params["stages"] = stage_params
+        params["stages"] = tuple(stage_params)
         params["stage_order"] = order_tf
         if rank_tf is not None:
             params["stage_rank"] = rank_tf

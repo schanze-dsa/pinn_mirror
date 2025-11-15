@@ -284,6 +284,8 @@ class TotalEnergy:
                 stats_all["stage_order"] = root_params["stage_order"]
             if "stage_rank" in root_params:
                 stats_all["stage_rank"] = root_params["stage_rank"]
+            if "stage_count" in root_params:
+                stats_all["stage_count"] = root_params["stage_count"]
 
         Pi = self._combine_parts(totals)
         return Pi, totals, stats_all
