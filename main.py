@@ -9,7 +9,8 @@ One-click runner for your DFEM/PINN project (PyCharm 直接运行即可).
 - 启用 TF 显存分配器 cuda_malloc_async（需在 import TF 之前设置）
 - 自动解析 INP & 表面 key（支持精确/模糊；含 bolt2 的 ASM::"bolt2 uo"）
 - 与新版 surfaces.py / inp_parser.py 对齐（ELEMENT 表面可直接采样）
-- 训练配置集中覆盖（降显存：CPU Jacobian 分块、降低采样规模、混合精度）
+- 训练配置集中覆盖（降显存：节点前向分块、降低采样规模、混合精度）
+- 支持从 config.yaml 读取材料、螺栓、接触对与 DFEM 配置（main.py 只做兜底）
 - 训练前“预训练审计打印”（镜面/螺栓/接触/绑定/超参等一并核对）
 - 训练结束后在 outputs/ 生成随机 5 组镜面变形云图（文件名含三螺栓预紧力）
 """
@@ -23,6 +24,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")  # 可选：减少冗余日�
 import sys
 import argparse
 from dataclasses import asdict
+import yaml  # 新增：读取 config.yaml
 
 # --- 确保 "src" 在 Python 路径中 ---
 ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -30,54 +32,74 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-# ================== USER SETTINGS ==================
+CONFIG_PATH = os.path.join(ROOT, "config.yaml")
+
+# ================== USER SETTINGS（兜底默认值） ==================
+# 若 config.yaml 中提供了相应字段，则优先使用 config.yaml 的配置；
+# 下面这些只在 config.yaml 缺失或字段为空时作为默认值。
+
 # INP 文件路径（按你的实际路径）
 INP_PATH = r"D:\\shuangfan\\shuangfan.inp"
 
 # 镜面“上表面”的精确 key（避免歧义）
-MIRROR_SURFACE_NAME = 'ASM::"MIRROR up"'
+MIRROR_SURFACE_NAME_DEFAULT = 'ASM::"MIRROR up"'
 
 # 三个螺栓的上/下端面（使用你列出的精确 key；bolt2 的“上”是 ASM::"bolt2 uo"）
-BOLT_SURFACES = [
+BOLT_SURFACES_DEFAULT = [
     {"name": "bolt1", "up_key": 'ASM::"bolt1 up"',  "down_key": 'ASM::"bolt1 down"'},
     {"name": "bolt2", "up_key": 'ASM::"bolt2 uo"',  "down_key": 'ASM::"bolt2 down"'},
     {"name": "bolt3", "up_key": 'ASM::"bolt3 up"',  "down_key": 'ASM::"bolt3 down"'},
 ]
 
 # 接触对（若暂不启用可留空；确认后再填写精确 key）
-CONTACT_PAIRS = [
+CONTACT_PAIRS_DEFAULT = [
     # 示例（需要时再启用）：
     # {"slave_key": 'ASM::"bolt1 s"', "master_key": 'ASM::"MIRROR up"', "name": "b1_mirror"},
 ]
 
-# 材料库（按实际材料调整 E, ν），单位 MPa
-MATERIALS = {
+# 材料库默认值（单位 MPa，仅当 config.yaml 中无 material_properties 时使用）
+MATERIALS_DEFAULT = {
     "mirror": (70000.0, 0.33),   # 例如铝合金镜坯
     "steel":  (210000.0, 0.30),  # 螺栓钢
 }
 
-# Part → 材料（使用你 INP 的 Part 名）
-PART2MAT = {
+# Part → 材料默认映射（使用你 INP 的 Part 名）
+PART2MAT_DEFAULT = {
     "mirror1": "mirror",
     "mirror2": "mirror",
     "bolt1": "steel",
     "bolt2": "steel",
     "bolt3": "steel",
-    "auto":   "steel",  # 如非钢材，请对应修改
+    "auto":   "steel",  # 如非钢材，请对应修改（或在 config.yaml 的 part2mat 中覆盖）
 }
 
-# 训练步数与采样设置（基础值；稍后会按“降显存覆盖”调整）
-TRAIN_STEPS = 4000
-CONTACT_POINTS_PER_PAIR = 6000
-PRELOAD_FACE_POINTS_EACH = 800
+# 训练步数与采样设置默认值
+TRAIN_STEPS_DEFAULT = 4000
+CONTACT_POINTS_PER_PAIR_DEFAULT = 6000
+PRELOAD_FACE_POINTS_EACH_DEFAULT = 800
 # 三个螺栓随机预紧力范围（单位 N）
-PRELOAD_RANGE_N = (200.0, 1000.0)
+PRELOAD_RANGE_N_DEFAULT = (200.0, 1000.0)
 # ===================================================
 
 # --- 项目内模块导入 ---
 from train.trainer import TrainerConfig
 from inp_io.inp_parser import load_inp
 from mesh.contact_pairs import guess_surface_key
+
+
+# ---------- 工具：读取 config.yaml（容错） ----------
+def _load_yaml_config():
+    if not os.path.exists(CONFIG_PATH):
+        print(f"[main] 未找到 config.yaml（路径: {CONFIG_PATH}），将使用 main.py 中的默认配置。")
+        return {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        print(f"[main] 成功读取 config.yaml。")
+        return data
+    except Exception as e:
+        print(f"[main] 读取 config.yaml 失败，将退回 main.py 默认配置：{e}")
+        return {}
 
 
 # ---------- 小工具：容错匹配表面 key ----------
@@ -99,7 +121,7 @@ def _auto_resolve_surface_keys(asm, key_or_hint: str) -> str:
     if len(cands) == 1:
         return cands[0]
     elif len(cands) == 0:
-        raise KeyError(f"找不到包含 '{k}' 的表面；请在 main.py 里把名字改得更准确一些。")
+        raise KeyError(f"找不到包含 '{k}' 的表面；请在 config.yaml 或 main.py 里把名字改得更准确一些。")
     else:
         msg = "匹配到多个表面：\n  " + "\n  ".join(cands) + "\n请改成更精确的名字。"
         raise KeyError(msg)
@@ -137,58 +159,120 @@ def _count_surface_faces(asm, surface_key: str):
 
 # ---------- 读取 INP + 组装 TrainerConfig（并返回 asm 以供审计打印） ----------
 def _prepare_config_with_autoguess():
-    # 1) 载入 INP
-    if not os.path.exists(INP_PATH):
-        raise FileNotFoundError(f"未找到 INP 文件：{INP_PATH}\n请在 main.py 顶部 INP_PATH 里填对路径。")
-    asm = load_inp(INP_PATH)
+    # 0) 读取 config.yaml（若存在）
+    cfg_yaml = _load_yaml_config()
 
-    # 2) 镜面表面（已提供精确 key；若不是精确 key，这里会尝试模糊）
+    # 1) INP 路径：config.yaml 优先，其次 main.py 默认
+    inp_path = cfg_yaml.get("inp_path", INP_PATH)
+    if not os.path.exists(inp_path):
+        raise FileNotFoundError(
+            f"未找到 INP 文件：{inp_path}\n"
+            f"请在 config.yaml 的 inp_path 或 main.py 顶部 INP_PATH 里填对路径。"
+        )
+    asm = load_inp(inp_path)
+
+    # 2) 镜面表面名：允许 config.yaml 中定义 mirror_surface_name，否则使用默认值
+    mirror_surface_name = cfg_yaml.get("mirror_surface_name", MIRROR_SURFACE_NAME_DEFAULT)
     try:
-        _ = _auto_resolve_surface_keys(asm, MIRROR_SURFACE_NAME)
+        _ = _auto_resolve_surface_keys(asm, mirror_surface_name)
     except Exception as e:
         print("[main] 提示：镜面表面名自动匹配失败：", e)
         print("       继续使用你提供的名字（可视化时按该名字模糊匹配）。")
 
-    # 3) 螺栓 up/down（使用你提供的精确 key；如果不是精确 key，这里也会尝试模糊）
+    # 3) 螺栓 up/down：优先使用 config.yaml 中的 bolts
+    bolts_from_yaml = cfg_yaml.get("bolts", None)
+    if bolts_from_yaml:
+        bolt_surfaces = []
+        for b in bolts_from_yaml:
+            bolt_surfaces.append(
+                {
+                    "name": b.get("name", ""),
+                    "up_key": b.get("up_surface_key", ""),
+                    "down_key": b.get("down_surface_key", ""),
+                }
+            )
+    else:
+        bolt_surfaces = BOLT_SURFACES_DEFAULT
+
     preload_specs = []
-    for spec in BOLT_SURFACES:
+    for spec in bolt_surfaces:
         try:
             up_key = _auto_resolve_surface_keys(asm, spec["up_key"])
             dn_key = _auto_resolve_surface_keys(asm, spec["down_key"])
             preload_specs.append({"name": spec["name"], "up_key": up_key, "down_key": dn_key})
         except Exception as e:
             print(f"[main] 螺栓 '{spec['name']}' 的 up/down 自动匹配失败：{e}")
-            print("       请在 main.py 的 BOLT_SURFACES 中把 up_key/down_key 改成更准确的名称。")
-            preload_specs.append({"name": spec["name"], "up_key": spec["up_key"], "down_key": spec["down_key"]})
+            print("       请在 config.yaml 的 bolts 或 main.py 的 BOLT_SURFACES_DEFAULT 中修正后再跑。")
+            preload_specs.append(
+                {"name": spec["name"], "up_key": spec["up_key"], "down_key": spec["down_key"]}
+            )
 
-    # 4) 接触对（若填写 hint，这里解析；否则Trainer里会自动从INP猜测）
+    # 4) 接触对：优先使用 config.yaml → 若为空则使用 main.py 默认
+    contact_pairs_cfg = cfg_yaml.get("contact_pairs", None)
+    if contact_pairs_cfg is None:
+        contact_pairs_cfg = CONTACT_PAIRS_DEFAULT
+
     contact_pairs = []
-    for p in CONTACT_PAIRS:
+    for p in contact_pairs_cfg:
         try:
             slave_key = _auto_resolve_surface_keys(asm, p["slave_key"])
             master_key = _auto_resolve_surface_keys(asm, p["master_key"])
-            contact_pairs.append({"slave_key": slave_key, "master_key": master_key, "name": p.get("name", "")})
+            contact_pairs.append(
+                {
+                    "slave_key": slave_key,
+                    "master_key": master_key,
+                    "name": p.get("name", ""),
+                    "interaction": p.get("interaction", ""),
+                }
+            )
         except Exception as e:
             print(f"[main] 接触对 '{p.get('name','')}' 自动匹配失败：{e}")
-            print("       暂时跳过该接触对（可在 main.py CONTACT_PAIRS 中修正后再跑）。")
+            print("       暂时跳过该接触对（可在 config.yaml 或 main.py CONTACT_PAIRS_DEFAULT 中修正后再跑）。")
 
-    # 5) 组装训练配置
+    # 5) 材料与 Part→材料映射：优先使用 config.yaml 中的 material_properties / part2mat
+    mat_props = cfg_yaml.get("material_properties", None)
+    if isinstance(mat_props, dict) and mat_props:
+        materials = {}
+        for name, props in mat_props.items():
+            E = props.get("E", None)
+            nu = props.get("nu", None)
+            if E is None or nu is None:
+                continue
+            materials[name] = (float(E), float(nu))
+        if not materials:
+            materials = MATERIALS_DEFAULT
+    else:
+        materials = MATERIALS_DEFAULT
+
+    part2mat = cfg_yaml.get("part2mat", PART2MAT_DEFAULT)
+
+    # 6) 训练步数与采样设置：优先使用 config.yaml 中的 optimizer_config / elasticity_config
+    optimizer_cfg = cfg_yaml.get("optimizer_config", {}) or {}
+    elas_cfg_yaml = cfg_yaml.get("elasticity_config", {}) or {}
+
+    train_steps = int(optimizer_cfg.get("epochs", TRAIN_STEPS_DEFAULT))
+    n_contact_points_per_pair = int(
+        cfg_yaml.get("n_contact_points_per_pair", CONTACT_POINTS_PER_PAIR_DEFAULT)
+    )
+    preload_face_points_each = int(
+        cfg_yaml.get("preload_n_points_each", PRELOAD_FACE_POINTS_EACH_DEFAULT)
+    )
+    preload_range = cfg_yaml.get("preload_range_n", PRELOAD_RANGE_N_DEFAULT)
+    preload_min, preload_max = float(preload_range[0]), float(preload_range[1])
+
+    # 7) 组装训练配置
     cfg = TrainerConfig(
-        inp_path=INP_PATH,
-        mirror_surface_name=MIRROR_SURFACE_NAME,  # 可视化仍支持模糊匹配
-        materials=MATERIALS,
-        part2mat=PART2MAT,
-
+        inp_path=inp_path,
+        mirror_surface_name=mirror_surface_name,  # 可视化仍支持模糊匹配
+        materials=materials,
+        part2mat=part2mat,
         contact_pairs=contact_pairs,
-        n_contact_points_per_pair=CONTACT_POINTS_PER_PAIR,
-
+        n_contact_points_per_pair=n_contact_points_per_pair,
         preload_specs=preload_specs,
-        preload_n_points_each=PRELOAD_FACE_POINTS_EACH,
-
-        preload_min=PRELOAD_RANGE_N[0],
-        preload_max=PRELOAD_RANGE_N[1],
-
-        max_steps=TRAIN_STEPS,
+        preload_n_points_each=preload_face_points_each,
+        preload_min=preload_min,
+        preload_max=preload_max,
+        max_steps=train_steps,
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
 
@@ -201,12 +285,13 @@ def _prepare_config_with_autoguess():
     cfg.model_cfg.field.depth = 9
     cfg.model_cfg.field.residual_skips = (3, 6, 8)
 
-    # 2) 把 Jacobian 前向+求导放在 CPU，并分块处理；关闭 pfor 降图复杂度
-    cfg.elas_cfg.jac_chunk = 128       # 64/128/256 视显存调整
-    cfg.elas_cfg.chunk_size = 128
-    cfg.elas_cfg.jac_device = "CPU"          # 关键：U+J 在 CPU，避免 GPU OOM
-    cfg.elas_cfg.use_pfor = False            # 关闭 pfor
-    cfg.elas_cfg.n_points_per_step = 4096
+    # 2) DFEM 采样配置（不再设置 Jacobian 相关字段）
+    #    - chunk_size: 节点前向/能量评估的分块大小（防止一次性吃满显存）
+    #    - n_points_per_step: 每一步参与 DFEM 积分的子单元/积分点个数上限
+    cfg.elas_cfg.chunk_size = int(elas_cfg_yaml.get("chunk_size", 128))
+    cfg.elas_cfg.n_points_per_step = int(elas_cfg_yaml.get("n_points_per_step", 4096))
+    cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
+
     # 3) 增大接触采样密度，并将重采样频率下调为每步刷新
     cfg.n_contact_points_per_pair = max(cfg.n_contact_points_per_pair, 6000)
     cfg.resample_contact_every = 1
@@ -219,7 +304,7 @@ def _prepare_config_with_autoguess():
     # 5) 根据预紧力范围自动调整归一化（映射到约 [-1, 1]）
     preload_lo, preload_hi = float(cfg.preload_min), float(cfg.preload_max)
     if preload_hi <= preload_lo:
-        raise ValueError("PRELOAD_RANGE_N 的上限必须大于下限。")
+        raise ValueError("预紧力范围 preload_range_n / PRELOAD_RANGE_N_DEFAULT 的上限必须大于下限。")
     preload_mid = 0.5 * (preload_lo + preload_hi)
     preload_half_span = 0.5 * (preload_hi - preload_lo)
     cfg.model_cfg.preload_shift = preload_mid
@@ -229,22 +314,24 @@ def _prepare_config_with_autoguess():
     return cfg, asm
 
 
-# ---------- 预训练审计打印（你需要的“那种详单”） ----------
+# ---------- 预训练审计打印（详单） ----------
 def _print_pretrain_audit(cfg: TrainerConfig, asm) -> None:
     print("\n======================================================================")
     print("[预训练审计] INP 解析摘要")
     print("======================================================================")
     try:
         s = asm.summary()
-        print(f"[INP] parts={s.get('num_parts')}  surfaces={s.get('num_surfaces')}  "
-              f"contact_pairs={s.get('num_contact_pairs')}  ties={s.get('num_ties')}")
+        print(
+            f"[INP] parts={s.get('num_parts')}  surfaces={s.get('num_surfaces')}  "
+            f"contact_pairs={s.get('num_contact_pairs')}  ties={s.get('num_ties')}"
+        )
     except Exception:
         pass
 
     # 镜面
-    print("\n[镜面] Surface =", MIRROR_SURFACE_NAME)
+    print("\n[镜面] Surface =", cfg.mirror_surface_name)
     try:
-        mirror_key = _auto_resolve_surface_keys(asm, MIRROR_SURFACE_NAME)
+        mirror_key = _auto_resolve_surface_keys(asm, cfg.mirror_surface_name)
         total, per_face, samples = _count_surface_faces(asm, mirror_key)
         print(f"  - 解析到 key: {mirror_key}")
         if per_face:
@@ -278,7 +365,7 @@ def _print_pretrain_audit(cfg: TrainerConfig, asm) -> None:
         mu_map = {}
         if isinstance(interactions, dict):
             for name, obj in interactions.items():
-                mu = getattr(obj, "mu", None) or obj.get("mu") if isinstance(obj, dict) else None
+                mu = getattr(obj, "mu", None) or (obj.get("mu") if isinstance(obj, dict) else None)
                 mu_map[name] = mu
 
         if asm.contact_pairs:
@@ -287,7 +374,10 @@ def _print_pretrain_audit(cfg: TrainerConfig, asm) -> None:
                 inter = cp.interaction or ""
                 mu = mu_map.get(inter, None)
                 mu_str = f", μ={mu}" if mu is not None else ""
-                print(f"  - #{idx}: master='{cp.master}', slave='{cp.slave}', interaction='{inter}'{mu_str}")
+                print(
+                    f"  - #{idx}: master='{cp.master}', slave='{cp.slave}', "
+                    f"interaction='{inter}'{mu_str}"
+                )
         else:
             print("[INP] 未在 *Contact Pair 中发现接触对（Trainer 将尝试自动识别）。")
 
@@ -323,7 +413,7 @@ def _run_training(cfg, asm, export_saved_model: str = ""):
         trainer.export_saved_model(export_saved_model)
 
     print("\n✅ 训练完成！请到 'outputs/' 查看 5 张 “MIRROR up” 变形云图（文件名包含三颗预紧力数值）。")
-    print("   如需修改 INP 路径、表面名或超参，直接改 main.py 顶部“USER SETTINGS”部分即可。")
+    print("   如需修改 INP 路径、表面名或超参，优先修改 config.yaml，如有需要再改 main.py 顶部 USER SETTINGS 默认值。")
 
 
 def _run_inference(cfg,
@@ -359,18 +449,42 @@ def _run_inference(cfg,
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Train the PINN or run inference with custom preloads.")
-    parser.add_argument("--mode", choices=["train", "infer"], default="train", help="train: 训练模型; infer: 使用已训模型生成云图")
-    parser.add_argument("--preload", nargs=3, type=float, metavar=("P1", "P2", "P3"),
-                        help="三个螺栓的预紧力，单位 N (仅在 --mode infer 时使用)")
-    parser.add_argument("--ckpt", default="", help="指定要恢复的检查点路径；默认使用 checkpoints/ 下最新的")
-    parser.add_argument("--out", default="", help="保存推理云图的路径；默认写入 outputs/ 目录")
-    parser.add_argument("--data", default="auto",
-                        help="云图对应的位移采样 txt 文件路径。使用 'auto' 表示与图片同名，"
-                             "使用 'none' 或空字符串表示不导出。")
-    parser.add_argument("--title", default="", help="自定义云图标题前缀（默认沿用配置中的 viz_title_prefix）")
-    parser.add_argument("--show", action="store_true", help="推理时显示 matplotlib 窗口")
-    parser.add_argument("--export", default="", help="将模型导出为 TensorFlow SavedModel 的目录")
+    parser = argparse.ArgumentParser(
+        description="Train the DFEM/PINN model or run inference with custom preloads."
+    )
+    parser.add_argument(
+        "--mode", choices=["train", "infer"], default="train",
+        help="train: 训练模型; infer: 使用已训模型生成云图"
+    )
+    parser.add_argument(
+        "--preload", nargs=3, type=float, metavar=("P1", "P2", "P3"),
+        help="三个螺栓的预紧力，单位 N (仅在 --mode infer 时使用)"
+    )
+    parser.add_argument(
+        "--ckpt", default="",
+        help="指定要恢复的检查点路径；默认使用 checkpoints/ 下最新的"
+    )
+    parser.add_argument(
+        "--out", default="",
+        help="保存推理云图的路径；默认写入 outputs/ 目录"
+    )
+    parser.add_argument(
+        "--data", default="auto",
+        help="云图对应的位移采样 txt 文件路径。使用 'auto' 表示与图片同名，"
+             "使用 'none' 或空字符串表示不导出。"
+    )
+    parser.add_argument(
+        "--title", default="",
+        help="自定义云图标题前缀（默认沿用配置中的 viz_title_prefix）"
+    )
+    parser.add_argument(
+        "--show", action="store_true",
+        help="推理时显示 matplotlib 窗口"
+    )
+    parser.add_argument(
+        "--export", default="",
+        help="将模型导出为 TensorFlow SavedModel 的目录"
+    )
 
     args = parser.parse_args(argv)
 

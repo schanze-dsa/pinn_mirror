@@ -7,8 +7,9 @@ trainer.py — 主训练循环（精简日志 + 分阶段进度提示）。
   - 构建阶段仅输出必需的信息与接触汇总。
   - 单步训练进度条会标注当前阶段，便于观察训练流程。
 """
-
 from __future__ import annotations
+from train.attach_ties_bcs import attach_ties_and_bcs_from_inp
+
 import os
 import sys
 import time
@@ -68,6 +69,7 @@ from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig
 from physics.tie_constraints import TiePenalty, TieConfig
 from physics.preload_model import PreloadWork, PreloadConfig, BoltSurfaceSpec
 from model.loss_energy import TotalEnergy, TotalConfig
+from train.loss_weights import LossWeightState, update_loss_weights, combine_loss
 from viz.mirror_viz import plot_mirror_deflection_by_name
 
 
@@ -282,6 +284,9 @@ class Trainer:
         self.mat_id = None
         self.enum_names: List[str] = []
         self.id2props_map: Dict[int, Tuple[float, float]] = {}
+        # 自适应损失权重的状态（在 run() 里初始化）
+        self.loss_state: Optional[LossWeightState] = None
+
 
     # ----------------- 辅助工具 -----------------
     @staticmethod
@@ -342,21 +347,18 @@ class Trainer:
                 if "E_int" in parts
                 else 0.0
             )
-            en = (
-                float(parts.get("E_n", tf.constant(0.0)).numpy())
-                if "E_n" in parts
-                else 0.0
-            )
-            et = (
-                float(parts.get("E_t", tf.constant(0.0)).numpy())
-                if "E_t" in parts
-                else 0.0
-            )
-            wpre = (
-                float(parts.get("W_pre", tf.constant(0.0)).numpy())
-                if "W_pre" in parts
-                else 0.0
-            )
+            en = 0.0
+            if "E_cn" in parts:
+                en = float(parts["E_cn"].numpy())
+            elif "E_n" in parts:
+                en = float(parts["E_n"].numpy())
+
+            et = 0.0
+            if "E_ct" in parts:
+                et = float(parts["E_ct"].numpy())
+            elif "E_t" in parts:
+                et = float(parts["E_t"].numpy())
+
 
             bolt_txt = ""
             preload_stats = None
@@ -586,9 +588,14 @@ class Trainer:
 
             pb.update(1)
 
-            # 3) 弹性项
+            # 3) 弹性项 —— 改为 DFEM 构造方式
+            # 注意：X_vol / w_vol / mat_id 依然保留在 Trainer 里用于可视化与检查，
+            # 但不再传进 ElasticityEnergy，DFEM 内部自己做子单元积分。
             self.elasticity = ElasticityEnergy(
-                X_vol=X_vol, w_vol=w_vol, mat_id=mat_id, matlib=self.id2props_map, cfg=cfg.elas_cfg
+                asm=self.asm,
+                part2mat=cfg.part2mat,
+                materials=cfg.materials,
+                cfg=cfg.elas_cfg,
             )
             pb.update(1)
 
@@ -771,20 +778,30 @@ class Trainer:
         model = self.model
         opt = self.optimizer
 
-        # 关键改动：用收集器拿到真正的可训练变量
+        # 统一收集可训练变量
         train_vars = self._collect_trainable_variables()
 
         with tf.GradientTape() as tape:
-            # 有限差分 J 不需要把 tape 传进 energy
-            Pi, parts, stats = total.energy(model.u_fn, params={"P": P_tf}, tape=None)
+            # 1) 先用 TotalEnergy 计算各个分量和“基线”Π_raw
+            Pi_raw, parts, stats = total.energy(model.u_fn, params={"P": P_tf}, tape=None)
 
+            # 2) 根据当前残差更新自适应权重，并用 parts 重新组合总能量 Π
+            if self.loss_state is not None:
+                update_loss_weights(self.loss_state, parts, stats)
+                Pi = combine_loss(parts, self.loss_state)   # 使用当前权重组合
+            else:
+                Pi = Pi_raw  # 没有自适应状态就退回原始 Π
+
+            # 3) 加上 Keras 模型自带的正则项
             reg = tf.add_n(model.losses) if getattr(model, "losses", None) else 0.0
+
             loss = Pi + reg
 
             use_loss_scale = hasattr(opt, "get_scaled_loss")
             if use_loss_scale:
                 scaled_loss = opt.get_scaled_loss(loss)
 
+        # 4) 反传 & 梯度缩放
         if use_loss_scale:
             scaled_grads = tape.gradient(scaled_loss, train_vars)
             grads = opt.get_unscaled_gradients(scaled_grads)
@@ -793,9 +810,10 @@ class Trainer:
 
         if not any(g is not None for g in grads):
             raise RuntimeError(
-                "[trainer] 所有梯度均为 None，训练无法继续。请确认损失在 tape 作用域内构建，且未用 .numpy()/np.* 切断图。")
+                "[trainer] 所有梯度均为 None，训练无法继续。请确认损失在 tape 作用域内构建，且未用 .numpy()/np.* 切断图。"
+            )
 
-        # 计算/裁剪梯度范数（可选）
+        # 5) 计算/裁剪梯度范数
         non_none = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
         g_list, v_list = zip(*non_none)
         grad_norm = tf.linalg.global_norm(g_list)
@@ -805,14 +823,47 @@ class Trainer:
             g_list, _ = tf.clip_by_global_norm(g_list, clip_norm)
 
         opt.apply_gradients(zip(g_list, v_list))
+
+        # 返回“当前权重下”的 Π，而不是 Pi_raw
         return Pi, parts, stats, grad_norm
+
 
     # ----------------- 训练 -----------------
     def run(self):
         self.build()
         print(f"[trainer] 当前训练设备：{self.device_summary}")
         total = self._assemble_total()
+        attach_ties_and_bcs_from_inp(
+            total=total,
+            asm=self.asm,
+            inp_path=self.cfg.inp_path,
+            cfg=self.cfg,
+        )
+        print("[dbg] Tie/BC 已挂载到 total")
 
+        # ---- 初始化自适应损失权重状态 ----
+        # 以 TotalConfig 里的 w_int / w_cn / ... 作为基准权重
+        base_weights = {
+            "E_int": self.cfg.total_cfg.w_int,
+            "E_cn": self.cfg.total_cfg.w_cn,
+            "E_ct": self.cfg.total_cfg.w_ct,
+            "E_tie": self.cfg.total_cfg.w_tie,
+            "E_bc": self.cfg.total_cfg.w_bc,
+            "W_pre": self.cfg.total_cfg.w_pre,
+            # 残差项默认权重为 0，需要的话再在 config 里改
+            "R_fric_comp": 0.0,
+            "R_contact_comp": 0.0,
+        }
+
+        # 建议在 TotalConfig 里加一个字段：
+        #   adaptive_scheme: str = "off"   # "off" / "contact_only" / "basic"
+        # 如果你还没加，可以先写死为 "off" 或 "contact_only"
+        scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "off")
+
+        self.loss_state = LossWeightState.from_config(
+            base_weights=base_weights,
+            adaptive_scheme=scheme,
+        )
         train_pb_kwargs = dict(total=self.cfg.max_steps, desc="Training", leave=True)
         if self.cfg.train_bar_color:
             train_pb_kwargs["colour"] = self.cfg.train_bar_color

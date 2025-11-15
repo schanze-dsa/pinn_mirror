@@ -1,87 +1,172 @@
-# 这个是完整的 config.yaml 修改后的版本
-# 根据 INP 文件与命名规则做了必要的调整
+# ============================================================
+# DFEM + PINN 总配置
+# - 本版：三种材料 jingmian / structural_steel / zhijia
+# - 弹性主模型：线弹性 + 预紧 + 接触/摩擦
+# - 额外保存了屈服强度、密度、热导率等，便于后处理
+# ============================================================
 
-# 基本配置
-material_enum: [mirror, steel]  # 材料的顺序
+# ------------------------------------------------------------
+# 1. 材料库
+# ------------------------------------------------------------
+
+# 材料标签的枚举（顺序无所谓，但名字要和下面 material_properties 一致）
+material_enum: [jingmian, structural_steel, zhijia]
+
+# 各材料的属性。当前 DFEM 静力分析只会用到 E 和 nu，
+# 其它参数为后续屈服判定、动力学、热–结构耦合等做准备。
 material_properties:
-  mirror:  # 反射镜面材料
-    E: 70000.0
-    nu: 0.33
-  steel:  # 钢材材料
-    E: 210000.0
-    nu: 0.3
+  jingmian:
+    # ---- 基本弹性参数（当前 DFEM 会用到）----
+    E: 6.9e10           # Pa，杨氏模量
+    nu: 0.33            # 泊松比
 
-# 预紧力设置
+    # 冗余弹性量（由 E, nu 推导，保留便于校验/扩展）
+    bulk_modulus: 6.7647e10   # Pa，体积模量 K
+    shear_modulus: 2.594e10   # Pa，剪切模量 G
+
+    # 密度与热学参数（后续若做动力学/热应力可用）
+    density: 2700.0           # kg/m^3
+    alpha_thermal: 2.4e-5     # 1/K，各向同性线膨胀系数
+    k_thermal: 166.9          # W/(m·K)，各向同性热导率
+    cp: 896.0                 # J/(kg·K)，比热容
+
+    # 强度参数（屈服/极限），可用于后处理安全系数或损伤指标
+    sigma_y_tension: 2.8e8        # Pa，拉伸屈服强度
+    sigma_y_compression: 2.8e8    # Pa，压缩屈服强度
+    sigma_u_tension: 3.1e8        # Pa，拉伸极限强度
+
+    # 如需疲劳分析，可在此增加 S–N 曲线数据
+    # sn_curve:
+    #   R: -1
+    #   points:
+    #     - [1.7e3, 2.75e8]
+    #     - [5.0e3, ...]
+    #     ...
+
+  structural_steel:
+    # ---- 基本弹性参数 ----
+    E: 2.0e11          # Pa，杨氏模量
+    nu: 0.30           # 泊松比
+
+    # 冗余弹性量
+    bulk_modulus: 1.6667e11   # Pa，体积模量 K
+    shear_modulus: 7.6923e10  # Pa，剪切模量 G
+
+    # 密度与热学参数
+    density: 7850.0           # kg/m^3
+    alpha_thermal: 1.2e-5     # 1/K
+    k_thermal: 60.5           # W/(m·K)
+    cp: 434.0                 # J/(kg·K)
+
+    # 强度参数
+    sigma_y_tension: 2.5e8        # Pa
+    sigma_y_compression: 2.5e8    # Pa
+    sigma_u_tension: 4.6e8        # Pa
+
+  zhijia:
+    # ---- 基本弹性参数 ----
+    E: 7.42e10         # Pa，杨氏模量
+    nu: 0.36           # 泊松比
+
+    # 冗余弹性量
+    bulk_modulus: 8.8333e10   # Pa，体积模量 K
+    shear_modulus: 2.7279e10  # Pa，剪切模量 G
+
+    # 密度与热学参数
+    density: 2850.0           # kg/m^3
+    alpha_thermal: 2.38e-5    # 1/K
+    k_thermal: 44.0           # W/(m·K)
+    cp: 460.0                 # J/(kg·K)
+
+    # 强度参数
+    sigma_y_tension: 2.8e8        # Pa
+    sigma_y_compression: 2.8e8    # Pa
+    sigma_u_tension: 3.1e8        # Pa
+
+# ------------------------------------------------------------
+# 2. Part → 材料映射（需与 INP 中 Part 名一致）
+# ------------------------------------------------------------
+part2mat:
+  mirror1: jingmian
+  mirror2: jingmian
+
+  bolt1:   structural_steel
+  bolt2:   structural_steel
+  bolt3:   structural_steel
+
+  auto:    zhijia      # 支架/中间件使用 zhijia 材料
+
+# ------------------------------------------------------------
+# 3. 预紧螺栓与装配面
+# ------------------------------------------------------------
 bolts:
   - name: bolt1
-    up_surface_key: 'ASM::"bolt1 up"'   # INP 中定义的“上表面”
-    down_surface_key: 'ASM::"bolt1 down"'  # INP 中定义的“下表面”
+    up_surface_key:   'ASM::"bolt1 up"'
+    down_surface_key: 'ASM::"bolt1 down"'
   - name: bolt2
-    up_surface_key: 'ASM::"bolt2 uo"'   # 注意：INP 中是“uo”而非“up”
+    up_surface_key:   'ASM::"bolt2 uo"'      # 注意：INP 中名为 "uo"
     down_surface_key: 'ASM::"bolt2 down"'
   - name: bolt3
-    up_surface_key: 'ASM::"bolt3 up"'   # INP 中定义的“上表面”
-    down_surface_key: 'ASM::"bolt3 down"'  # INP 中定义的“下表面”
+    up_surface_key:   'ASM::"bolt3 up"'
+    down_surface_key: 'ASM::"bolt3 down"'
 
-# 材料映射与装配面设置
-part2mat:
-  mirror1: mirror
-  mirror2: mirror
-  bolt1: steel
-  bolt2: steel
-  bolt3: steel
-  auto: steel
-
-# 接触对设置（如果有手动填充接触对）
+# ------------------------------------------------------------
+# 4. 接触对设置（master/slave surface 名需与 INP 中一致）
+# ------------------------------------------------------------
 contact_pairs:
-  # 接触对根据 INP 中的配对进行配置
+  # 镜面与各螺栓帽/垫片接触
   - master_key: 'ASM::"mirror1 up"'
-    slave_key: 'ASM::"bolt1 mirror s"'
-    interaction: 'fri'
+    slave_key:  'ASM::"bolt1 mirror s"'
+    interaction: 'fri'      # 考虑摩擦
   - master_key: 'ASM::"mirror2 up"'
-    slave_key: 'ASM::"bolt2 mirror s"'
+    slave_key:  'ASM::"bolt2 mirror s"'
     interaction: 'fri'
   - master_key: 'ASM::"mirror3 up"'
-    slave_key: 'ASM::"bolt3 mirror s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt1 auto s"'
-    slave_key: 'ASM::"bolt1 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt1 mirror s"'
-    slave_key: 'ASM::"bolt1 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt2 auto s"'
-    slave_key: 'ASM::"bolt2 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt2 mirror s"'
-    slave_key: 'ASM::"bolt2 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 auto s"'
-    slave_key: 'ASM::"bolt3 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror s"'
-    slave_key: 'ASM::"bolt3 s"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key: 'ASM::"bolt1 up"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt2 mirror up"'
-    slave_key: 'ASM::"bolt1 up"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt1 mirror up"'
-    slave_key: 'ASM::"bolt2 uo"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key: 'ASM::"bolt3 up"'
+    slave_key:  'ASM::"bolt3 mirror s"'
     interaction: 'fri'
 
-# 训练配置：网络结构、优化器等
+  # 各螺栓头/垫片与其下部结构的接触
+  - master_key: 'ASM::"bolt1 auto s"'
+    slave_key:  'ASM::"bolt1 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt1 mirror s"'
+    slave_key:  'ASM::"bolt1 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt2 auto s"'
+    slave_key:  'ASM::"bolt2 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt2 mirror s"'
+    slave_key:  'ASM::"bolt2 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 auto s"'
+    slave_key:  'ASM::"bolt3 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror s"'
+    slave_key:  'ASM::"bolt3 s"'
+    interaction: 'fri'
+
+  # 螺栓上表面之间的接触（防止装配间隙导致相对位移异常）
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key:  'ASM::"bolt1 up"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt2 mirror up"'
+    slave_key:  'ASM::"bolt1 up"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt1 mirror up"'
+    slave_key:  'ASM::"bolt2 uo"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key:  'ASM::"bolt3 up"'
+    interaction: 'fri'
+
+# ------------------------------------------------------------
+# 5. 网络与优化器配置（后续 DFEM 改造时会用）
+# ------------------------------------------------------------
 network_config:
-  # 网络结构
-  model_type: pinn
-  input_dim: 3  # 3 个预紧力输入
-  output_dim: 1  # 镜面变形应力云图的输出维度（可根据实际情况调整）
-  layers: [64, 64, 32]  # 网络层结构（示意）
+  model_type: pinn         # 之后会 DFEM 化：网络预测节点位移/场
+  input_dim: 3             # 例如三个预紧力或加载参数
+  output_dim: 1            # 目标量维度；如需输出完整位移场可在代码中扩展
+  layers: [64, 64, 32]
 
 optimizer_config:
   type: Adam
@@ -89,18 +174,50 @@ optimizer_config:
   batch_size: 32
   epochs: 500
 
-# 训练阶段配置：损失函数、能量项等
-loss_config:
-  elasticity_loss: 1.0
-  contact_loss: 0.1  # 如果启用了接触损失
-  friction_loss: 0.1  # 如果启用了摩擦损失
+# ------------------------------------------------------------
+# 6. 弹性 DFEM 配置（ElasticityConfig）
+# ------------------------------------------------------------
+elasticity_config:
+  coord_scale: 1.0          # 坐标缩放系数
+  chunk_size: 128           # 节点前向微批大小（DFEM：u_fn(X_nodes) 分块）
+  use_pfor: false           # 保留字段，可忽略
+  check_nan: true           # 是否进行数值 NaN 检查
+  n_points_per_step: 4096   # 每步用于 DFEM 积分的子单元/积分点上限；None 表示全量
 
-# 可视化与结果输出配置
+# ------------------------------------------------------------
+# 7. 损失函数与自适应加权（TotalConfig + weighted PINN）
+# ------------------------------------------------------------
+loss_config:
+  base_weights:
+    w_int: 1.0      # 内能
+    w_cn: 1.0      # 法向接触能量
+    w_ct: 1.0      # 摩擦能量/摩擦残差
+    w_tie: 1.0     # 绑定/多体约束
+    w_bc: 1.0      # 边界条件
+    w_pre: 1.0     # 预紧功（乘在 -W_pre 上）
+
+  adaptive:
+    enabled: true           # 是否启用自适应加权（weighted PINN）
+    update_every: 50        # 每多少个 global step 更新一次权重
+    ema_decay: 0.99         # 残差/能量的 EMA 衰减系数
+    temperature: 1.0        # softmax 温度
+    min_weight: 0.1         # 单项权重下限
+    max_weight: 10.0        # 单项权重上限
+    focus_terms: [w_int, w_cn, w_ct]  # 重点自适应的损失项
+
+# ------------------------------------------------------------
+# 8. 输出与可视化
+# ------------------------------------------------------------
 output_config:
   save_path: './results'
-  visualize: true  # 是否进行训练过程可视化
+  visualize: true
 
-
-
-# 必填：Abaqus INP 的绝对路径
+# ------------------------------------------------------------
+# 9. INP 文件路径
+# ------------------------------------------------------------
 inp_path: D:/shuangfan/shuangfan.inp
+
+
+n_tie_points: 2000
+tie_alpha: 1e3
+bc_alpha: 1e4

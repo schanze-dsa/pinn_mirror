@@ -5,30 +5,42 @@ contact_normal_alm.py
 ---------------------
 Augmented Lagrangian (ALM) normal-contact energy (frictionless, normal gap only).
 
-This operator:
-- Accepts per-step contact samples from ContactMap (xs, xm, n, w_area)
-- Computes kinematic gap: g = ((xs + u(xs)) - (xm + u(xm))) · n
-- Uses smooth negative-part: phi(g) = softplus(-g; beta)
-- ALM energy: En = sum w * [ lambda * phi(g) + 0.5 * mu_n * phi(g)^2 ]
-- Provides an outer update of Lagrange multipliers: lambda <- max(0, lambda + mu_n * phi(g))
-- Supports per-sample weights (Weighted PINN) through w_area (and optional extra weights)
-- Auto-orients normals at build-time if zero-displacement gap is predominantly negative
+本模块实现的是“能量型 + ALM”的法向接触项，可与 DFEM/ PINN 解耦使用：
 
-Intended to be called from TF2 custom training loop:
-    En, stats = op.energy(u_fn, params)
-    # backprop on En
-    if step % K == 0:
-        op.update_multipliers(u_fn, params)
+- 接受 ContactMap 采样得到的接触点信息 (xs, xm, n, w_area)；
+- 通过 u_fn(xs, params)、u_fn(xm, params) 获得节点位移；
+- 计算几何间隙 g = ((xs + u(xs)) - (xm + u(xm))) · n；
+- 使用平滑负部 φ(g) = softplus(-g; β) 近似 max(0, -g)；
+- 法向接触能量：
+      En = Σ w · [ λ · φ(g) + 0.5 · μ_n · φ(g)^2 ]
+- 外层 ALM 更新：
+      λ ← max(0, λ + η · μ_n · φ(g))
 
-Notes:
-- Multipliers are per-batch; if you resample contact points each step, they are reset.
-  (You can persist across steps by not calling reset_for_new_batch.)
-- All internal tensors live on TF (float32 by default). NumPy inputs are converted.
+其中 η 为外部可控的步长（增强型拉格朗日法），默认 η=1。
 
-Author: you
+支持特性：
+- 支持通过 w_area 和额外的 extra_weights 组合成最终权重；
+- energy(...) 中支持额外的 per-sample 权重 extra_weights，便于 weighted PINN；
+- update_multipliers(...) 保持接口简洁，同时增加 step_scale 控制更新步长；
+- 不依赖 Jacobian、与 DFEM 内核解耦，只要 u_fn(X, params) 接口一致即可。
+
+典型用法（每个训练 step 内）::
+
+    op = NormalContactALM(cfg)
+    op.build_from_cat(contact_cat_dict)         # 或 build_from_numpy(...)
+    En, stats_cn = op.energy(u_fn, params, extra_weights=cn_weights)
+    # 反向传播 En
+    if step % k == 0:
+        op.update_multipliers(u_fn, params, step_scale=1.0)
+
+Notes
+-----
+- 本算子是“每批次状态”，如果每步都重采样接触点，则每次 build_* 都会重置 λ。
+  若希望 λ 跨 step 继承，可在 Trainer 层控制不重置 / 以某种方式 carry over。
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -36,11 +48,12 @@ import numpy as np
 import tensorflow as tf
 
 
-# -----------------------------
+# --------------------------------------------------------------------------- #
 # Utilities
-# -----------------------------
+# --------------------------------------------------------------------------- #
 
 def _to_tf(x, dtype=tf.float32):
+    """Convert NumPy/TF input to a TF tensor with given dtype."""
     if isinstance(x, tf.Tensor):
         return tf.cast(x, dtype)
     return tf.convert_to_tensor(x, dtype=dtype)
@@ -48,8 +61,17 @@ def _to_tf(x, dtype=tf.float32):
 
 def softplus_neg(x: tf.Tensor, beta: tf.Tensor) -> tf.Tensor:
     """
-    Smooth negative-part: softplus(-x; beta) = (1/beta)*log(1 + exp(-beta*x))
-    beta can be a scalar tensor; higher beta -> sharper.
+    Smooth negative-part: softplus(-x; beta) ≈ max(0, -x).
+
+    具体形式：
+        φ(x) = softplus(-β x) / β = (1/β) log(1 + exp(-β x))
+
+    参数
+    ----
+    x : (...,) tensor
+        gap 值 g。
+    beta : scalar tensor
+        越大则越接近硬的 max(0, -g)。
     """
     return tf.nn.softplus(-x * beta) / (beta + 1e-12)
 
@@ -58,7 +80,7 @@ def softplus_neg(x: tf.Tensor, beta: tf.Tensor) -> tf.Tensor:
 class NormalALMConfig:
     """Hyperparameters for the normal-contact ALM operator."""
     beta: float = 50.0          # softplus steepness
-    mu_n: float = 1.0e3         # ALM coefficient
+    mu_n: float = 1.0e3         # ALM coefficient (normal penalty)
     enforce_nonneg_lambda: bool = True
     dtype: str = "float32"
 
@@ -67,32 +89,33 @@ class NormalContactALM:
     """
     Normal-contact ALM energy operator.
 
-    Build workflow (per batch):
-        op = NormalContactALM(config)
-        op.build_from_numpy(xs, xm, n, w_area)       # or op.build_from_cat(cat_dict)
-        En, stats = op.energy(u_fn, params)          # differentiable
-        op.update_multipliers(u_fn, params)          # outer loop, not differentiable
+    接口保持与旧版兼容，但实现上调整为更清晰的“能量 + ALM”形式，并增加：
 
-    Where:
-        - u_fn: callable (X, params)-> displ, returns TF tensor of shape (N,3)
-        - params: dict carrying preload etc., if u_fn needs them; can be None
+    - energy(..., extra_weights=None):
+        额外 per-sample 权重入口，不改变内部 self.w，用于 weighted PINN；
+    - update_multipliers(..., step_scale=1.0):
+        外部可控的 ALM 步长因子 η。
     """
+
+    # ------------------------------------------------------------------ #
+    # 构造与批次构建
+    # ------------------------------------------------------------------ #
 
     def __init__(self, cfg: Optional[NormalALMConfig] = None):
         self.cfg = cfg or NormalALMConfig()
         self.dtype = tf.float32 if self.cfg.dtype == "float32" else tf.float64
 
         # Per-batch tensors (TF)
-        self.xs: Optional[tf.Tensor] = None   # (N,3)
-        self.xm: Optional[tf.Tensor] = None   # (N,3)
-        self.n:  Optional[tf.Tensor] = None   # (N,3) (master normals; may be auto-flipped)
-        self.w:  Optional[tf.Tensor] = None   # (N,)
+        self.xs: Optional[tf.Tensor] = None   # (N,3) slave/sample points
+        self.xm: Optional[tf.Tensor] = None   # (N,3) master projection points
+        self.n:  Optional[tf.Tensor] = None   # (N,3) normals (unit, may be auto-flipped)
+        self.w:  Optional[tf.Tensor] = None   # (N,) base weights (e.g., area)
 
-        # State (multipliers)
+        # State (multipliers λ_n)
         self.lmbda: Optional[tf.Variable] = None  # (N,)
         self._built_N: int = 0
 
-        # Schedules (scalars on TF)
+        # Schedules/coeffs (scalars on TF)
         self.beta = tf.Variable(self.cfg.beta, dtype=self.dtype, trainable=False, name="beta_n")
         self.mu_n = tf.Variable(self.cfg.mu_n, dtype=self.dtype, trainable=False, name="mu_n")
 
@@ -102,16 +125,31 @@ class NormalContactALM:
 
     # ---------- building ----------
 
-    def build_from_numpy(self, xs: np.ndarray, xm: np.ndarray, n: np.ndarray, w_area: np.ndarray,
-                         extra_weights: Optional[np.ndarray] = None, auto_orient: bool = True):
+    def build_from_numpy(
+        self,
+        xs: np.ndarray,
+        xm: np.ndarray,
+        n: np.ndarray,
+        w_area: np.ndarray,
+        extra_weights: Optional[np.ndarray] = None,
+        auto_orient: bool = True,
+    ):
         """
         Initialize per-batch tensors from NumPy arrays.
-        - xs, xm: (N,3) coordinates (mm)
-        - n: (N,3) normals from master surface (unit)
-        - w_area: (N,) area weights from slave-surface sampling
-        - extra_weights: (N,) optional additional weights (e.g., IRLS); multiplied onto w_area
 
-        Note: This resets the multipliers to zero for the new batch.
+        参数
+        ----
+        xs, xm : (N,3)
+            分别为从从表面采样的点（slave）及其在主表面上的投影点（master）。
+        n : (N,3)
+            主表面的单位法向量。
+        w_area : (N,)
+            从从表面采样得到的面积权重。
+        extra_weights : (N,), optional
+            额外权重（例如 IRLS / edge weighting），会在 build 阶段乘到 w_area 上。
+            若希望每一步动态变化的权重，请使用 energy(..., extra_weights=...)。
+        auto_orient : bool
+            是否在零位移状态下根据 g0 = (xs - xm)·n 的中位数自动翻转法向。
         """
         assert xs.shape == xm.shape and xs.shape[1] == 3
         assert n.shape == xs.shape and w_area.shape[0] == xs.shape[0]
@@ -132,7 +170,11 @@ class NormalContactALM:
         self._built_N = int(Xs.shape[0])
 
         # (Re)init multipliers (per-batch state)
-        self.lmbda = tf.Variable(tf.zeros((self._built_N,), dtype=self.dtype), trainable=False, name="lambda_n")
+        self.lmbda = tf.Variable(
+            tf.zeros((self._built_N,), dtype=self.dtype),
+            trainable=False,
+            name="lambda_n",
+        )
 
         # Auto-orient normals (once per batch): ensure median((xs-xm)·n) >= 0 at zero displacement
         if auto_orient:
@@ -140,39 +182,63 @@ class NormalContactALM:
 
         self._last_gap = None
 
-    def build_from_cat(self, cat: Dict[str, np.ndarray], extra_weights: Optional[np.ndarray] = None, auto_orient: bool = True):
+    def build_from_cat(
+        self,
+        cat: Dict[str, np.ndarray],
+        extra_weights: Optional[np.ndarray] = None,
+        auto_orient: bool = True,
+    ):
         """
-        Build from concatenated dictionary returned by ContactMap.concatenate():
+        从 ContactMap.concatenate() 返回的字典构建：
             cat['xs'], cat['xm'], cat['n'], cat['w_area']  (N,*)
 
-        Optionally multiply extra per-sample weights (e.g., Weighted PINN IRLS).
+        其中 extra_weights 同 build_from_numpy，用于一次性的静态重权。
         """
-        self.build_from_numpy(cat["xs"], cat["xm"], cat["n"], cat["w_area"],
-                              extra_weights=extra_weights, auto_orient=auto_orient)
+        self.build_from_numpy(
+            cat["xs"],
+            cat["xm"],
+            cat["n"],
+            cat["w_area"],
+            extra_weights=extra_weights,
+            auto_orient=auto_orient,
+        )
 
     def _auto_orient_normals(self):
         """Flip all normals if median zero-displacement gap is negative."""
         # g0 = (xs - xm) · n
-        g0 = tf.reduce_sum((self.xs - self.xm) * self.n, axis=1)
+        xs = tf.cast(self.xs, self.dtype)
+        xm = tf.cast(self.xm, self.dtype)
+        n = tf.cast(self.n, self.dtype)
+
+        g0 = tf.reduce_sum((xs - xm) * n, axis=1)
         med = tfp_median(g0)
         flip = med < tf.cast(0.0, self.dtype)
-        if bool(flip.numpy()):
-            self.n.assign(-self.n)
 
+        def _flip():
+            self.n.assign(-self.n)
+            return tf.constant(0, dtype=tf.int32)
+
+        def _noflip():
+            return tf.constant(0, dtype=tf.int32)
+
+        _ = tf.cond(flip, _flip, _noflip)
         self._auto_flip_done = True
 
-    # ---------- core computations ----------
+    # ------------------------------------------------------------------ #
+    # 核心计算：gap / energy / multipliers
+    # ------------------------------------------------------------------ #
 
     def _gap(self, u_fn, params=None) -> tf.Tensor:
         """
         Compute signed gap:
             g = ((xs + u(xs)) - (xm + u(xm))) · n
-        Returns:
+
+        返回：
             g: (N,) tensor
         """
         xs = tf.cast(self.xs, self.dtype)
         xm = tf.cast(self.xm, self.dtype)
-        n = tf.cast(self.n, self.dtype)
+        n = tf.cast(self.n,  self.dtype)
 
         u_s = tf.cast(_ensure_2d(u_fn(xs, params)), self.dtype)
         u_m = tf.cast(_ensure_2d(u_fn(xm, params)), self.dtype)
@@ -181,54 +247,108 @@ class NormalContactALM:
         self._last_gap = g
         return g
 
-    def energy(self, u_fn, params=None) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
+    def energy(
+        self,
+        u_fn,
+        params=None,
+        extra_weights: Optional[tf.Tensor] = None,
+    ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
         """
         Compute ALM normal-contact energy (scalar) and stats (dict):
-            En = sum w * [ lambda * phi(g) + 0.5 * mu_n * phi(g)^2 ]
+
+            En = Σ w_eff · [ λ · φ(g) + 0.5 · μ_n · φ(g)^2 ]
+
+        其中：
+            - w_eff = w * extra_weights（若 extra_weights 为 None，则 w_eff = w）；
+            - φ(g) = softplus(-g; β)。
+
+        参数
+        ----
+        u_fn : callable
+            u_fn(X, params) -> (N,3)，DFEM/ PINN 统一的位移预测接口。
+        params : Any
+            传给 u_fn 的参数，可为字典或 dataclass。
+        extra_weights : tensor or None
+            形状 (N,)；若提供，则作为本次 energy 调用的额外权重，
+            不会永久写回 self.w。可用于 weighted PINN 中基于残差
+            的自适应权重。
         """
         g = self._gap(u_fn, params)
-        phi = softplus_neg(g, self.beta)
-        En = tf.reduce_sum(self.w * (self.lmbda * phi + 0.5 * self.mu_n * phi * phi))
+        phi = softplus_neg(g, self.beta)         # (N,)
+
+        # 有效权重 w_eff：保留 self.w 作为几何/面积基权重，额外权重只在本次调用中生效
+        w_eff = self.w
+        if extra_weights is not None:
+            w_eff = w_eff * tf.cast(extra_weights, self.dtype)
+
+        En = tf.reduce_sum(w_eff * (self.lmbda * phi + 0.5 * self.mu_n * phi * phi))
 
         # Stats for logging
         stats = {
-            "min_gap": tf.reduce_min(g),
-            "mean_gap": tf.reduce_mean(g),
-            "pen_ratio": tf.reduce_mean(tf.cast(phi > 0.0, self.dtype)),  # fraction with penetration (phi>0)
-            "phi_mean": tf.reduce_mean(phi),
+            "cn_min_gap": tf.reduce_min(g),
+            "cn_mean_gap": tf.reduce_mean(g),
+            "cn_pen_ratio": tf.reduce_mean(tf.cast(phi > 0.0, self.dtype)),  # fraction with penetration (phi>0)
+            "cn_phi_mean": tf.reduce_mean(phi),
+            "cn_mean_weight": tf.reduce_mean(w_eff),
         }
         return En, stats
 
     @tf.function(jit_compile=False)
-    def update_multipliers(self, u_fn, params=None):
+    def update_multipliers(
+        self,
+        u_fn,
+        params=None,
+        step_scale: float = 1.0,
+    ):
         """
         Outer-loop ALM update (not part of gradient path):
-            lambda <- max(0, lambda + mu_n * phi(g))
+
+            λ ← max(0, λ + η · μ_n · φ(g)),  其中 η = step_scale。
+
+        参数
+        ----
+        u_fn, params : 同 energy(...)
+        step_scale : float
+            增强型拉格朗日的步长因子；可以在 Trainer 中根据步数递增/递减。
         """
         g = self._gap(u_fn, params)
         phi = softplus_neg(g, self.beta)
-        new_lmbda = self.lmbda + self.mu_n * phi
+
+        eta = tf.cast(step_scale, self.dtype)
+        new_lmbda = self.lmbda + eta * self.mu_n * phi
+
         if self.cfg.enforce_nonneg_lambda:
             new_lmbda = tf.maximum(new_lmbda, tf.cast(0.0, self.dtype))
         self.lmbda.assign(new_lmbda)
 
-    # ---------- schedules / setters ----------
+    # ------------------------------------------------------------------ #
+    # Schedules / setters / misc
+    # ------------------------------------------------------------------ #
 
     def set_beta(self, beta: float):
+        """Set softplus steepness β."""
         self.beta.assign(tf.cast(beta, self.dtype))
 
     def set_mu_n(self, mu_n: float):
+        """Set ALM coefficient μ_n."""
         self.mu_n.assign(tf.cast(mu_n, self.dtype))
 
     def multiply_weights(self, extra_w: np.ndarray):
         """
-        Multiply current per-sample weights by extra_w (e.g., IRLS / edge weighting).
+        Permanently multiply current base weights self.w by extra_w (e.g., IRLS / edge weighting).
+
+        若只是想在某次 energy 调用中使用临时权重，请使用
+        energy(..., extra_weights=...)，而不是本函数。
         """
         ew = _to_tf(extra_w, self.dtype)
         self.w.assign(self.w * ew)
 
     def reset_for_new_batch(self):
-        """Clear internal tensors/state so the operator can be rebuilt with a new batch."""
+        """
+        Clear internal tensors/state so the operator can be rebuilt with a new batch.
+
+        注意：这会丢弃当前批次的 λ，需要在下一次 build_* 之后重新优化。
+        """
         self.xs = self.xm = self.n = self.w = None
         self.lmbda = None
         self._built_N = 0
@@ -236,9 +356,9 @@ class NormalContactALM:
         self._auto_flip_done = False
 
 
-# -----------------------------
+# --------------------------------------------------------------------------- #
 # Helpers
-# -----------------------------
+# --------------------------------------------------------------------------- #
 
 def tfp_median(x: tf.Tensor) -> tf.Tensor:
     """
@@ -256,6 +376,7 @@ def tfp_median(x: tf.Tensor) -> tf.Tensor:
         lambda: x_sorted[mid],
     )
     return tf.cast(mid_val, x.dtype)
+
 
 def _ensure_2d(u: tf.Tensor) -> tf.Tensor:
     """Ensure u has shape (N,3)."""
