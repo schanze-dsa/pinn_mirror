@@ -276,6 +276,39 @@ def _prepare_config_with_autoguess():
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
 
+    # ===== 预紧分阶段 / 顺序设置 =====
+    staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
+
+    # 顶层布尔开关优先，其次是 staging_cfg 内的 enabled
+    use_stages_val = cfg_yaml.get("preload_use_stages", None)
+    if use_stages_val is not None:
+        cfg.preload_use_stages = bool(use_stages_val)
+    if "enabled" in staging_cfg:
+        cfg.preload_use_stages = bool(staging_cfg["enabled"])
+
+    random_order_val = cfg_yaml.get("preload_randomize_order", None)
+    if random_order_val is not None:
+        cfg.preload_randomize_order = bool(random_order_val)
+    if "randomize_order" in staging_cfg:
+        cfg.preload_randomize_order = bool(staging_cfg["randomize_order"])
+
+    if "repeat" in staging_cfg:
+        cfg.preload_sequence_repeat = int(staging_cfg["repeat"])
+    if "shuffle" in staging_cfg:
+        cfg.preload_sequence_shuffle = bool(staging_cfg["shuffle"])
+    if "jitter" in staging_cfg:
+        cfg.preload_sequence_jitter = float(staging_cfg["jitter"])
+
+    seq_overrides = cfg_yaml.get("preload_sequence", None)
+    if seq_overrides:
+        cfg.preload_sequence = list(seq_overrides)
+    seq_from_staging = staging_cfg.get("sequence", None)
+    if seq_from_staging:
+        cfg.preload_sequence = list(seq_from_staging)
+
+    if cfg.preload_sequence:
+        cfg.preload_use_stages = True
+
     # ===== 损失加权配置（含自适应） =====
     loss_cfg_yaml = cfg_yaml.get("loss_config", {}) or {}
     base_weights_yaml = loss_cfg_yaml.get("base_weights", {}) or {}

@@ -574,18 +574,26 @@ class Trainer:
         stage_last = []
         cumulative = np.zeros_like(P)
         mask = np.zeros_like(P)
-        for idx in order:
-            cumulative[idx] = P[idx]
-            mask[idx] = 1.0
+        rank = np.zeros((nb,), dtype=np.float32)
+        for pos, idx in enumerate(order):
+            idx_int = int(idx)
+            cumulative[idx_int] = P[idx_int]
+            mask[idx_int] = 1.0
             stage_loads.append(cumulative.copy())
             stage_masks.append(mask.copy())
             onehot = np.zeros_like(P)
-            onehot[idx] = 1.0
+            onehot[idx_int] = 1.0
             stage_last.append(onehot)
+            rank[idx_int] = float(pos)
+        if nb > 1:
+            rank = rank / float(nb - 1)
+        else:
+            rank = np.zeros_like(rank)
         return {
             "stages": np.stack(stage_loads).astype(np.float32),
             "stage_masks": np.stack(stage_masks).astype(np.float32),
             "stage_last": np.stack(stage_last).astype(np.float32),
+            "stage_rank": rank.astype(np.float32),
         }
 
     def _sample_preload_case(self) -> Dict[str, np.ndarray]:
@@ -618,9 +626,13 @@ class Trainer:
         masks = case.get("stage_masks")
         lasts = case.get("stage_last")
         order_np = case.get("order")
+        rank_np = case.get("stage_rank")
         if order_np is None:
             order_np = np.arange(case["P"].shape[0], dtype=np.int32)
         order_tf = tf.convert_to_tensor(order_np, dtype=tf.int32)
+        rank_tf = None
+        if rank_np is not None:
+            rank_tf = tf.convert_to_tensor(rank_np, dtype=tf.float32)
         stage_params: List[Dict[str, tf.Tensor]] = []
         stage_count = int(len(stages))
         shift = tf.cast(self.cfg.model_cfg.preload_shift, tf.float32)
@@ -630,20 +642,26 @@ class Trainer:
             mask_stage = tf.convert_to_tensor(masks[idx], dtype=tf.float32)
             last_stage = tf.convert_to_tensor(lasts[idx], dtype=tf.float32)
             norm = (p_stage - shift) / scale
-            features = tf.concat([norm, mask_stage, last_stage], axis=0)
-            stage_params.append(
-                {
-                    "P": p_stage,
-                    "P_hat": features,
-                    "stage_index": tf.constant(idx, dtype=tf.int32),
-                    "stage_mask": mask_stage,
-                    "stage_last": last_stage,
-                    "stage_order": order_tf,
-                    "stage_count": tf.constant(stage_count, dtype=tf.int32),
-                }
-            )
+            feat_parts = [norm, mask_stage, last_stage]
+            if rank_tf is not None:
+                feat_parts.append(rank_tf)
+            features = tf.concat(feat_parts, axis=0)
+            stage_entry: Dict[str, tf.Tensor] = {
+                "P": p_stage,
+                "P_hat": features,
+                "stage_index": tf.constant(idx, dtype=tf.int32),
+                "stage_mask": mask_stage,
+                "stage_last": last_stage,
+                "stage_order": order_tf,
+                "stage_count": tf.constant(stage_count, dtype=tf.int32),
+            }
+            if rank_tf is not None:
+                stage_entry["stage_rank"] = rank_tf
+            stage_params.append(stage_entry)
         params["stages"] = stage_params
         params["stage_order"] = order_tf
+        if rank_tf is not None:
+            params["stage_rank"] = rank_tf
         params["stage_count"] = tf.constant(stage_count, dtype=tf.int32)
         return params
 

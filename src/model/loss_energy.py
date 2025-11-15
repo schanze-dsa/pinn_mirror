@@ -279,8 +279,11 @@ class TotalEnergy:
                 stats_all[f"s{idx+1}_{key}"] = cur
                 prev[key] = cur
 
-        if isinstance(root_params, dict) and "stage_order" in root_params:
-            stats_all["stage_order"] = root_params["stage_order"]
+        if isinstance(root_params, dict):
+            if "stage_order" in root_params:
+                stats_all["stage_order"] = root_params["stage_order"]
+            if "stage_rank" in root_params:
+                stats_all["stage_rank"] = root_params["stage_rank"]
 
         Pi = self._combine_parts(totals)
         return Pi, totals, stats_all
