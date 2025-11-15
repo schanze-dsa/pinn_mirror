@@ -23,6 +23,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")  # 可选：减少冗余日�
 
 import sys
 import argparse
+import math
 from dataclasses import asdict
 import yaml  # 新增：读取 config.yaml
 
@@ -366,11 +367,34 @@ def _prepare_config_with_autoguess():
     cfg.elas_cfg.n_points_per_step = int(elas_cfg_yaml.get("n_points_per_step", 4096))
     cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
 
-    # 3) 增大接触采样密度，并将重采样频率下调为每步刷新
-    cfg.n_contact_points_per_pair = max(cfg.n_contact_points_per_pair, 6000)
+    # 3) 接触/预紧采样：根据阶段数做显存友好的调整
+    stage_multiplier = 1
+    if cfg.preload_use_stages:
+        stage_multiplier = max(1, len(cfg.preload_specs))
+        if cfg.preload_sequence:
+            for entry in cfg.preload_sequence:
+                if isinstance(entry, dict):
+                    order = entry.get("order") or entry.get("orders")
+                    values = entry.get("values") or entry.get("P")
+                    if order is not None:
+                        stage_multiplier = max(stage_multiplier, len(order))
+                    elif values is not None:
+                        stage_multiplier = max(stage_multiplier, len(values))
+                elif isinstance(entry, (list, tuple)):
+                    stage_multiplier = max(stage_multiplier, len(entry))
+
+    contact_target = cfg.n_contact_points_per_pair
     cfg.resample_contact_every = 1
-    #    预紧端面采样使用高密度样本以放大不同预紧力的影响
-    cfg.preload_n_points_each = max(cfg.preload_n_points_each, 2000)
+    if stage_multiplier > 1:
+        per_stage_contact = max(256, math.ceil(contact_target / stage_multiplier))
+        if per_stage_contact != contact_target:
+            approx_total = per_stage_contact * stage_multiplier
+            print(
+                "[main] 分阶段预紧启用：将每对接触采样从 "
+                f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total} 总点数)。"
+            )
+        cfg.n_contact_points_per_pair = per_stage_contact
+
 
     # 4) 混合精度（4080S 支持）
     cfg.mixed_precision = "mixed_float16"
