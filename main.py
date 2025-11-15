@@ -23,6 +23,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")  # 可选：减少冗余日�
 
 import sys
 import argparse
+import math
 from dataclasses import asdict
 import yaml  # 新增：读取 config.yaml
 
@@ -276,6 +277,80 @@ def _prepare_config_with_autoguess():
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
 
+    # ===== 预紧分阶段 / 顺序设置 =====
+    staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
+
+    # 顶层布尔开关优先，其次是 staging_cfg 内的 enabled
+    use_stages_val = cfg_yaml.get("preload_use_stages", None)
+    if use_stages_val is not None:
+        cfg.preload_use_stages = bool(use_stages_val)
+    if "enabled" in staging_cfg:
+        cfg.preload_use_stages = bool(staging_cfg["enabled"])
+
+    random_order_val = cfg_yaml.get("preload_randomize_order", None)
+    if random_order_val is not None:
+        cfg.preload_randomize_order = bool(random_order_val)
+    if "randomize_order" in staging_cfg:
+        cfg.preload_randomize_order = bool(staging_cfg["randomize_order"])
+
+    if "repeat" in staging_cfg:
+        cfg.preload_sequence_repeat = int(staging_cfg["repeat"])
+    if "shuffle" in staging_cfg:
+        cfg.preload_sequence_shuffle = bool(staging_cfg["shuffle"])
+    if "jitter" in staging_cfg:
+        cfg.preload_sequence_jitter = float(staging_cfg["jitter"])
+
+    seq_overrides = cfg_yaml.get("preload_sequence", None)
+    if seq_overrides:
+        cfg.preload_sequence = list(seq_overrides)
+    seq_from_staging = staging_cfg.get("sequence", None)
+    if seq_from_staging:
+        cfg.preload_sequence = list(seq_from_staging)
+
+    if cfg.preload_sequence:
+        cfg.preload_use_stages = True
+
+    # ===== 损失加权配置（含自适应） =====
+    loss_cfg_yaml = cfg_yaml.get("loss_config", {}) or {}
+    base_weights_yaml = loss_cfg_yaml.get("base_weights", {}) or {}
+    weight_key_map = {
+        "w_int": ("w_int", "E_int"),
+        "w_cn": ("w_cn", "E_cn"),
+        "w_ct": ("w_ct", "E_ct"),
+        "w_tie": ("w_tie", "E_tie"),
+        "w_bc": ("w_bc", "E_bc"),
+        "w_pre": ("w_pre", "W_pre"),
+    }
+    for yaml_key, (attr, _) in weight_key_map.items():
+        if yaml_key in base_weights_yaml:
+            setattr(cfg.total_cfg, attr, float(base_weights_yaml[yaml_key]))
+
+    adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
+    cfg.loss_adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
+    cfg.loss_update_every = int(adaptive_cfg.get("update_every", cfg.loss_update_every))
+    cfg.loss_ema_decay = float(adaptive_cfg.get("ema_decay", cfg.loss_ema_decay))
+    if "min_weight" in adaptive_cfg:
+        cfg.loss_min_factor = float(adaptive_cfg["min_weight"])
+    if "max_weight" in adaptive_cfg:
+        cfg.loss_max_factor = float(adaptive_cfg["max_weight"])
+    temperature = float(adaptive_cfg.get("temperature", 0.0) or 0.0)
+    if temperature > 0.0:
+        cfg.loss_gamma = 1.0 / temperature
+    else:
+        cfg.loss_gamma = float(adaptive_cfg.get("gamma", cfg.loss_gamma))
+
+    focus_terms_yaml = adaptive_cfg.get("focus_terms", []) or []
+    focus_terms = []
+    for item in focus_terms_yaml:
+        key = str(item).strip()
+        mapping = weight_key_map.get(key)
+        if mapping is None:
+            continue
+        focus_terms.append(mapping[1])
+    cfg.loss_focus_terms = tuple(focus_terms)
+    cfg.total_cfg.adaptive_scheme = adaptive_cfg.get("scheme", cfg.total_cfg.adaptive_scheme)
+
+
     # ===== 显存友好覆盖（建议先这样跑通，再逐步调回） =====
     # 1) 提升模型表达能力（更宽更深的位移网络 + 更大的条件编码器）
     cfg.model_cfg.encoder.width = 96
@@ -292,11 +367,70 @@ def _prepare_config_with_autoguess():
     cfg.elas_cfg.n_points_per_step = int(elas_cfg_yaml.get("n_points_per_step", 4096))
     cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
 
-    # 3) 增大接触采样密度，并将重采样频率下调为每步刷新
-    cfg.n_contact_points_per_pair = max(cfg.n_contact_points_per_pair, 6000)
+    # 3) 接触/预紧采样：根据阶段数做显存友好的调整
+    stage_multiplier = 1
+    if cfg.preload_use_stages:
+        stage_multiplier = max(1, len(cfg.preload_specs))
+        if cfg.preload_sequence:
+            for entry in cfg.preload_sequence:
+                if isinstance(entry, dict):
+                    order = entry.get("order") or entry.get("orders")
+                    values = entry.get("values") or entry.get("P")
+                    if order is not None:
+                        stage_multiplier = max(stage_multiplier, len(order))
+                    elif values is not None:
+                        stage_multiplier = max(stage_multiplier, len(values))
+                elif isinstance(entry, (list, tuple)):
+                    stage_multiplier = max(stage_multiplier, len(entry))
+
+    contact_target = cfg.n_contact_points_per_pair
     cfg.resample_contact_every = 1
-    #    预紧端面采样使用高密度样本以放大不同预紧力的影响
-    cfg.preload_n_points_each = max(cfg.preload_n_points_each, 800)
+    if stage_multiplier > 1:
+        per_stage_contact = max(256, math.ceil(contact_target / stage_multiplier))
+        approx_total_contact = per_stage_contact * stage_multiplier
+        if per_stage_contact != contact_target:
+            print(
+                "[main] 分阶段预紧启用：将每对接触采样从 "
+                f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total_contact} 总点数)。"
+            )
+        # 分阶段计算仍会在同一梯度带内重复评估接触能，因此进一步限制总量
+        contact_cap = 2048
+        if per_stage_contact > contact_cap:
+            per_stage_contact = contact_cap
+            approx_total_contact = per_stage_contact * stage_multiplier
+            print(
+                "[main] 接触点上限触发：将每阶段采样压缩到 "
+                f"{per_stage_contact} (≈{approx_total_contact} 总点数)。"
+            )
+        cfg.n_contact_points_per_pair = per_stage_contact
+
+        preload_target = cfg.preload_n_points_each
+        per_stage_preload = max(128, math.ceil(preload_target / stage_multiplier))
+        approx_total_preload = per_stage_preload * stage_multiplier
+        if per_stage_preload != preload_target:
+            print(
+                "[main] 分阶段预紧启用：将每个螺栓端面的采样从 "
+                f"{preload_target} 调整为每阶段 {per_stage_preload} (≈{approx_total_preload} 总点数)。"
+            )
+        preload_cap = 1024
+        if per_stage_preload > preload_cap:
+            per_stage_preload = preload_cap
+            approx_total_preload = per_stage_preload * stage_multiplier
+            print(
+                "[main] 预紧点上限触发：将每阶段端面采样压缩到 "
+                f"{per_stage_preload} (≈{approx_total_preload} 总点数)。"
+            )
+        cfg.preload_n_points_each = per_stage_preload
+
+        elas_target = cfg.elas_cfg.n_points_per_step
+        per_stage_elas = max(1024, math.ceil(elas_target / stage_multiplier))
+        if per_stage_elas != elas_target:
+            print(
+                "[main] 分阶段预紧启用：将 DFEM 每步积分点从 "
+                f"{elas_target} 调整为每阶段 {per_stage_elas}。"
+            )
+            cfg.elas_cfg.n_points_per_step = per_stage_elas
+
 
     # 4) 混合精度（4080S 支持）
     cfg.mixed_precision = "mixed_float16"
