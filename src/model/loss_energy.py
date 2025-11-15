@@ -309,18 +309,37 @@ class TotalEnergy:
 # -----------------------------
 if __name__ == "__main__":
     # 仅做 API 连通性检查；真正的 DFEM/接触细节在各子模块里。
-    from physics.material_lib import MaterialLibrary
-    from physics.contact.contact_operator import ContactOperator
+    from dataclasses import dataclass
     import numpy as np
+    from physics.contact.contact_operator import ContactOperator
 
-    # 1) Dummy elasticity（这里只是接口占位，实际 DFEM 构建在外部完成）
-    matlib = MaterialLibrary({"steel": (210000.0, 0.3)})
-    Nvol = 16
-    X_vol = np.random.randn(Nvol, 3).astype(np.float64)
-    w_vol = np.ones((Nvol,), dtype=np.float64)
-    mat_id = np.zeros((Nvol,), dtype=np.int64)
-    elas = ElasticityEnergy(ElasticityConfig())
-    # 注意：真实项目中应调用你 DFEM 版的构建函数，这里略去
+    @dataclass
+    class DummyBlock:
+        elem_type: str
+        connectivity: list
+
+    @dataclass
+    class DummyPart:
+        name: str
+        element_blocks: list
+
+    class DummyAsm:
+        def __init__(self):
+            # 4 节点四面体：节点编号故意使用非 0 基，以测试映射
+            self.nodes = {
+                10: (0.0, 0.0, 0.0),
+                11: (1.0, 0.0, 0.0),
+                12: (0.0, 1.0, 0.0),
+                13: (0.0, 0.0, 1.0),
+            }
+            block = DummyBlock("C3D4", [[10, 11, 12, 13]])
+            part = DummyPart(name="demo", element_blocks=[block])
+            self.parts = {"demo": part}
+
+    asm = DummyAsm()
+    materials = {"steel": (210000.0, 0.3)}
+    part2mat = {"demo": "steel"}
+    elas = ElasticityEnergy(asm=asm, part2mat=part2mat, materials=materials, cfg=ElasticityConfig())
 
     # 2) Contact (random placeholders)
     cat = {
