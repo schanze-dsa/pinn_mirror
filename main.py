@@ -387,13 +387,49 @@ def _prepare_config_with_autoguess():
     cfg.resample_contact_every = 1
     if stage_multiplier > 1:
         per_stage_contact = max(256, math.ceil(contact_target / stage_multiplier))
+        approx_total_contact = per_stage_contact * stage_multiplier
         if per_stage_contact != contact_target:
-            approx_total = per_stage_contact * stage_multiplier
             print(
                 "[main] 分阶段预紧启用：将每对接触采样从 "
-                f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total} 总点数)。"
+                f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total_contact} 总点数)。"
+            )
+        # 分阶段计算仍会在同一梯度带内重复评估接触能，因此进一步限制总量
+        contact_cap = 2048
+        if per_stage_contact > contact_cap:
+            per_stage_contact = contact_cap
+            approx_total_contact = per_stage_contact * stage_multiplier
+            print(
+                "[main] 接触点上限触发：将每阶段采样压缩到 "
+                f"{per_stage_contact} (≈{approx_total_contact} 总点数)。"
             )
         cfg.n_contact_points_per_pair = per_stage_contact
+
+        preload_target = cfg.preload_n_points_each
+        per_stage_preload = max(128, math.ceil(preload_target / stage_multiplier))
+        approx_total_preload = per_stage_preload * stage_multiplier
+        if per_stage_preload != preload_target:
+            print(
+                "[main] 分阶段预紧启用：将每个螺栓端面的采样从 "
+                f"{preload_target} 调整为每阶段 {per_stage_preload} (≈{approx_total_preload} 总点数)。"
+            )
+        preload_cap = 1024
+        if per_stage_preload > preload_cap:
+            per_stage_preload = preload_cap
+            approx_total_preload = per_stage_preload * stage_multiplier
+            print(
+                "[main] 预紧点上限触发：将每阶段端面采样压缩到 "
+                f"{per_stage_preload} (≈{approx_total_preload} 总点数)。"
+            )
+        cfg.preload_n_points_each = per_stage_preload
+
+        elas_target = cfg.elas_cfg.n_points_per_step
+        per_stage_elas = max(1024, math.ceil(elas_target / stage_multiplier))
+        if per_stage_elas != elas_target:
+            print(
+                "[main] 分阶段预紧启用：将 DFEM 每步积分点从 "
+                f"{elas_target} 调整为每阶段 {per_stage_elas}。"
+            )
+            cfg.elas_cfg.n_points_per_step = per_stage_elas
 
 
     # 4) 混合精度（4080S 支持）
