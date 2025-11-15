@@ -633,7 +633,8 @@ class Trainer:
         rank_tf = None
         if rank_np is not None:
             rank_tf = tf.convert_to_tensor(rank_np, dtype=tf.float32)
-        stage_params: List[Dict[str, tf.Tensor]] = []
+        stage_params_P: List[tf.Tensor] = []
+        stage_params_feat: List[tf.Tensor] = []
         stage_count = int(len(stages))
         shift = tf.cast(self.cfg.model_cfg.preload_shift, tf.float32)
         scale = tf.cast(self.cfg.model_cfg.preload_scale, tf.float32)
@@ -658,12 +659,16 @@ class Trainer:
                 feat_parts.append(rank_tf)
             features = tf.concat(feat_parts, axis=0)
             features.set_shape((feat_dim,))
-            stage_entry: Dict[str, tf.Tensor] = {
-                "P": p_stage,
-                "P_hat": features,
-            }
-            stage_params.append(stage_entry)
-        params["stages"] = tuple(stage_params)
+            stage_params_P.append(p_stage)
+            stage_params_feat.append(features)
+        stage_tensor_P = tf.stack(stage_params_P, axis=0)
+        stage_tensor_P.set_shape((stage_count, n_bolts))
+        stage_tensor_feat = tf.stack(stage_params_feat, axis=0)
+        stage_tensor_feat.set_shape((stage_count, feat_dim))
+        params["stages"] = {
+            "P": stage_tensor_P,
+            "P_hat": stage_tensor_feat,
+        }
         params["stage_order"] = order_tf
         if rank_tf is not None:
             params["stage_rank"] = rank_tf
@@ -675,9 +680,12 @@ class Trainer:
             self.cfg.preload_use_stages
             and isinstance(params, dict)
             and "stages" in params
-            and params["stages"]
         ):
-            return params["stages"][-1]
+            stages = params["stages"]
+            if isinstance(stages, dict) and stages:
+                last_P = stages["P"][-1]
+                last_feat = stages["P_hat"][-1]
+                return {"P": last_P, "P_hat": last_feat}
         return params
 
     def _make_warmup_case(self) -> Dict[str, np.ndarray]:

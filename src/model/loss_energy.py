@@ -263,10 +263,32 @@ class TotalEnergy:
         prev: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
 
-        if not stages:
+        if isinstance(stages, dict):
+            stage_tensor_P = stages.get("P")
+            stage_tensor_feat = stages.get("P_hat")
+            if stage_tensor_P is None or stage_tensor_feat is None:
+                stage_seq: List[Dict[str, tf.Tensor]] = []
+            else:
+                stage_seq = [
+                    {"P": p, "P_hat": z}
+                    for p, z in zip(
+                        tf.unstack(stage_tensor_P, axis=0),
+                        tf.unstack(stage_tensor_feat, axis=0),
+                    )
+                ]
+        else:
+            stage_seq = []
+            for item in stages:
+                if isinstance(item, dict):
+                    stage_seq.append(item)
+                else:
+                    p_val, z_val = item
+                    stage_seq.append({"P": p_val, "P_hat": z_val})
+
+        if not stage_seq:
             return self._combine_parts(totals), totals, stats_all
 
-        for idx, stage_params in enumerate(stages):
+        for idx, stage_params in enumerate(stage_seq):
             stage_parts, stage_stats = self._compute_parts(u_fn, stage_params, tape)
             for k, v in stage_stats.items():
                 stats_all[f"s{idx+1}_{k}"] = v
