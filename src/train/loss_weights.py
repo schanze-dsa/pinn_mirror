@@ -293,6 +293,14 @@ def combine_loss(
     """
     loss = tf.constant(0.0, dtype=tf.float32)
 
+    # Certain energy contributions (e.g. external work) enter the potential with
+    # a negative sign.  Keep a small map of such terms so combine_loss stays
+    # consistent with TotalEnergy.Pi's baseline formulation even when adaptive
+    # weighting is enabled.
+    sign_overrides = {
+        "W_pre": -1.0,
+    }
+
     for name, value in parts.items():
         # 只组合标量项
         if not isinstance(value, tf.Tensor):
@@ -310,6 +318,7 @@ def combine_loss(
         if w is None or abs(w) <= 0.0:
             continue
 
-        loss = loss + tf.cast(w, tf.float32) * tf.cast(value, tf.float32)
+        sign = tf.cast(sign_overrides.get(name, 1.0), tf.float32)
+        loss = loss + sign * tf.cast(w, tf.float32) * tf.cast(value, tf.float32)
 
     return loss
