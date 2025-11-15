@@ -127,6 +127,15 @@ class TrainerConfig:
         w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_bc=1.0, w_pre=1.0
     ))
 
+    # 损失加权（自适应）
+    loss_adaptive_enabled: bool = False
+    loss_update_every: int = 1
+    loss_ema_decay: float = 0.95
+    loss_min_factor: float = 0.25
+    loss_max_factor: float = 4.0
+    loss_gamma: float = 2.0
+    loss_focus_terms: Tuple[str, ...] = field(default_factory=tuple)
+
     # 训练超参
     max_steps: int = 1000
     lr: float = 1e-3
@@ -855,15 +864,24 @@ class Trainer:
             "R_contact_comp": 0.0,
         }
 
-        # 建议在 TotalConfig 里加一个字段：
-        #   adaptive_scheme: str = "off"   # "off" / "contact_only" / "basic"
-        # 如果你还没加，可以先写死为 "off" 或 "contact_only"
-        scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "off")
-
-        self.loss_state = LossWeightState.from_config(
-            base_weights=base_weights,
-            adaptive_scheme=scheme,
-        )
+        adaptive_enabled = bool(getattr(self.cfg, "loss_adaptive_enabled", False))
+        if adaptive_enabled:
+            scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "contact_only")
+            focus_terms = getattr(self.cfg, "loss_focus_terms", tuple())
+            if focus_terms:
+                scheme = "focus"
+            self.loss_state = LossWeightState.from_config(
+                base_weights=base_weights,
+                adaptive_scheme=scheme,
+                ema_decay=getattr(self.cfg, "loss_ema_decay", 0.95),
+                min_factor=getattr(self.cfg, "loss_min_factor", 0.25),
+                max_factor=getattr(self.cfg, "loss_max_factor", 4.0),
+                gamma=getattr(self.cfg, "loss_gamma", 2.0),
+                focus_terms=focus_terms,
+                update_every=getattr(self.cfg, "loss_update_every", 1),
+            )
+        else:
+            self.loss_state = None
         train_pb_kwargs = dict(total=self.cfg.max_steps, desc="Training", leave=True)
         if self.cfg.train_bar_color:
             train_pb_kwargs["colour"] = self.cfg.train_bar_color

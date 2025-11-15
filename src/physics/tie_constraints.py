@@ -54,10 +54,34 @@ class TieConfig:
 class TiePenalty:
     """
     Tie (displacement continuity) penalty energy.
+
+    The constructor is intentionally flexible so legacy call-sites such as
+    ``TiePenalty(alpha=..., dtype=...)`` continue to function after the module
+    rewrite.  ``attach_ties_bcs.py`` still instantiates the class with
+    positional/keyword arguments instead of a ``TieConfig`` instance, therefore
+    we accept the most common keywords and fold them into the dataclass config
+    before proceeding with the modern initialisation path.
     """
 
-    def __init__(self, cfg: Optional[TieConfig] = None):
-        self.cfg = cfg or TieConfig()
+    def __init__(
+        self,
+        cfg: Optional[TieConfig] = None,
+        *,
+        alpha: Optional[float] = None,
+        dtype: Optional[str] = None,
+        **_legacy_kwargs,
+    ):
+        if cfg is None:
+            cfg = TieConfig()
+
+        # Legacy constructors used ``TiePenalty(alpha=..., dtype=...)``.  Allow
+        # those keywords to override the dataclass defaults when present.
+        if alpha is not None:
+            cfg = TieConfig(alpha=alpha, dtype=cfg.dtype)
+        if dtype is not None:
+            cfg = TieConfig(alpha=cfg.alpha, dtype=dtype)
+
+        self.cfg = cfg
         self.dtype = tf.float32 if self.cfg.dtype == "float32" else tf.float64
 
         # per-batch tensors
@@ -71,12 +95,14 @@ class TiePenalty:
 
     # ---------- build ----------
 
-    def build_from_numpy(self,
-                         xs: np.ndarray,
-                         xm: np.ndarray,
-                         w_area: np.ndarray,
-                         dof_mask: Optional[np.ndarray] = None,
-                         extra_w: Optional[np.ndarray] = None):
+    def build_from_numpy(
+        self,
+        xs: np.ndarray,
+        xm: np.ndarray,
+        w_area: np.ndarray,
+        dof_mask: Optional[np.ndarray] = None,
+        extra_w: Optional[np.ndarray] = None,
+    ):
         """
         Prepare per-batch tensors from NumPy arrays.
         """
@@ -102,6 +128,32 @@ class TiePenalty:
     def reset_for_new_batch(self):
         self.xs = self.xm = self.w = self.mask = None
         self._N = 0
+
+    # ---- compatibility aliases -------------------------------------------------
+
+    def build(
+        self,
+        xs: np.ndarray,
+        xm: np.ndarray,
+        w_area: np.ndarray,
+        dof_mask: Optional[np.ndarray] = None,
+        extra_w: Optional[np.ndarray] = None,
+    ):
+        """Backward-compatible alias used by older sampling pipelines."""
+
+        self.build_from_numpy(xs, xm, w_area, dof_mask=dof_mask, extra_w=extra_w)
+
+    def build_from_points(
+        self,
+        xs: np.ndarray,
+        xm: np.ndarray,
+        w_area: np.ndarray,
+        dof_mask: Optional[np.ndarray] = None,
+        extra_w: Optional[np.ndarray] = None,
+    ):
+        """Alias for libraries that expose a ``build_from_points`` API."""
+
+        self.build_from_numpy(xs, xm, w_area, dof_mask=dof_mask, extra_w=extra_w)
 
     # ---------- energy ----------
 
