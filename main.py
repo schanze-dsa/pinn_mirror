@@ -24,6 +24,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")  # 可选：减少冗余日�
 import sys
 import argparse
 import math
+from datetime import datetime
 from dataclasses import asdict
 import yaml  # 新增：读取 config.yaml
 
@@ -535,6 +536,16 @@ def _print_pretrain_audit(cfg: TrainerConfig, asm) -> None:
     print("======================================================================\n")
 
 
+def _default_saved_model_dir(out_dir: str) -> str:
+    """Return a timestamped SavedModel path inside ``out_dir``."""
+
+    base_dir = out_dir or "outputs"
+    root = os.path.abspath(os.path.join(base_dir, "saved_models"))
+    os.makedirs(root, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.join(root, f"pinn_saved_model_{stamp}")
+
+
 def _run_training(cfg, asm, export_saved_model: str = ""):
     # 训练前审计打印（你要的“那种详单”）
     _print_pretrain_audit(cfg, asm)
@@ -543,8 +554,14 @@ def _run_training(cfg, asm, export_saved_model: str = ""):
     trainer = Trainer(cfg)
     trainer.run()
 
-    if export_saved_model:
-        trainer.export_saved_model(export_saved_model)
+    export_dir = (export_saved_model or "").strip()
+    if export_dir:
+        export_dir = os.path.abspath(export_dir)
+        os.makedirs(os.path.dirname(export_dir), exist_ok=True)
+    else:
+        export_dir = _default_saved_model_dir(cfg.out_dir)
+        print(f"[main] 未提供 --export，将 SavedModel 写入: {export_dir}")
+    trainer.export_saved_model(export_dir)
 
     print("\n✅ 训练完成！请到 'outputs/' 查看 5 张 “MIRROR up” 变形云图（文件名包含三颗预紧力数值）。")
     print("   如需修改 INP 路径、表面名或超参，优先修改 config.yaml，如有需要再改 main.py 顶部 USER SETTINGS 默认值。")
