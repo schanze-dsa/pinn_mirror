@@ -33,7 +33,7 @@ Loss-weight scheduler for TotalEnergy / Trainer.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -108,11 +108,18 @@ class LossWeightState:
     max_factor: float = 4.0
     gamma: float = 2.0
 
+    update_every: int = 1
+    focus_terms: Tuple[str, ...] = tuple()
+
     step: int = 0
 
     # 方便调试记录最近一次因子
     last_factor_cn: float = 1.0
     last_factor_ct: float = 1.0
+    last_factors: Dict[str, float] = field(default_factory=dict)
+
+    # 通用 EMA 容器（focus_terms 自适应时使用）
+    ema_terms: Dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_config(
@@ -123,6 +130,8 @@ class LossWeightState:
         min_factor: float = 0.25,
         max_factor: float = 4.0,
         gamma: float = 2.0,
+        focus_terms: Tuple[str, ...] | None = None,
+        update_every: int = 1,
     ) -> "LossWeightState":
         """
         从配置初始化一个 LossWeightState。
@@ -146,6 +155,8 @@ class LossWeightState:
             min_factor=min_factor,
             max_factor=max_factor,
             gamma=gamma,
+            focus_terms=tuple(focus_terms or tuple()),
+            update_every=max(int(update_every), 1),
         )
 
     def as_dict(self) -> Dict[str, float]:
@@ -194,6 +205,77 @@ def update_loss_weights(
         state.current = dict(state.base)
         state.last_factor_cn = 1.0
         state.last_factor_ct = 1.0
+        state.last_factors = {}
+        return
+
+    # 每 update_every 步才真正更新一次权重；EMA 会在每次调用时更新
+    should_update = state.step % max(state.update_every, 1) == 0
+
+    # 若 focus_terms 非空，则采用通用自适应逻辑
+    if state.focus_terms:
+        residual_aliases = {
+            "E_cn": ("R_contact_comp",),
+            "E_ct": ("R_fric_comp",),
+        }
+
+        values = []
+        term_order = []
+        d = state.decay
+        for term in state.focus_terms:
+            # 依次尝试 term 自身及别名，找到第一个存在的分量
+            aliases = (term,) + residual_aliases.get(term, tuple())
+            val = 0.0
+            for alias in aliases:
+                part = parts.get(alias)
+                if isinstance(part, tf.Tensor) and part.shape.rank == 0:
+                    val = abs(_to_float(part))
+                    break
+                if isinstance(part, (float, int, np.generic)):
+                    val = abs(_to_float(part))
+                    break
+            prev = state.ema_terms.get(term, 0.0)
+            ema = d * prev + (1.0 - d) * val
+            state.ema_terms[term] = ema
+            values.append(ema)
+            term_order.append(term)
+
+        # 同步兼容字段（便于调试输出）
+        state.ema_contact = state.ema_terms.get("E_cn", state.ema_contact)
+        state.ema_fric = state.ema_terms.get("E_ct", state.ema_fric)
+
+        if not should_update:
+            return
+
+        if not any(v > 1e-16 for v in values):
+            state.current = dict(state.base)
+            state.last_factors = {term: 1.0 for term in term_order}
+            state.last_factor_cn = state.last_factors.get("E_cn", 1.0)
+            state.last_factor_ct = state.last_factors.get("E_ct", 1.0)
+            return
+
+        vals = np.array(values, dtype=np.float64)
+        mean = float(np.mean(vals)) if np.mean(vals) > 1e-16 else 1.0
+        x = vals / mean
+
+        logits = state.gamma * x
+        logits = logits - np.max(logits)
+        exp = np.exp(logits)
+        soft = exp / np.sum(exp)
+
+        avg = float(len(soft)) if len(soft) > 0 else 1.0
+        factors = avg * soft
+        factors = np.clip(factors, state.min_factor, state.max_factor)
+
+        new_current = dict(state.base)
+        state.last_factors = {}
+        for term, factor in zip(term_order, factors):
+            if term in new_current:
+                new_current[term] = new_current[term] * float(factor)
+                state.last_factors[term] = float(factor)
+
+        state.current = new_current
+        state.last_factor_cn = state.last_factors.get("E_cn", state.last_factor_cn)
+        state.last_factor_ct = state.last_factors.get("E_ct", state.last_factor_ct)
         return
 
     # --------------------------------------------------
@@ -227,6 +309,7 @@ def update_loss_weights(
         state.current = dict(state.base)
         state.last_factor_cn = 1.0
         state.last_factor_ct = 1.0
+        state.last_factors = {}
         return
 
     # --------------------------------------------------
@@ -235,6 +318,9 @@ def update_loss_weights(
     #              然后平移到平均因子 ~1，并限制在 [min_factor, max_factor]。
     # --------------------------------------------------
     if state.adaptive_scheme in ("contact_only", "basic"):
+        if not should_update:
+            return
+
         vals = np.array([state.ema_contact, state.ema_fric], dtype=np.float64)
         mean = float(np.mean(vals)) if np.mean(vals) > 1e-16 else 1.0
         x = vals / mean  # 归一化到 ~O(1)
@@ -262,12 +348,14 @@ def update_loss_weights(
         state.current = new_current
         state.last_factor_cn = f_cn
         state.last_factor_ct = f_ct
+        state.last_factors = {"E_cn": f_cn, "E_ct": f_ct}
         return
 
     # 其它未知 scheme，退回 base
     state.current = dict(state.base)
     state.last_factor_cn = 1.0
     state.last_factor_ct = 1.0
+    state.last_factors = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +381,14 @@ def combine_loss(
     """
     loss = tf.constant(0.0, dtype=tf.float32)
 
+    # Certain energy contributions (e.g. external work) enter the potential with
+    # a negative sign.  Keep a small map of such terms so combine_loss stays
+    # consistent with TotalEnergy.Pi's baseline formulation even when adaptive
+    # weighting is enabled.
+    sign_overrides = {
+        "W_pre": -1.0,
+    }
+
     for name, value in parts.items():
         # 只组合标量项
         if not isinstance(value, tf.Tensor):
@@ -310,6 +406,7 @@ def combine_loss(
         if w is None or abs(w) <= 0.0:
             continue
 
-        loss = loss + tf.cast(w, tf.float32) * tf.cast(value, tf.float32)
+        sign = tf.cast(sign_overrides.get(name, 1.0), tf.float32)
+        loss = loss + sign * tf.cast(w, tf.float32) * tf.cast(value, tf.float32)
 
     return loss
