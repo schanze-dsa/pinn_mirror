@@ -110,6 +110,17 @@ bolts:
     up_surface_key:   'ASM::"bolt3 up"'
     down_surface_key: 'ASM::"bolt3 down"'
 
+# 预紧分阶段/顺序设置（enabled=true 则训练/推理都会按照顺序分步加载）
+preload_staging:
+  enabled: true              # 启用分阶段加载 -> PINN 输入包含顺序信息
+  randomize_order: true      # 训练时随机打乱三颗螺栓的加载顺序
+  repeat: 3                  # 每组顺序持续的步数（>1 时可重复使用同一组合）
+  shuffle: false             # 若提供 sequence 列表，是否在 epoch 间随机打乱条目
+  jitter: 0.0                # 顺序列表在训练时叠加的 ±jitter 噪声（N）
+  # sequence:               # 如需固定顺序，可取消注释并填写：
+  #   - values: [800, 600, 500]
+  #     order:  [1, 3, 2]    # 顺序字段支持 1-based 或 0-based
+
 # ------------------------------------------------------------
 # 4. 接触对设置（master/slave surface 名需与 INP 中一致）
 # ------------------------------------------------------------
@@ -170,9 +181,10 @@ network_config:
 
 optimizer_config:
   type: Adam
-  learning_rate: 0.001
+  learning_rate: 0.0005
+  grad_clip_norm: 1.0e6
   batch_size: 32
-  epochs: 500
+  epochs: 1000
 
 # ------------------------------------------------------------
 # 6. 弹性 DFEM 配置（ElasticityConfig）
@@ -203,7 +215,7 @@ loss_config:
     temperature: 1.0        # softmax 温度
     min_weight: 0.1         # 单项权重下限
     max_weight: 10.0        # 单项权重上限
-    focus_terms: [w_int, w_cn, w_ct]  # 重点自适应的损失项
+    focus_terms: [w_int, w_cn, w_ct, w_pre]  # 重点自适应的损失项
 
 # ------------------------------------------------------------
 # 8. 输出与可视化
@@ -216,6 +228,14 @@ output_config:
 # 9. INP 文件路径
 # ------------------------------------------------------------
 inp_path: D:/shuangfan/shuangfan.inp
+
+# ------------------------------------------------------------
+# 10. 训练采样/调度（main.py 会读取这些值覆盖默认兜底）
+# ------------------------------------------------------------
+n_contact_points_per_pair: 2400     # 每对接触面的采样数（单阶段）
+preload_n_points_each: 800         # 单个螺栓端面的采样数
+resample_contact_every: 5          # 每隔多少步重采样接触点（0=只采样首步）
+alm_update_every: 75               # 接触 ALM 罚乘子更新周期
 
 
 n_tie_points: 2000
