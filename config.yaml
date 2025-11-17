@@ -10,7 +10,10 @@
 # ------------------------------------------------------------
 
 # 材料标签的枚举（顺序无所谓，但名字要和下面 material_properties 一致）
-material_enum: [jingmian, structural_steel, zhijia]
+material_enum:
+  - jingmian
+  - structural_steel
+  - zhijia
 
 # 各材料的属性。当前 DFEM 静力分析只会用到 E 和 nu，
 # 其它参数为后续屈服判定、动力学、热–结构耦合等做准备。
@@ -177,7 +180,10 @@ network_config:
   model_type: pinn         # 之后会 DFEM 化：网络预测节点位移/场
   input_dim: 3             # 例如三个预紧力或加载参数
   output_dim: 1            # 目标量维度；如需输出完整位移场可在代码中扩展
-  layers: [64, 64, 32
+  layers:
+    - 64
+    - 64
+    - 32
 
 optimizer_config:
   type: Adam
@@ -215,7 +221,11 @@ loss_config:
     temperature: 1.0        # softmax 温度
     min_weight: 0.1         # 单项权重下限
     max_weight: 10.0        # 单项权重上限
-    focus_terms: [w_int, w_cn, w_ct, w_pre]  # 重点自适应的损失项
+    focus_terms:
+      - w_int
+      - w_cn
+      - w_ct
+      - w_pre   # 重点自适应的损失项
 
 # ------------------------------------------------------------
 # 8. 输出与可视化
