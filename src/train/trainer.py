@@ -1450,6 +1450,11 @@ class Trainer:
             title_prefix: Optional custom title prefix for the figure.
             show: If ``True`` call ``plt.show()`` instead of closing the
                 figure (useful when running interactively).
+            data_out_path: Text export path or ``"auto"``/``None`` for
+                automatic/disabled displacement dumps.
+            preload_order: Optional tightening sequence (either 0- or
+                1-based) used when staged preload is enabled. When omitted,
+                the natural 1-2-3 order is applied.
 
         Returns:
             The absolute/relative path where the image was written.
@@ -1463,6 +1468,8 @@ class Trainer:
             raise ValueError("'preload' must contain exactly three values (for the three bolts).")
 
         case: Dict[str, np.ndarray] = {"P": P}
+        if preload_order is not None and not self.cfg.preload_use_stages:
+            print("[viz] preload_order 被忽略：配置中未启用分阶段加载。")
         if self.cfg.preload_use_stages:
             nb = P.size
             if preload_order is not None:
@@ -1471,16 +1478,23 @@ class Trainer:
                 order_arr = np.arange(nb, dtype=np.int32)
             case["order"] = order_arr
             case.update(self._build_stage_case(P, order_arr))
+            order_display = "-".join(str(int(o) + 1) for o in order_arr.tolist())
+        else:
+            order_arr = None
+            order_display = None
         params_full = self._make_preload_params(case)
         params = self._extract_final_stage_params(params_full)
         title = title_prefix or self.cfg.viz_title_prefix
+        if order_display:
+            title = f"{title}  (order={order_display})"
 
         if out_path is None:
             os.makedirs(self.cfg.out_dir, exist_ok=True)
             p_int = [int(round(float(x))) for x in P]
+            ord_tag = f"_ord{order_display.replace('-', '')}" if order_display else ""
             out_path = os.path.join(
                 self.cfg.out_dir,
-                f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
+                f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}{ord_tag}.png",
             )
 
         resolved_data_path: Optional[str]
@@ -1522,7 +1536,10 @@ class Trainer:
         self.last_viz_data_path = data_path
         if data_path:
             print(f"[viz] displacement data -> {data_path}")
-        print(f"[viz] saved -> {out_path}")
+        if order_display:
+            print(f"[viz] saved -> {out_path}  (order={order_display})")
+        else:
+            print(f"[viz] saved -> {out_path}")
         return out_path
 
     # ----------------- 可视化（鲁棒多签名） -----------------
@@ -1560,8 +1577,18 @@ class Trainer:
         for i in range(n_samples):
             preload_case = self._sample_preload_case()
             P = preload_case["P"]
+            order_display = None
+            if self.cfg.preload_use_stages and "order" in preload_case:
+                order_display = "-".join(
+                    str(int(o) + 1) for o in preload_case["order"].tolist()
+                )
             title = f"{self.cfg.viz_title_prefix}  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
-            save_path = os.path.join(self.cfg.out_dir, f"deflection_{i+1:02d}.png")
+            if order_display:
+                title += f"  (order={order_display})"
+            suffix = f"_{order_display.replace('-', '')}" if order_display else ""
+            save_path = os.path.join(
+                self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}.png"
+            )
             params_full = self._make_preload_params(preload_case)
             params_eval = self._extract_final_stage_params(params_full)
             try:
@@ -1573,7 +1600,10 @@ class Trainer:
                         plt.close()
                     except Exception:
                         pass
-                print(f"[viz] saved -> {save_path}")
+                if order_display:
+                    print(f"[viz] saved -> {save_path}  (order={order_display})")
+                else:
+                    print(f"[viz] saved -> {save_path}")
                 if data_path:
                     print(f"[viz] displacement data -> {data_path}")
             except TypeError as e:

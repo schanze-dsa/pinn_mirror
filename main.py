@@ -596,6 +596,7 @@ def _run_inference(cfg,
                    data_out: str = "auto",
                    title_prefix: str = "",
                    show: bool = False,
+                   preload_order=None,
                    export_saved_model: str = ""):
     from train.trainer import Trainer
 
@@ -612,6 +613,7 @@ def _run_inference(cfg,
         title_prefix=title_prefix or None,
         show=show,
         data_out_path=data_out,
+        preload_order=preload_order,
     )
 
     print("\n✅ 推理完成！")
@@ -632,6 +634,13 @@ def main(argv=None):
     parser.add_argument(
         "--preload", nargs=3, type=float, metavar=("P1", "P2", "P3"),
         help="三个螺栓的预紧力，单位 N (仅在 --mode infer 时使用)"
+    )
+    parser.add_argument(
+        "--order", nargs=3, type=int, metavar=("B1", "B2", "B3"),
+        help=(
+            "分阶段推理时三颗螺栓的拧紧顺序；例如 '2 3 1' 表示第二颗先拧，"
+            "再拧第三、第一颗。留空则默认按 1-2-3 的顺序加载。"
+        ),
     )
     parser.add_argument(
         "--ckpt", default="",
@@ -676,6 +685,7 @@ def main(argv=None):
             data_out=args.data,
             title_prefix=args.title,
             show=args.show,
+            preload_order=args.order,
             export_saved_model=args.export,
         )
 
