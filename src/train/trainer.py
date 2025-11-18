@@ -13,8 +13,9 @@ from train.attach_ties_bcs import attach_ties_and_bcs_from_inp
 import os
 import sys
 import time
+import copy
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, Mapping
+from typing import Dict, List, Optional, Tuple, Any, Mapping, Sequence
 
 import numpy as np
 from tensorflow.python.util import deprecation
@@ -62,7 +63,7 @@ from inp_io.inp_parser import load_inp, AssemblyModel
 from mesh.volume_quadrature import build_volume_points
 from mesh.contact_pairs import ContactPairSpec, build_contact_map, resample_contact_map
 from physics.material_lib import MaterialLibrary
-from model.pinn_model import create_displacement_model, ModelConfig
+from model.pinn_model import create_displacement_model, ModelConfig, DisplacementModel
 from physics.elasticity_energy import ElasticityEnergy, ElasticityConfig
 from physics.contact.contact_operator import ContactOperator, ContactOperatorConfig
 from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig
@@ -111,10 +112,14 @@ class TrainerConfig:
     # 预紧力范围（N）
     preload_min: float = 200.0
     preload_max: float = 1000.0
-    preload_sequence: List[List[float]] = field(default_factory=list)
+    preload_sequence: List[Any] = field(default_factory=list)
     preload_sequence_repeat: int = 1
     preload_sequence_shuffle: bool = False
     preload_sequence_jitter: float = 0.0
+
+    # 预紧顺序（分步加载）
+    preload_use_stages: bool = False
+    preload_randomize_order: bool = True
 
     # 物理项/模型配置
     model_cfg: ModelConfig = field(default_factory=ModelConfig)
@@ -127,13 +132,29 @@ class TrainerConfig:
         w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_bc=1.0, w_pre=1.0
     ))
 
+    # 损失加权（自适应）
+    loss_adaptive_enabled: bool = False
+    loss_update_every: int = 1
+    loss_ema_decay: float = 0.95
+    loss_min_factor: float = 0.25
+    loss_max_factor: float = 4.0
+    loss_gamma: float = 2.0
+    loss_focus_terms: Tuple[str, ...] = field(default_factory=tuple)
+
     # 训练超参
     max_steps: int = 1000
+    adam_steps: Optional[int] = None
     lr: float = 1e-3
     grad_clip_norm: Optional[float] = 1.0
     log_every: int = 1
     alm_update_every: int = 10
     resample_contact_every: int = 10
+    lbfgs_enabled: bool = False
+    lbfgs_max_iter: int = 200
+    lbfgs_tolerance: float = 1e-6
+    lbfgs_history_size: int = 50
+    lbfgs_line_search: int = 50
+    lbfgs_reuse_last_batch: bool = True
 
     # 进度条颜色（None 则禁用彩色，使用终端默认色）
     build_bar_color: Optional[str] = "cyan"
@@ -175,23 +196,38 @@ class Trainer:
         self._pi_ema: Optional[float] = None
         self._prev_pi: Optional[float] = None
         self._preload_sequence: List[np.ndarray] = []
+        self._preload_sequence_orders: List[Optional[np.ndarray]] = []
         self._preload_sequence_index: int = 0
         self._preload_sequence_hold: int = 0
         self._preload_current_target: Optional[np.ndarray] = None
+        self._preload_current_order: Optional[np.ndarray] = None
+        self._last_preload_order: Optional[np.ndarray] = None
+        self._last_preload_case: Optional[Dict[str, np.ndarray]] = None
         self._train_vars: List[tf.Variable] = []
 
         if cfg.preload_sequence:
             sanitized: List[np.ndarray] = []
+            sanitized_orders: List[Optional[np.ndarray]] = []
             for idx, entry in enumerate(cfg.preload_sequence):
+                order_entry = None
+                values_entry: Any = entry
+                if isinstance(entry, dict):
+                    order_entry = entry.get("order")
+                    for key in ("values", "loads", "P", "p", "preload", "forces"):
+                        if key in entry:
+                            values_entry = entry[key]
+                            break
                 try:
-                    arr = np.array(entry, dtype=np.float32).reshape(-1)
+                    arr = np.array(values_entry, dtype=np.float32).reshape(-1)
                 except Exception:
                     print(
                         f"[preload] 忽略 preload_sequence[{idx}]，无法解析为浮点数组：{entry}"
                     )
+                    sanitized_orders.append(None)
                     continue
                 if arr.size == 0:
                     print(f"[preload] 忽略 preload_sequence[{idx}]，未提供数值。")
+                    sanitized_orders.append(None)
                     continue
                 if arr.size == 1:
                     arr = np.repeat(arr, 3)
@@ -199,25 +235,63 @@ class Trainer:
                     print(
                         f"[preload] 忽略 preload_sequence[{idx}]，需要 3 个数值，实际 {arr.size} 个。"
                     )
+                    sanitized_orders.append(None)
                     continue
+
+                order_arr: Optional[np.ndarray] = None
+                if order_entry is not None:
+                    try:
+                        order_raw = np.array(order_entry, dtype=np.int32).reshape(-1)
+                    except Exception:
+                        print(
+                            f"[preload] 忽略 preload_sequence[{idx}] 的顺序字段，无法解析：{order_entry}"
+                        )
+                        order_raw = None
+                    if order_raw is not None:
+                        nb = arr.size
+                        if order_raw.size != nb:
+                            print(
+                                f"[preload] 忽略 preload_sequence[{idx}] 的顺序字段，长度需为 {nb}。"
+                            )
+                        else:
+                            if np.all(order_raw >= 1) and np.max(order_raw) <= nb and np.min(order_raw) >= 1:
+                                order_raw = order_raw - 1
+                            unique = sorted(set(order_raw.tolist()))
+                            if unique != list(range(nb)):
+                                print(
+                                    f"[preload] 忽略 preload_sequence[{idx}] 的顺序字段，必须是 0~{nb-1} 的排列（或 1~{nb}）。"
+                                )
+                            else:
+                                order_arr = order_raw.astype(np.int32)
+
                 sanitized.append(arr.astype(np.float32))
+                sanitized_orders.append(order_arr.copy() if order_arr is not None else None)
 
             if sanitized:
                 if cfg.preload_sequence_shuffle:
                     perm = np.random.permutation(len(sanitized))
                     sanitized = [sanitized[i] for i in perm]
+                    sanitized_orders = [sanitized_orders[i] for i in perm]
                 self._preload_sequence = sanitized
+                self._preload_sequence_orders = sanitized_orders
                 self._preload_current_target = self._preload_sequence[0].copy()
+                if self._preload_sequence_orders:
+                    self._preload_current_order = (
+                        None
+                        if self._preload_sequence_orders[0] is None
+                        else self._preload_sequence_orders[0].copy()
+                    )
                 hold = max(1, cfg.preload_sequence_repeat)
                 print(
-                    f"[preload] 已启用顺序载荷：{len(self._preload_sequence)} 组，"
+                    f"[preload] 已启用顺序载荷：{len(self._preload_sequence)} 组，",
                     f"每组持续 {hold} 步。"
                 )
                 if cfg.preload_sequence_jitter > 0:
                     print(
                         f"[preload] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
                     )
-
+            else:
+                print("[preload] preload_sequence 中有效条目为空，改为随机采样。")
         if cfg.model_cfg.preload_scale:
             print(
                 f"[preload] 归一化: shift={cfg.model_cfg.preload_shift:.2f}, "
@@ -331,6 +405,7 @@ class Trainer:
         grad_val: float,
         rel_pi: float,
         rel_delta: Optional[float],
+        order: Optional[np.ndarray] = None,
     ) -> Tuple[Optional[str], str]:
         """Compose the detailed training log postfix for the outer progress bar.
 
@@ -394,9 +469,12 @@ class Trainer:
                     mean_gap = float(val.numpy())
 
             grad_disp = f"grad={grad_val:.2e}"
-            rel_disp = f"Πrel={rel_pi:.3f}"
+            rel_pct = rel_pi * 100.0 if rel_pi is not None else None
+            rel_disp = (
+                f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
+            )
             delta_disp = (
-                f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
+                f"ΔΠ={rel_delta * 100:+.1f}%" if rel_delta is not None else "ΔΠ=--"
             )
             pen_disp = (
                 f"pen={pen_ratio * 100:.1f}%" if pen_ratio is not None else "pen=--"
@@ -411,8 +489,32 @@ class Trainer:
                 f"⟨gap⟩={mean_gap:.2e}" if mean_gap is not None else "⟨gap⟩=--"
             )
 
+            order_txt = ""
+            if order is not None:
+                try:
+                    order_list = [int(x) for x in list(order)]
+                    human_order = "-".join(str(idx + 1) for idx in order_list)
+                    ordered_values: Optional[List[int]] = None
+                    if P_np is not None and len(order_list) == len(P_np):
+                        ordered_values = []
+                        for idx in order_list:
+                            if 0 <= idx < len(P_np):
+                                ordered_values.append(int(P_np[idx]))
+                            else:
+                                ordered_values = None
+                                break
+                    if ordered_values:
+                        order_txt = (
+                            f" order={human_order}(P序=["
+                            + ",".join(str(val) for val in ordered_values)
+                            + "])"
+                        )
+                    else:
+                        order_txt = f" order={human_order}"
+                except Exception:
+                    order_txt = " order=?"
             postfix = (
-                f"P=[{p1},{p2},{p3}]N Π={pin:.3e} Eint={eint:.3e} "
+                f"P=[{p1},{p2},{p3}]N{order_txt} Π={pin:.3e} Eint={eint:.3e} "
                 f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
                 f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
             )
@@ -424,10 +526,20 @@ class Trainer:
     def _sample_P(self) -> np.ndarray:
         if self._preload_sequence:
             if self._preload_current_target is None:
-                self._preload_current_target = self._preload_sequence[
-                    self._preload_sequence_index
-                ].copy()
+                idx = self._preload_sequence_index
+                self._preload_current_target = self._preload_sequence[idx].copy()
+                base_order = (
+                    self._preload_sequence_orders[idx]
+                    if idx < len(self._preload_sequence_orders)
+                    else None
+                )
+                self._preload_current_order = (
+                    None if base_order is None else base_order.copy()
+                )
             target = self._preload_current_target.copy()
+            current_order = (
+                None if self._preload_current_order is None else self._preload_current_order.copy()
+            )
             jitter = float(self.cfg.preload_sequence_jitter or 0.0)
             if jitter > 0.0:
                 noise = np.random.uniform(-jitter, jitter, size=target.shape)
@@ -444,14 +556,189 @@ class Trainer:
                 if self._preload_sequence_index == 0 and self.cfg.preload_sequence_shuffle:
                     perm = np.random.permutation(len(self._preload_sequence))
                     self._preload_sequence = [self._preload_sequence[i] for i in perm]
-                self._preload_current_target = self._preload_sequence[
-                    self._preload_sequence_index
-                ].copy()
+                    self._preload_sequence_orders = [
+                        self._preload_sequence_orders[i] if i < len(self._preload_sequence_orders) else None
+                        for i in perm
+                    ]
+                idx = self._preload_sequence_index
+                self._preload_current_target = self._preload_sequence[idx].copy()
+                base_order = (
+                    self._preload_sequence_orders[idx]
+                    if idx < len(self._preload_sequence_orders)
+                    else None
+                )
+                self._preload_current_order = (
+                    None if base_order is None else base_order.copy()
+                )
 
+            self._last_preload_order = None if current_order is None else current_order.copy()
             return target.astype(np.float32)
 
         lo, hi = self.cfg.preload_min, self.cfg.preload_max
-        return np.random.uniform(lo, hi, size=(3,)).astype(np.float32)
+        out = np.random.uniform(lo, hi, size=(3,)).astype(np.float32)
+        self._last_preload_order = None
+        return out
+
+    def _normalize_order(self, order: Optional[Any], nb: int) -> Optional[np.ndarray]:
+        if order is None:
+            return None
+        arr = np.array(order, dtype=np.int32).reshape(-1)
+        if arr.size != nb:
+            raise ValueError(f"顺序长度需为 {nb}，收到 {arr.size}。")
+        if np.all(arr >= 1) and np.max(arr) <= nb and np.min(arr) >= 1:
+            arr = arr - 1
+        unique = sorted(set(arr.tolist()))
+        if unique != list(range(nb)):
+            raise ValueError(
+                f"顺序字段必须是 0~{nb-1}（或 1~{nb}）的排列，收到 {list(arr)}。"
+            )
+        return arr.astype(np.int32)
+
+    def _build_stage_case(self, P: np.ndarray, order: np.ndarray) -> Dict[str, np.ndarray]:
+        nb = int(P.shape[0])
+        order = np.asarray(order, dtype=np.int32).reshape(-1)
+        if order.size != nb:
+            raise ValueError(f"顺序长度需为 {nb}，收到 {order.size}。")
+        stage_loads = []
+        stage_masks = []
+        stage_last = []
+        cumulative = np.zeros_like(P)
+        mask = np.zeros_like(P)
+        rank = np.zeros((nb,), dtype=np.float32)
+        for pos, idx in enumerate(order):
+            idx_int = int(idx)
+            cumulative[idx_int] = P[idx_int]
+            mask[idx_int] = 1.0
+            stage_loads.append(cumulative.copy())
+            stage_masks.append(mask.copy())
+            onehot = np.zeros_like(P)
+            onehot[idx_int] = 1.0
+            stage_last.append(onehot)
+            rank[idx_int] = float(pos)
+        if nb > 1:
+            rank = rank / float(nb - 1)
+        else:
+            rank = np.zeros_like(rank)
+        rank_matrix = np.tile(rank.reshape(1, -1), (len(stage_loads), 1))
+        return {
+            "stages": np.stack(stage_loads).astype(np.float32),
+            "stage_masks": np.stack(stage_masks).astype(np.float32),
+            "stage_last": np.stack(stage_last).astype(np.float32),
+            "stage_rank": rank.astype(np.float32),
+            "stage_rank_matrix": rank_matrix.astype(np.float32),
+        }
+
+    def _sample_preload_case(self) -> Dict[str, np.ndarray]:
+        P = self._sample_P()
+        case: Dict[str, np.ndarray] = {"P": P}
+        if not self.cfg.preload_use_stages:
+            return case
+
+        base_order = None if self._last_preload_order is None else self._last_preload_order.copy()
+        if base_order is None:
+            if self.cfg.preload_randomize_order:
+                order = np.random.permutation(P.shape[0]).astype(np.int32)
+            else:
+                order = np.arange(P.shape[0], dtype=np.int32)
+        else:
+            order = base_order.astype(np.int32)
+
+        case["order"] = order
+        case.update(self._build_stage_case(P, order))
+        return case
+
+    def _make_preload_params(self, case: Dict[str, np.ndarray]) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "P": tf.convert_to_tensor(case["P"], dtype=tf.float32)
+        }
+        if not self.cfg.preload_use_stages or "stages" not in case:
+            return params
+
+        stages = case.get("stages")
+        masks = case.get("stage_masks")
+        lasts = case.get("stage_last")
+        order_np = case.get("order")
+        rank_np = case.get("stage_rank")
+        rank_matrix_np = case.get("stage_rank_matrix")
+        if order_np is None:
+            order_np = np.arange(case["P"].shape[0], dtype=np.int32)
+        order_tf = tf.convert_to_tensor(order_np, dtype=tf.int32)
+        rank_tf = None
+        if rank_np is not None:
+            rank_tf = tf.convert_to_tensor(rank_np, dtype=tf.float32)
+        rank_matrix_tf = None
+        if rank_matrix_np is not None:
+            rank_matrix_tf = tf.convert_to_tensor(rank_matrix_np, dtype=tf.float32)
+        elif rank_tf is not None:
+            rank_matrix_tf = tf.repeat(
+                tf.expand_dims(rank_tf, axis=0), repeats=int(len(stages)), axis=0
+            )
+        stage_params_P: List[tf.Tensor] = []
+        stage_params_feat: List[tf.Tensor] = []
+        stage_count = int(len(stages))
+        shift = tf.cast(self.cfg.model_cfg.preload_shift, tf.float32)
+        scale = tf.cast(self.cfg.model_cfg.preload_scale, tf.float32)
+        n_bolts = int(case["P"].shape[0])
+        feat_dim = n_bolts
+        if masks is not None:
+            feat_dim += n_bolts
+        if lasts is not None:
+            feat_dim += n_bolts
+        if rank_tf is not None:
+            feat_dim += n_bolts
+
+        for idx in range(stage_count):
+            p_stage = tf.convert_to_tensor(stages[idx], dtype=tf.float32)
+            norm = (p_stage - shift) / scale
+            feat_parts = [norm]
+            if masks is not None:
+                feat_parts.append(tf.convert_to_tensor(masks[idx], dtype=tf.float32))
+            if lasts is not None:
+                feat_parts.append(tf.convert_to_tensor(lasts[idx], dtype=tf.float32))
+            if rank_tf is not None:
+                feat_parts.append(rank_tf)
+            features = tf.concat(feat_parts, axis=0)
+            features.set_shape((feat_dim,))
+            stage_params_P.append(p_stage)
+            stage_params_feat.append(features)
+        stage_tensor_P = tf.stack(stage_params_P, axis=0)
+        stage_tensor_P.set_shape((stage_count, n_bolts))
+        stage_tensor_feat = tf.stack(stage_params_feat, axis=0)
+        stage_tensor_feat.set_shape((stage_count, feat_dim))
+        params["stages"] = {
+            "P": stage_tensor_P,
+            "P_hat": stage_tensor_feat,
+        }
+        if rank_matrix_tf is not None:
+            params["stages"]["stage_rank"] = rank_matrix_tf
+        params["stage_order"] = order_tf
+        if rank_tf is not None:
+            params["stage_rank"] = rank_tf
+        params["stage_count"] = tf.constant(stage_count, dtype=tf.int32)
+        return params
+
+    def _extract_final_stage_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if (
+            self.cfg.preload_use_stages
+            and isinstance(params, dict)
+            and "stages" in params
+        ):
+            stages = params["stages"]
+            if isinstance(stages, dict) and stages:
+                last_P = stages["P"][-1]
+                last_feat = stages["P_hat"][-1]
+                return {"P": last_P, "P_hat": last_feat}
+        return params
+
+    def _make_warmup_case(self) -> Dict[str, np.ndarray]:
+        mid = 0.5 * (float(self.cfg.preload_min) + float(self.cfg.preload_max))
+        base = np.full((3,), mid, dtype=np.float32)
+        case: Dict[str, np.ndarray] = {"P": base}
+        if self.cfg.preload_use_stages:
+            order = np.arange(base.shape[0], dtype=np.int32)
+            case["order"] = order
+            case.update(self._build_stage_case(base, order))
+        return case
 
     # ----------------- 从 INP/Assembly 尝试自动发现接触对 -----------------
     def _autoguess_contacts_from_inp(self, asm: AssemblyModel) -> List[Dict[str, str]]:
@@ -690,9 +977,11 @@ class Trainer:
         if warmup_n > 0:
             X_sample = tf.convert_to_tensor(self.X_vol[:warmup_n], dtype=tf.float32)
             mid = 0.5 * (float(cfg.preload_min) + float(cfg.preload_max))
-            P_mid = tf.constant([mid, mid, mid], dtype=tf.float32)
+            warmup_case = self._make_warmup_case()
+            params = self._make_preload_params(warmup_case)
+            eval_params = self._extract_final_stage_params(params)
             # 调用一次前向以创建所有变量；忽略实际输出
-            _ = self.model.u_fn(X_sample, {"P": P_mid})
+            _ = self.model.u_fn(X_sample, eval_params)
 
         self._train_vars = (
             list(self.model.encoder.trainable_variables)
@@ -774,28 +1063,34 @@ class Trainer:
             )
         return out
 
-    def _train_step(self, total, P_tf):
+    def _compute_total_loss(
+        self,
+        total: TotalEnergy,
+        params: Dict[str, Any],
+        *,
+        adaptive: bool = True,
+    ):
+        Pi_raw, parts, stats = total.energy(self.model.u_fn, params=params, tape=None)
+        Pi = Pi_raw
+        if self.loss_state is not None:
+            if adaptive:
+                update_loss_weights(self.loss_state, parts, stats)
+            Pi = combine_loss(parts, self.loss_state)
+        reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
+        loss = Pi + reg
+        return loss, Pi, parts, stats
+
+    def _train_step(self, total, preload_case: Dict[str, np.ndarray]):
         model = self.model
         opt = self.optimizer
 
         # 统一收集可训练变量
         train_vars = self._collect_trainable_variables()
 
+        params = self._make_preload_params(preload_case)
+
         with tf.GradientTape() as tape:
-            # 1) 先用 TotalEnergy 计算各个分量和“基线”Π_raw
-            Pi_raw, parts, stats = total.energy(model.u_fn, params={"P": P_tf}, tape=None)
-
-            # 2) 根据当前残差更新自适应权重，并用 parts 重新组合总能量 Π
-            if self.loss_state is not None:
-                update_loss_weights(self.loss_state, parts, stats)
-                Pi = combine_loss(parts, self.loss_state)   # 使用当前权重组合
-            else:
-                Pi = Pi_raw  # 没有自适应状态就退回原始 Π
-
-            # 3) 加上 Keras 模型自带的正则项
-            reg = tf.add_n(model.losses) if getattr(model, "losses", None) else 0.0
-
-            loss = Pi + reg
+            loss, Pi, parts, stats = self._compute_total_loss(total, params, adaptive=True)
 
             use_loss_scale = hasattr(opt, "get_scaled_loss")
             if use_loss_scale:
@@ -827,6 +1122,106 @@ class Trainer:
         # 返回“当前权重下”的 Π，而不是 Pi_raw
         return Pi, parts, stats, grad_norm
 
+    def _flatten_tensor_list(
+        self, tensors: Sequence[Optional[tf.Tensor]], sizes: Sequence[int]
+    ) -> tf.Tensor:
+        flats: List[tf.Tensor] = []
+        for tensor, size in zip(tensors, sizes):
+            if tensor is None:
+                flats.append(tf.zeros((size,), dtype=tf.float32))
+            else:
+                flats.append(tf.reshape(tf.cast(tensor, tf.float32), (-1,)))
+        if not flats:
+            return tf.zeros((0,), dtype=tf.float32)
+        return tf.concat(flats, axis=0)
+
+    def _assign_from_flat(
+        self, flat_tensor: tf.Tensor, variables: Sequence[tf.Variable], sizes: Sequence[int]
+    ):
+        offset = 0
+        for var, size in zip(variables, sizes):
+            next_offset = offset + size
+            slice_tensor = tf.reshape(flat_tensor[offset:next_offset], var.shape)
+            var.assign(tf.cast(slice_tensor, var.dtype))
+            offset = next_offset
+
+    def _run_lbfgs_stage(self, total: TotalEnergy):
+        if not self.cfg.lbfgs_enabled:
+            return
+
+        try:
+            import tensorflow_probability as tfp
+        except ImportError as exc:
+            raise RuntimeError(
+                "启用了 L-BFGS 精调，但当前环境未安装 tensorflow_probability。"
+                "请先安装 tensorflow_probability 再重新运行。"
+            ) from exc
+
+        train_vars = self._collect_trainable_variables()
+        if not train_vars:
+            raise RuntimeError("[lbfgs] 找不到可训练变量，无法执行 L-BFGS 精调。")
+
+        sizes = []
+        for var in train_vars:
+            size = var.shape.num_elements()
+            if size is None:
+                raise ValueError(
+                    f"[lbfgs] 变量 {var.name} 的形状包含未知维度，无法展开为一维向量。"
+                )
+            sizes.append(int(size))
+
+        if self.cfg.lbfgs_reuse_last_batch and self._last_preload_case is not None:
+            lbfgs_case = copy.deepcopy(self._last_preload_case)
+        else:
+            lbfgs_case = self._sample_preload_case()
+
+        lbfgs_params = self._make_preload_params(lbfgs_case)
+        order = lbfgs_case.get("order")
+        if order is None:
+            order_txt = "默认顺序"
+        else:
+            order_txt = "-".join(str(int(i) + 1) for i in order)
+
+        print("[lbfgs] 开始 L-BFGS 精调阶段：")
+        print(
+            f"[lbfgs] 固定预紧力 P={[int(p) for p in lbfgs_case['P']]} N, 顺序={order_txt},"
+            f" 最大迭代 {self.cfg.lbfgs_max_iter}, tol={self.cfg.lbfgs_tolerance}"
+        )
+
+        initial_position = self._flatten_tensor_list(train_vars, sizes)
+
+        def _value_and_gradients(position):
+            self._assign_from_flat(position, train_vars, sizes)
+            with tf.GradientTape() as tape:
+                tape.watch(train_vars)
+                loss, Pi, parts, stats = self._compute_total_loss(
+                    total, lbfgs_params, adaptive=False
+                )
+            grads = tape.gradient(loss, train_vars)
+            grad_vec = self._flatten_tensor_list(grads, sizes)
+            return loss, grad_vec
+
+        results = tfp.optimizer.lbfgs_minimize(
+            value_and_gradients_function=_value_and_gradients,
+            initial_position=initial_position,
+            tolerance=self.cfg.lbfgs_tolerance,
+            max_iterations=self.cfg.lbfgs_max_iter,
+            num_correction_pairs=self.cfg.lbfgs_history_size,
+            parallel_iterations=1,
+            linesearch_max_iterations=max(1, int(self.cfg.lbfgs_line_search)),
+        )
+
+        self._assign_from_flat(results.position, train_vars, sizes)
+
+        status = "converged" if results.converged else "stopped"
+        if results.failed:
+            status = "failed"
+        grad_norm = float(results.gradient_norm.numpy()) if results.gradient_norm is not None else float("nan")
+        print(
+            f"[lbfgs] 完成：状态={status}, iters={int(results.num_iterations.numpy())}, "
+            f"loss={float(results.objective_value.numpy()):.3e}, grad={grad_norm:.3e}"
+        )
+
 
     # ----------------- 训练 -----------------
     def run(self):
@@ -855,15 +1250,24 @@ class Trainer:
             "R_contact_comp": 0.0,
         }
 
-        # 建议在 TotalConfig 里加一个字段：
-        #   adaptive_scheme: str = "off"   # "off" / "contact_only" / "basic"
-        # 如果你还没加，可以先写死为 "off" 或 "contact_only"
-        scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "off")
-
-        self.loss_state = LossWeightState.from_config(
-            base_weights=base_weights,
-            adaptive_scheme=scheme,
-        )
+        adaptive_enabled = bool(getattr(self.cfg, "loss_adaptive_enabled", False))
+        if adaptive_enabled:
+            scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "contact_only")
+            focus_terms = getattr(self.cfg, "loss_focus_terms", tuple())
+            if focus_terms:
+                scheme = "focus"
+            self.loss_state = LossWeightState.from_config(
+                base_weights=base_weights,
+                adaptive_scheme=scheme,
+                ema_decay=getattr(self.cfg, "loss_ema_decay", 0.95),
+                min_factor=getattr(self.cfg, "loss_min_factor", 0.25),
+                max_factor=getattr(self.cfg, "loss_max_factor", 4.0),
+                gamma=getattr(self.cfg, "loss_gamma", 2.0),
+                focus_terms=focus_terms,
+                update_every=getattr(self.cfg, "loss_update_every", 1),
+            )
+        else:
+            self.loss_state = None
         train_pb_kwargs = dict(total=self.cfg.max_steps, desc="Training", leave=True)
         if self.cfg.train_bar_color:
             train_pb_kwargs["colour"] = self.cfg.train_bar_color
@@ -924,9 +1328,11 @@ class Trainer:
                     # 2) 前向 + 反传（随机采样三螺栓预紧力）
                     self._set_pbar_desc(p_step, f"step {step}: 前向/反传")
                     t0 = time.perf_counter()
-                    P_np = self._sample_P()
-                    P_tf = tf.convert_to_tensor(P_np, dtype=tf.float32)
-                    Pi, parts, stats, grad_norm = self._train_step(total, P_tf)
+                    preload_case = self._sample_preload_case()
+                    Pi, parts, stats, grad_norm = self._train_step(total, preload_case)
+                    P_np = preload_case["P"]
+                    order_np = preload_case.get("order")
+                    self._last_preload_case = copy.deepcopy(preload_case)
                     pi_val = float(Pi.numpy())
                     if self._pi_baseline is None:
                         self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
@@ -944,12 +1350,22 @@ class Trainer:
                     self._step_stage_times.append(("train", elapsed))
                     device = self._short_device_name(getattr(Pi, "device", None))
                     grad_val = float(grad_norm.numpy()) if hasattr(grad_norm, "numpy") else float(grad_norm)
-                    rel_txt = f"Πrel={rel_pi:.3f}"
-                    d_txt = f"ΔΠ={(rel_delta * 100):.1f}%" if rel_delta is not None else "ΔΠ=--"
+                    rel_pct = rel_pi * 100.0 if rel_pi is not None else None
+                    rel_txt = (
+                        f"Πrel={rel_pct:.2f}%" if rel_pct is not None else "Πrel=--"
+                    )
+                    d_txt = (
+                        f"ΔΠ={rel_delta * 100:+.1f}%"
+                        if rel_delta is not None
+                        else "ΔΠ=--"
+                    )
                     ema_txt = f"Πema={self._pi_ema:.2e}" if self._pi_ema is not None else "Πema=--"
+                    order_txt = ""
+                    if order_np is not None:
+                        order_txt = " order=" + "-".join(str(int(x) + 1) for x in order_np)
                     train_note = (
-                        f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}] "
-                        f"Π={pi_val:.2e} {rel_txt} {d_txt} "
+                        f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}]"
+                        f"{order_txt} Π={pi_val:.2e} {rel_txt} {d_txt} "
                         f"grad={grad_val:.2e} {ema_txt}"
                     )
                     if step == 1:
@@ -969,7 +1385,8 @@ class Trainer:
                     elif self.cfg.alm_update_every <= 0:
                         alm_note = "跳过 (已禁用)"
                     elif step % self.cfg.alm_update_every == 0:
-                        total.update_multipliers(self.model.u_fn, params={"P": P_tf})
+                        params_for_update = self._make_preload_params(preload_case)
+                        total.update_multipliers(self.model.u_fn, params=params_for_update)
                         alm_note = "已更新"
                     else:
                         remaining = self.cfg.alm_update_every - (
@@ -1001,6 +1418,7 @@ class Trainer:
                                 grad_val,
                                 rel_pi,
                                 rel_delta,
+                                order_np,
                             )
                             if postfix:
                                 p_train.set_postfix_str(postfix)
@@ -1055,6 +1473,9 @@ class Trainer:
             # 训练结束：再存一次
             self.ckpt_manager.save(checkpoint_number=self.cfg.max_steps)
 
+        if self.cfg.lbfgs_enabled:
+            self._run_lbfgs_stage(total)
+
         self._visualize_after_training(n_samples=self.cfg.viz_samples_after_train)
 
     # ----------------- Checkpoint utilities -----------------
@@ -1107,43 +1528,34 @@ class Trainer:
         return ckpt_path
 
     def export_saved_model(self, export_dir: str) -> str:
-        """Export the PINN displacement model as a TensorFlow SavedModel.
-
-        The exported module exposes a callable with signature ``(X, P) -> u``
-        where ``X`` is an ``(N, 3)`` tensor of spatial coordinates and ``P``
-        is a ``(3,)`` tensor of bolt preload values (in Newtons). The return
-        value ``u`` matches :meth:`model.u_fn` and has shape ``(N, 3)``.
-        """
+        """Export the PINN displacement model as a TensorFlow SavedModel."""
 
         if self.model is None:
             raise RuntimeError("Trainer.export_saved_model() requires build()/restore().")
 
-        class _PINNModule(tf.Module):
-            def __init__(self, model):
-                super().__init__()
-                self._model = model
+        n_bolts = max(1, len(self.cfg.preload_specs) or 3)
 
-            @tf.function(
-                input_signature=[
-                    tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
-                    tf.TensorSpec(shape=[3], dtype=tf.float32, name="P"),
-                ]
-            )
-            def __call__(self, X, P):
-                params = {"P": tf.reshape(P, (3,))}
-                return self._model.u_fn(X, params)
-
-        module = _PINNModule(self.model)
-        tf.saved_model.save(module, export_dir)
+        module = _SavedModelModule(
+            model=self.model,
+            use_stages=bool(self.cfg.preload_use_stages),
+            shift=float(self.cfg.model_cfg.preload_shift),
+            scale=float(self.cfg.model_cfg.preload_scale),
+            n_bolts=n_bolts,
+        )
+        serving_fn = module.run.get_concrete_function()
+        tf.saved_model.save(module, export_dir, signatures={"serving_default": serving_fn})
         print(f"[trainer] SavedModel exported -> {export_dir}")
         return export_dir
 
-    def generate_deflection_map(self,
-                                 preload: Any,
-                                 out_path: Optional[str] = None,
-                                 title_prefix: Optional[str] = None,
-                                 show: bool = False,
-                                 data_out_path: Optional[str] = "auto") -> str:
+    def generate_deflection_map(
+        self,
+        preload: Any,
+        out_path: Optional[str] = None,
+        title_prefix: Optional[str] = None,
+        show: bool = False,
+        data_out_path: Optional[str] = "auto",
+        preload_order: Optional[Sequence[int]] = None,
+    ) -> str:
         """Generate a mirror deflection contour for a user-specified preload.
 
         Args:
@@ -1155,6 +1567,11 @@ class Trainer:
             title_prefix: Optional custom title prefix for the figure.
             show: If ``True`` call ``plt.show()`` instead of closing the
                 figure (useful when running interactively).
+            data_out_path: Text export path or ``"auto"``/``None`` for
+                automatic/disabled displacement dumps.
+            preload_order: Optional tightening sequence (either 0- or
+                1-based) used when staged preload is enabled. When omitted,
+                the natural 1-2-3 order is applied.
 
         Returns:
             The absolute/relative path where the image was written.
@@ -1167,15 +1584,34 @@ class Trainer:
         if P.size != 3:
             raise ValueError("'preload' must contain exactly three values (for the three bolts).")
 
-        params = {"P": tf.convert_to_tensor(P, dtype=tf.float32)}
+        case: Dict[str, np.ndarray] = {"P": P}
+        if preload_order is not None and not self.cfg.preload_use_stages:
+            print("[viz] preload_order 被忽略：配置中未启用分阶段加载。")
+        if self.cfg.preload_use_stages:
+            nb = P.size
+            if preload_order is not None:
+                order_arr = self._normalize_order(preload_order, nb)
+            else:
+                order_arr = np.arange(nb, dtype=np.int32)
+            case["order"] = order_arr
+            case.update(self._build_stage_case(P, order_arr))
+            order_display = "-".join(str(int(o) + 1) for o in order_arr.tolist())
+        else:
+            order_arr = None
+            order_display = None
+        params_full = self._make_preload_params(case)
+        params = self._extract_final_stage_params(params_full)
         title = title_prefix or self.cfg.viz_title_prefix
+        if order_display:
+            title = f"{title}  (order={order_display})"
 
         if out_path is None:
             os.makedirs(self.cfg.out_dir, exist_ok=True)
             p_int = [int(round(float(x))) for x in P]
+            ord_tag = f"_ord{order_display.replace('-', '')}" if order_display else ""
             out_path = os.path.join(
                 self.cfg.out_dir,
-                f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
+                f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}{ord_tag}.png",
             )
 
         resolved_data_path: Optional[str]
@@ -1217,493 +1653,15 @@ class Trainer:
         self.last_viz_data_path = data_path
         if data_path:
             print(f"[viz] displacement data -> {data_path}")
-        print(f"[viz] saved -> {out_path}")
-        return out_path
-
-    # ----------------- Checkpoint utilities -----------------
-    def restore_checkpoint(self, checkpoint_path: Optional[str] = None,
-                           expect_partial: bool = True) -> str:
-        """Restore model/optimizer weights from a checkpoint.
-
-        Args:
-            checkpoint_path: Explicit checkpoint path. If ``None`` the latest
-                checkpoint managed by :class:`tf.train.CheckpointManager` is
-                used.
-            expect_partial: Whether partial restores are acceptable (useful
-                when optimizer slots are absent, e.g. when exporting models for
-                inference only).
-
-        Returns:
-            The path of the checkpoint that was restored.
-
-        Raises:
-            FileNotFoundError: If no checkpoint can be located.
-            RuntimeError: If ``build()`` has not been called yet.
-        """
-
-        if self.ckpt is None:
-            raise RuntimeError("Trainer.restore_checkpoint() called before build().")
-
-        ckpt_path = checkpoint_path
-        if ckpt_path is None:
-            if self.ckpt_manager is None:
-                raise RuntimeError("Checkpoint manager not initialised; call build() first.")
-            ckpt_path = self.ckpt_manager.latest_checkpoint
-
-        if not ckpt_path:
-            raise FileNotFoundError(
-                "No checkpoint found. Train the model first or pass an explicit path."
-            )
-
-        status = self.ckpt.restore(ckpt_path)
-        try:
-            if expect_partial:
-                status.expect_partial()
-            else:
-                status.assert_consumed()
-        except AssertionError:
-            # Fall back to the strongest available assertion; if it still
-            # fails TensorFlow will raise, which is what we want.
-            status.assert_existing_objects_matched()
-
-        print(f"[trainer] Restored checkpoint -> {ckpt_path}")
-        return ckpt_path
-
-    def export_saved_model(self, export_dir: str) -> str:
-        """Export the PINN displacement model as a TensorFlow SavedModel.
-
-        The exported module exposes a callable with signature ``(X, P) -> u``
-        where ``X`` is an ``(N, 3)`` tensor of spatial coordinates and ``P``
-        is a ``(3,)`` tensor of bolt preload values (in Newtons). The return
-        value ``u`` matches :meth:`model.u_fn` and has shape ``(N, 3)``.
-        """
-
-        if self.model is None:
-            raise RuntimeError("Trainer.export_saved_model() requires build()/restore().")
-
-        class _PINNModule(tf.Module):
-            def __init__(self, model):
-                super().__init__()
-                self._model = model
-
-            @tf.function(
-                input_signature=[
-                    tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
-                    tf.TensorSpec(shape=[3], dtype=tf.float32, name="P"),
-                ]
-            )
-            def __call__(self, X, P):
-                params = {"P": tf.reshape(P, (3,))}
-                return self._model.u_fn(X, params)
-
-        module = _PINNModule(self.model)
-        tf.saved_model.save(module, export_dir)
-        print(f"[trainer] SavedModel exported -> {export_dir}")
-        return export_dir
-
-    def generate_deflection_map(self,
-                                 preload: Any,
-                                 out_path: Optional[str] = None,
-                                 title_prefix: Optional[str] = None,
-                                 show: bool = False,
-                                 data_out_path: Optional[str] = "auto") -> str:
-        """Generate a mirror deflection contour for a user-specified preload.
-
-        Args:
-            preload: Iterable of three preload values (N) in the order
-                ``[P1, P2, P3]``.
-            out_path: Optional absolute/relative path to save the PNG. If
-                omitted the file is stored under ``cfg.out_dir`` with a name
-                derived from the preload values.
-            title_prefix: Optional custom title prefix for the figure.
-            show: If ``True`` call ``plt.show()`` instead of closing the
-                figure (useful when running interactively).
-
-        Returns:
-            The absolute/relative path where the image was written.
-        """
-
-        if self.asm is None or self.model is None:
-            raise RuntimeError("Trainer.generate_deflection_map() requires build()/restore().")
-
-        P = np.asarray(list(preload), dtype=np.float32).reshape(-1)
-        if P.size != 3:
-            raise ValueError("'preload' must contain exactly three values (for the three bolts).")
-
-        params = {"P": tf.convert_to_tensor(P, dtype=tf.float32)}
-        title = title_prefix or self.cfg.viz_title_prefix
-
-        if out_path is None:
-            os.makedirs(self.cfg.out_dir, exist_ok=True)
-            p_int = [int(round(float(x))) for x in P]
-            out_path = os.path.join(
-                self.cfg.out_dir,
-                f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
-            )
-
-        resolved_data_path: Optional[str]
-        if data_out_path is None:
-            resolved_data_path = None
+        if order_display:
+            print(f"[viz] saved -> {out_path}  (order={order_display})")
         else:
-            key = str(data_out_path).strip().lower()
-            if key == "auto":
-                if self.cfg.viz_write_data and out_path:
-                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
-                else:
-                    resolved_data_path = None
-            elif key in {"", "none"}:
-                resolved_data_path = None
-            else:
-                resolved_data_path = data_out_path
-
-        _, _, data_path = plot_mirror_deflection_by_name(
-            self.asm,
-            self.cfg.mirror_surface_name,
-            self.model.u_fn,
-            params,
-            P_values=tuple(float(x) for x in P),
-            out_path=out_path,
-            title_prefix=title,
-            units=self.cfg.viz_units,
-            levels=self.cfg.viz_levels,
-            symmetric=self.cfg.viz_symmetric,
-            show=show,
-            data_out_path=resolved_data_path,
-            style=self.cfg.viz_style,
-            cmap=self.cfg.viz_colormap,
-            draw_wireframe=self.cfg.viz_draw_wireframe,
-        )
-
-        self.last_viz_data_path = data_path
-        if data_path:
-            print(f"[viz] displacement data -> {data_path}")
-        print(f"[viz] saved -> {out_path}")
-        return out_path
-
-    # ----------------- Checkpoint utilities -----------------
-    def restore_checkpoint(self, checkpoint_path: Optional[str] = None,
-                           expect_partial: bool = True) -> str:
-        """Restore model/optimizer weights from a checkpoint.
-
-        Args:
-            checkpoint_path: Explicit checkpoint path. If ``None`` the latest
-                checkpoint managed by :class:`tf.train.CheckpointManager` is
-                used.
-            expect_partial: Whether partial restores are acceptable (useful
-                when optimizer slots are absent, e.g. when exporting models for
-                inference only).
-
-        Returns:
-            The path of the checkpoint that was restored.
-
-        Raises:
-            FileNotFoundError: If no checkpoint can be located.
-            RuntimeError: If ``build()`` has not been called yet.
-        """
-
-        if self.ckpt is None:
-            raise RuntimeError("Trainer.restore_checkpoint() called before build().")
-
-        ckpt_path = checkpoint_path
-        if ckpt_path is None:
-            if self.ckpt_manager is None:
-                raise RuntimeError("Checkpoint manager not initialised; call build() first.")
-            ckpt_path = self.ckpt_manager.latest_checkpoint
-
-        if not ckpt_path:
-            raise FileNotFoundError(
-                "No checkpoint found. Train the model first or pass an explicit path."
-            )
-
-        status = self.ckpt.restore(ckpt_path)
-        try:
-            if expect_partial:
-                status.expect_partial()
-            else:
-                status.assert_consumed()
-        except AssertionError:
-            # Fall back to the strongest available assertion; if it still
-            # fails TensorFlow will raise, which is what we want.
-            status.assert_existing_objects_matched()
-
-        print(f"[trainer] Restored checkpoint -> {ckpt_path}")
-        return ckpt_path
-
-    def export_saved_model(self, export_dir: str) -> str:
-        """Export the PINN displacement model as a TensorFlow SavedModel.
-
-        The exported module exposes a callable with signature ``(X, P) -> u``
-        where ``X`` is an ``(N, 3)`` tensor of spatial coordinates and ``P``
-        is a ``(3,)`` tensor of bolt preload values (in Newtons). The return
-        value ``u`` matches :meth:`model.u_fn` and has shape ``(N, 3)``.
-        """
-
-        if self.model is None:
-            raise RuntimeError("Trainer.export_saved_model() requires build()/restore().")
-
-        class _PINNModule(tf.Module):
-            def __init__(self, model):
-                super().__init__()
-                self._model = model
-
-            @tf.function(
-                input_signature=[
-                    tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
-                    tf.TensorSpec(shape=[3], dtype=tf.float32, name="P"),
-                ]
-            )
-            def __call__(self, X, P):
-                params = {"P": tf.reshape(P, (3,))}
-                return self._model.u_fn(X, params)
-
-        module = _PINNModule(self.model)
-        tf.saved_model.save(module, export_dir)
-        print(f"[trainer] SavedModel exported -> {export_dir}")
-        return export_dir
-
-    def generate_deflection_map(self,
-                                 preload: Any,
-                                 out_path: Optional[str] = None,
-                                 title_prefix: Optional[str] = None,
-                                 show: bool = False,
-                                 data_out_path: Optional[str] = "auto") -> str:
-        """Generate a mirror deflection contour for a user-specified preload.
-
-        Args:
-            preload: Iterable of three preload values (N) in the order
-                ``[P1, P2, P3]``.
-            out_path: Optional absolute/relative path to save the PNG. If
-                omitted the file is stored under ``cfg.out_dir`` with a name
-                derived from the preload values.
-            title_prefix: Optional custom title prefix for the figure.
-            show: If ``True`` call ``plt.show()`` instead of closing the
-                figure (useful when running interactively).
-
-        Returns:
-            The absolute/relative path where the image was written.
-        """
-
-        if self.asm is None or self.model is None:
-            raise RuntimeError("Trainer.generate_deflection_map() requires build()/restore().")
-
-        P = np.asarray(list(preload), dtype=np.float32).reshape(-1)
-        if P.size != 3:
-            raise ValueError("'preload' must contain exactly three values (for the three bolts).")
-
-        params = {"P": tf.convert_to_tensor(P, dtype=tf.float32)}
-        title = title_prefix or self.cfg.viz_title_prefix
-
-        if out_path is None:
-            os.makedirs(self.cfg.out_dir, exist_ok=True)
-            p_int = [int(round(float(x))) for x in P]
-            out_path = os.path.join(
-                self.cfg.out_dir,
-                f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
-            )
-
-        resolved_data_path: Optional[str]
-        if data_out_path is None:
-            resolved_data_path = None
-        else:
-            key = str(data_out_path).strip().lower()
-            if key == "auto":
-                if self.cfg.viz_write_data and out_path:
-                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
-                else:
-                    resolved_data_path = None
-            elif key in {"", "none"}:
-                resolved_data_path = None
-            else:
-                resolved_data_path = data_out_path
-
-        _, _, data_path = plot_mirror_deflection_by_name(
-            self.asm,
-            self.cfg.mirror_surface_name,
-            self.model.u_fn,
-            params,
-            P_values=tuple(float(x) for x in P),
-            out_path=out_path,
-            title_prefix=title,
-            units=self.cfg.viz_units,
-            levels=self.cfg.viz_levels,
-            symmetric=self.cfg.viz_symmetric,
-            show=show,
-            data_out_path=resolved_data_path,
-            style=self.cfg.viz_style,
-            cmap=self.cfg.viz_colormap,
-            draw_wireframe=self.cfg.viz_draw_wireframe,
-        )
-
-        self.last_viz_data_path = data_path
-        if data_path:
-            print(f"[viz] displacement data -> {data_path}")
-        print(f"[viz] saved -> {out_path}")
-        return out_path
-
-    # ----------------- Checkpoint utilities -----------------
-    def restore_checkpoint(self, checkpoint_path: Optional[str] = None,
-                           expect_partial: bool = True) -> str:
-        """Restore model/optimizer weights from a checkpoint.
-
-        Args:
-            checkpoint_path: Explicit checkpoint path. If ``None`` the latest
-                checkpoint managed by :class:`tf.train.CheckpointManager` is
-                used.
-            expect_partial: Whether partial restores are acceptable (useful
-                when optimizer slots are absent, e.g. when exporting models for
-                inference only).
-
-        Returns:
-            The path of the checkpoint that was restored.
-
-        Raises:
-            FileNotFoundError: If no checkpoint can be located.
-            RuntimeError: If ``build()`` has not been called yet.
-        """
-
-        if self.ckpt is None:
-            raise RuntimeError("Trainer.restore_checkpoint() called before build().")
-
-        ckpt_path = checkpoint_path
-        if ckpt_path is None:
-            if self.ckpt_manager is None:
-                raise RuntimeError("Checkpoint manager not initialised; call build() first.")
-            ckpt_path = self.ckpt_manager.latest_checkpoint
-
-        if not ckpt_path:
-            raise FileNotFoundError(
-                "No checkpoint found. Train the model first or pass an explicit path."
-            )
-
-        status = self.ckpt.restore(ckpt_path)
-        try:
-            if expect_partial:
-                status.expect_partial()
-            else:
-                status.assert_consumed()
-        except AssertionError:
-            # Fall back to the strongest available assertion; if it still
-            # fails TensorFlow will raise, which is what we want.
-            status.assert_existing_objects_matched()
-
-        print(f"[trainer] Restored checkpoint -> {ckpt_path}")
-        return ckpt_path
-
-    def export_saved_model(self, export_dir: str) -> str:
-        """Export the PINN displacement model as a TensorFlow SavedModel.
-
-        The exported module exposes a callable with signature ``(X, P) -> u``
-        where ``X`` is an ``(N, 3)`` tensor of spatial coordinates and ``P``
-        is a ``(3,)`` tensor of bolt preload values (in Newtons). The return
-        value ``u`` matches :meth:`model.u_fn` and has shape ``(N, 3)``.
-        """
-
-        if self.model is None:
-            raise RuntimeError("Trainer.export_saved_model() requires build()/restore().")
-
-        class _PINNModule(tf.Module):
-            def __init__(self, model):
-                super().__init__()
-                self._model = model
-
-            @tf.function(
-                input_signature=[
-                    tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
-                    tf.TensorSpec(shape=[3], dtype=tf.float32, name="P"),
-                ]
-            )
-            def __call__(self, X, P):
-                params = {"P": tf.reshape(P, (3,))}
-                return self._model.u_fn(X, params)
-
-        module = _PINNModule(self.model)
-        tf.saved_model.save(module, export_dir)
-        print(f"[trainer] SavedModel exported -> {export_dir}")
-        return export_dir
-
-    def generate_deflection_map(self,
-                                 preload: Any,
-                                 out_path: Optional[str] = None,
-                                 title_prefix: Optional[str] = None,
-                                 show: bool = False,
-                                 data_out_path: Optional[str] = "auto") -> str:
-        """Generate a mirror deflection contour for a user-specified preload.
-
-        Args:
-            preload: Iterable of three preload values (N) in the order
-                ``[P1, P2, P3]``.
-            out_path: Optional absolute/relative path to save the PNG. If
-                omitted the file is stored under ``cfg.out_dir`` with a name
-                derived from the preload values.
-            title_prefix: Optional custom title prefix for the figure.
-            show: If ``True`` call ``plt.show()`` instead of closing the
-                figure (useful when running interactively).
-
-        Returns:
-            The absolute/relative path where the image was written.
-        """
-
-        if self.asm is None or self.model is None:
-            raise RuntimeError("Trainer.generate_deflection_map() requires build()/restore().")
-
-        P = np.asarray(list(preload), dtype=np.float32).reshape(-1)
-        if P.size != 3:
-            raise ValueError("'preload' must contain exactly three values (for the three bolts).")
-
-        params = {"P": tf.convert_to_tensor(P, dtype=tf.float32)}
-        title = title_prefix or self.cfg.viz_title_prefix
-
-        if out_path is None:
-            os.makedirs(self.cfg.out_dir, exist_ok=True)
-            p_int = [int(round(float(x))) for x in P]
-            out_path = os.path.join(
-                self.cfg.out_dir,
-                f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}.png",
-            )
-
-        resolved_data_path: Optional[str]
-        if data_out_path is None:
-            resolved_data_path = None
-        else:
-            key = str(data_out_path).strip().lower()
-            if key == "auto":
-                if self.cfg.viz_write_data and out_path:
-                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
-                else:
-                    resolved_data_path = None
-            elif key in {"", "none"}:
-                resolved_data_path = None
-            else:
-                resolved_data_path = data_out_path
-
-        _, _, data_path = plot_mirror_deflection_by_name(
-            self.asm,
-            self.cfg.mirror_surface_name,
-            self.model.u_fn,
-            params,
-            P_values=tuple(float(x) for x in P),
-            out_path=out_path,
-            title_prefix=title,
-            units=self.cfg.viz_units,
-            levels=self.cfg.viz_levels,
-            symmetric=self.cfg.viz_symmetric,
-            show=show,
-            data_out_path=resolved_data_path,
-            style=self.cfg.viz_style,
-            cmap=self.cfg.viz_colormap,
-            draw_wireframe=self.cfg.viz_draw_wireframe,
-        )
-
-        self.last_viz_data_path = data_path
-        if data_path:
-            print(f"[viz] displacement data -> {data_path}")
-        print(f"[viz] saved -> {out_path}")
+            print(f"[viz] saved -> {out_path}")
         return out_path
 
     # ----------------- 可视化（鲁棒多签名） -----------------
-    def _call_viz(self, P: np.ndarray, out_path: str, title: str):
+    def _call_viz(self, P: np.ndarray, params: Dict[str, tf.Tensor], out_path: str, title: str):
         bare = self.cfg.mirror_surface_name
-        params = {"P": tf.convert_to_tensor(P.reshape(-1), dtype=tf.float32)}
         data_path = None
         if self.cfg.viz_write_data and out_path:
             data_path = os.path.splitext(out_path)[0] + ".txt"
@@ -1734,11 +1692,24 @@ class Trainer:
         os.makedirs(self.cfg.out_dir, exist_ok=True)
         print(f"[trainer] Generating {n_samples} deflection maps for '{self.cfg.mirror_surface_name}' ...")
         for i in range(n_samples):
-            P = self._sample_P()
+            preload_case = self._sample_preload_case()
+            P = preload_case["P"]
+            order_display = None
+            if self.cfg.preload_use_stages and "order" in preload_case:
+                order_display = "-".join(
+                    str(int(o) + 1) for o in preload_case["order"].tolist()
+                )
             title = f"{self.cfg.viz_title_prefix}  P=[{int(P[0])},{int(P[1])},{int(P[2])}]N"
-            save_path = os.path.join(self.cfg.out_dir, f"deflection_{i+1:02d}.png")
+            if order_display:
+                title += f"  (order={order_display})"
+            suffix = f"_{order_display.replace('-', '')}" if order_display else ""
+            save_path = os.path.join(
+                self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}.png"
+            )
+            params_full = self._make_preload_params(preload_case)
+            params_eval = self._extract_final_stage_params(params_full)
             try:
-                _, _, data_path = self._call_viz(P, save_path, title)
+                _, _, data_path = self._call_viz(P, params_eval, save_path, title)
                 if not os.path.exists(save_path):
                     try:
                         import matplotlib.pyplot as plt
@@ -1746,10 +1717,118 @@ class Trainer:
                         plt.close()
                     except Exception:
                         pass
-                print(f"[viz] saved -> {save_path}")
+                if order_display:
+                    print(f"[viz] saved -> {save_path}  (order={order_display})")
+                else:
+                    print(f"[viz] saved -> {save_path}")
                 if data_path:
                     print(f"[viz] displacement data -> {data_path}")
             except TypeError as e:
                 print("[viz] signature mismatch:", e)
             except Exception as e:
                 print("[viz] error:", e)
+
+
+class _SavedModelModule(tf.Module):
+    """TensorFlow module exposing the PINN forward pass for SavedModel export."""
+
+    def __init__(self, model: DisplacementModel, use_stages: bool,
+                 shift: float, scale: float, n_bolts: int):
+        super().__init__(name="pinn_saved_model")
+        self._model = model
+        self._use_stages = bool(use_stages)
+        self._shift = tf.constant(shift, dtype=tf.float32)
+        self._scale = tf.constant(scale, dtype=tf.float32)
+        self._n_bolts = int(max(1, n_bolts))
+
+    @tf.function(
+        input_signature=[
+            tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=[None], dtype=tf.float32, name="P"),
+            tf.TensorSpec(shape=[None], dtype=tf.int32, name="order"),
+        ]
+    )
+    def run(self, X, P, order):
+        params = self._prepare_params(P, order)
+        return self._model.u_fn(X, params)
+
+    def _prepare_params(self, P, order):
+        P = tf.reshape(P, (self._n_bolts,))
+        if not self._use_stages:
+            return {"P": P}
+        order = self._normalize_order(order)
+        stage_P, stage_feat = self._build_stage_tensors(P, order)
+        return {"P": stage_P[-1], "P_hat": stage_feat[-1]}
+
+    def _normalize_order(self, order):
+        order = tf.reshape(order, (self._n_bolts,))
+        default = tf.range(self._n_bolts, dtype=tf.int32)
+        cond = tf.reduce_all(order >= 0)
+        order = tf.where(cond, order, default)
+        minv = tf.reduce_min(order)
+        maxv = tf.reduce_max(order)
+
+        def _one_based():
+            return order - 1
+
+        order = tf.cond(
+            tf.logical_and(tf.greater_equal(minv, 1), tf.less_equal(maxv, self._n_bolts)),
+            _one_based,
+            lambda: order,
+        )
+        return order
+
+    def _build_stage_tensors(self, P, order):
+        stage_count = self._n_bolts
+        cumulative = tf.zeros_like(P)
+        mask = tf.zeros_like(P)
+        loads_ta = tf.TensorArray(tf.float32, size=stage_count)
+        masks_ta = tf.TensorArray(tf.float32, size=stage_count)
+        last_ta = tf.TensorArray(tf.float32, size=stage_count)
+
+        def body(i, cum, mask_vec, loads, masks, lasts):
+            bolt = tf.gather(order, i)
+            bolt = tf.clip_by_value(bolt, 0, self._n_bolts - 1)
+            load_val = tf.gather(P, bolt)
+            idx = tf.reshape(bolt, (1, 1))
+            cum = tf.tensor_scatter_nd_update(cum, idx, tf.reshape(load_val, (1,)))
+            mask_vec = tf.tensor_scatter_nd_update(
+                mask_vec, idx, tf.ones((1,), dtype=tf.float32)
+            )
+            loads = loads.write(i, cum)
+            masks = masks.write(i, mask_vec)
+            last_vec = tf.zeros_like(P)
+            last_vec = tf.tensor_scatter_nd_update(
+                last_vec, idx, tf.ones((1,), dtype=tf.float32)
+            )
+            lasts = lasts.write(i, last_vec)
+            return i + 1, cum, mask_vec, loads, masks, lasts
+
+        _, cumulative, mask, loads_ta, masks_ta, last_ta = tf.while_loop(
+            lambda i, *_: tf.less(i, stage_count),
+            body,
+            (0, cumulative, mask, loads_ta, masks_ta, last_ta),
+        )
+
+        stage_P = loads_ta.stack()
+        stage_masks = masks_ta.stack()
+        stage_last = last_ta.stack()
+
+        indices = tf.reshape(order, (-1, 1))
+        ranks = tf.cast(tf.range(stage_count), tf.float32)
+        rank_vec = tf.tensor_scatter_nd_update(
+            tf.zeros((self._n_bolts,), tf.float32), indices, ranks
+        )
+        if stage_count > 1:
+            rank_vec = rank_vec / tf.cast(stage_count - 1, tf.float32)
+        else:
+            rank_vec = tf.zeros_like(rank_vec)
+
+        feats_ta = tf.TensorArray(tf.float32, size=stage_count)
+        for i in range(stage_count):
+            norm = (stage_P[i] - self._shift) / self._scale
+            feat = tf.concat([norm, stage_masks[i], stage_last[i], rank_vec], axis=0)
+            feats_ta = feats_ta.write(i, feat)
+
+        stage_feat = feats_ta.stack()
+        return stage_P, stage_feat
