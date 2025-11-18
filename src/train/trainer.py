@@ -417,23 +417,22 @@ class Trainer:
         try:
             p1, p2, p3 = [int(x) for x in P_np.tolist()]
             pin = float(Pi.numpy())
-            eint = (
-                float(parts.get("E_int", tf.constant(0.0)).numpy())
-                if "E_int" in parts
-                else 0.0
-            )
-            en = 0.0
-            if "E_cn" in parts:
-                en = float(parts["E_cn"].numpy())
-            elif "E_n" in parts:
-                en = float(parts["E_n"].numpy())
 
-            et = 0.0
-            if "E_ct" in parts:
-                et = float(parts["E_ct"].numpy())
-            elif "E_t" in parts:
-                et = float(parts["E_t"].numpy())
+            def _part_val(key: str, alt_keys: Optional[Sequence[str]] = None) -> float:
+                if key in parts:
+                    return float(parts[key].numpy())
+                if alt_keys:
+                    for other in alt_keys:
+                        if other in parts:
+                            return float(parts[other].numpy())
+                return 0.0
 
+            eint = _part_val("E_int")
+            en = _part_val("E_cn", ("E_n",))
+            et = _part_val("E_ct", ("E_t",))
+            ebc = _part_val("E_bc")
+            etie = _part_val("E_tie")
+            wpre = _part_val("W_pre")
 
             bolt_txt = ""
             preload_stats = None
@@ -513,10 +512,30 @@ class Trainer:
                         order_txt = f" order={human_order}"
                 except Exception:
                     order_txt = " order=?"
+            # ---- 当前自适应权重 ----
+            default_weights = {
+                "E_int": getattr(self.cfg.total_cfg, "w_int", 1.0),
+                "E_cn": getattr(self.cfg.total_cfg, "w_cn", 1.0),
+                "E_ct": getattr(self.cfg.total_cfg, "w_ct", 1.0),
+                "E_tie": getattr(self.cfg.total_cfg, "w_tie", 1.0),
+                "E_bc": getattr(self.cfg.total_cfg, "w_bc", 1.0),
+                "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
+            }
+            weight_map = dict(default_weights)
+            if self.loss_state is not None:
+                weight_map.update(self.loss_state.current)
+
+            parts_disp = (
+                f"Eint={eint:.3e}(w={weight_map.get('E_int', 0.0):.2f}) "
+                f"Ecn={en:.3e}(w={weight_map.get('E_cn', 0.0):.2f}) "
+                f"Ect={et:.3e}(w={weight_map.get('E_ct', 0.0):.2f}) "
+                f"Etie={etie:.3e}(w={weight_map.get('E_tie', 0.0):.2f}) "
+                f"Ebc={ebc:.3e}(w={weight_map.get('E_bc', 0.0):.2f}) "
+                f"Wpre={wpre:.3e}(w={weight_map.get('W_pre', 0.0):.2f})"
+            )
             postfix = (
-                f"P=[{p1},{p2},{p3}]N{order_txt} Π={pin:.3e} Eint={eint:.3e} "
-                f"En={en:.3e} Et={et:.3e} Wpre={wpre:.3e}{bolt_txt} "
-                f"{rel_disp} {delta_disp} {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
+                f"P=[{p1},{p2},{p3}]N{order_txt} Π={pin:.3e} | {parts_disp} {bolt_txt} "
+                f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
             )
             return postfix, "已记录"
         except Exception:
@@ -1145,7 +1164,7 @@ class Trainer:
             var.assign(tf.cast(slice_tensor, var.dtype))
             offset = next_offset
 
-    def _run_lbfgs_stage(self, total: TotalEnergy):
+    def _run_lbfgs_stage(self, total: TotalEnergy, show_progress: bool = False):
         if not self.cfg.lbfgs_enabled:
             return
 
@@ -1156,6 +1175,17 @@ class Trainer:
                 "启用了 L-BFGS 精调，但当前环境未安装 tensorflow_probability。"
                 "请先安装 tensorflow_probability 再重新运行。"
             ) from exc
+
+        pbar = None
+        if show_progress:
+            lbfgs_kwargs = dict(
+                total=max(1, int(self.cfg.lbfgs_max_iter)),
+                desc="L-BFGS阶段 (2/2)",
+                leave=True,
+            )
+            if self.cfg.train_bar_color:
+                lbfgs_kwargs["colour"] = self.cfg.train_bar_color
+            pbar = tqdm(**lbfgs_kwargs)
 
         train_vars = self._collect_trainable_variables()
         if not train_vars:
@@ -1217,6 +1247,20 @@ class Trainer:
         if results.failed:
             status = "failed"
         grad_norm = float(results.gradient_norm.numpy()) if results.gradient_norm is not None else float("nan")
+
+        if pbar is not None:
+            try:
+                completed = int(results.num_iterations.numpy())
+            except Exception:
+                completed = 0
+            pbar.update(max(0, min(self.cfg.lbfgs_max_iter, completed)))
+            pbar.set_postfix_str(
+                self._wrap_bar_text(
+                    f"loss={float(results.objective_value.numpy()):.3e} grad={grad_norm:.3e}"
+                )
+            )
+            pbar.close()
+
         print(
             f"[lbfgs] 完成：状态={status}, iters={int(results.num_iterations.numpy())}, "
             f"loss={float(results.objective_value.numpy()):.3e}, grad={grad_norm:.3e}"
@@ -1268,7 +1312,11 @@ class Trainer:
             )
         else:
             self.loss_state = None
-        train_pb_kwargs = dict(total=self.cfg.max_steps, desc="Training", leave=True)
+        if self.cfg.lbfgs_enabled:
+            train_desc = "Adam阶段 (1/2)"
+        else:
+            train_desc = "训练"
+        train_pb_kwargs = dict(total=self.cfg.max_steps, desc=train_desc, leave=True)
         if self.cfg.train_bar_color:
             train_pb_kwargs["colour"] = self.cfg.train_bar_color
         with tqdm(**train_pb_kwargs) as p_train:
@@ -1474,7 +1522,7 @@ class Trainer:
             self.ckpt_manager.save(checkpoint_number=self.cfg.max_steps)
 
         if self.cfg.lbfgs_enabled:
-            self._run_lbfgs_stage(total)
+            self._run_lbfgs_stage(total, show_progress=True)
 
         self._visualize_after_training(n_samples=self.cfg.viz_samples_after_train)
 
