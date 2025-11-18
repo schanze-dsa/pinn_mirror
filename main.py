@@ -307,6 +307,12 @@ def _prepare_config_with_autoguess():
     if "jitter" in staging_cfg:
         cfg.preload_sequence_jitter = float(staging_cfg["jitter"])
 
+    relax_top = cfg_yaml.get("preload_rank_relaxation", None)
+    if relax_top is not None:
+        cfg.preload_cfg.rank_relaxation = float(relax_top)
+    if "relaxation" in staging_cfg:
+        cfg.preload_cfg.rank_relaxation = float(staging_cfg["relaxation"])
+
     seq_overrides = cfg_yaml.get("preload_sequence", None)
     if seq_overrides:
         cfg.preload_sequence = list(seq_overrides)

@@ -610,11 +610,13 @@ class Trainer:
             rank = rank / float(nb - 1)
         else:
             rank = np.zeros_like(rank)
+        rank_matrix = np.tile(rank.reshape(1, -1), (len(stage_loads), 1))
         return {
             "stages": np.stack(stage_loads).astype(np.float32),
             "stage_masks": np.stack(stage_masks).astype(np.float32),
             "stage_last": np.stack(stage_last).astype(np.float32),
             "stage_rank": rank.astype(np.float32),
+            "stage_rank_matrix": rank_matrix.astype(np.float32),
         }
 
     def _sample_preload_case(self) -> Dict[str, np.ndarray]:
@@ -648,12 +650,20 @@ class Trainer:
         lasts = case.get("stage_last")
         order_np = case.get("order")
         rank_np = case.get("stage_rank")
+        rank_matrix_np = case.get("stage_rank_matrix")
         if order_np is None:
             order_np = np.arange(case["P"].shape[0], dtype=np.int32)
         order_tf = tf.convert_to_tensor(order_np, dtype=tf.int32)
         rank_tf = None
         if rank_np is not None:
             rank_tf = tf.convert_to_tensor(rank_np, dtype=tf.float32)
+        rank_matrix_tf = None
+        if rank_matrix_np is not None:
+            rank_matrix_tf = tf.convert_to_tensor(rank_matrix_np, dtype=tf.float32)
+        elif rank_tf is not None:
+            rank_matrix_tf = tf.repeat(
+                tf.expand_dims(rank_tf, axis=0), repeats=int(len(stages)), axis=0
+            )
         stage_params_P: List[tf.Tensor] = []
         stage_params_feat: List[tf.Tensor] = []
         stage_count = int(len(stages))
@@ -690,6 +700,8 @@ class Trainer:
             "P": stage_tensor_P,
             "P_hat": stage_tensor_feat,
         }
+        if rank_matrix_tf is not None:
+            params["stages"]["stage_rank"] = rank_matrix_tf
         params["stage_order"] = order_tf
         if rank_tf is not None:
             params["stage_rank"] = rank_tf
@@ -1399,33 +1411,117 @@ class Trainer:
         return ckpt_path
 
     def export_saved_model(self, export_dir: str) -> str:
-        """Export the PINN displacement model as a TensorFlow SavedModel.
-
-        The exported module exposes a callable with signature ``(X, P) -> u``
-        where ``X`` is an ``(N, 3)`` tensor of spatial coordinates and ``P``
-        is a ``(3,)`` tensor of bolt preload values (in Newtons). The return
-        value ``u`` matches :meth:`model.u_fn` and has shape ``(N, 3)``.
-        """
+        """Export the PINN displacement model as a TensorFlow SavedModel."""
 
         if self.model is None:
             raise RuntimeError("Trainer.export_saved_model() requires build()/restore().")
 
+        n_bolts = max(1, len(self.cfg.preload_specs) or 3)
+
         class _PINNModule(tf.Module):
-            def __init__(self, model):
+            def __init__(self, model, cfg, n_bolts):
                 super().__init__()
                 self._model = model
+                self._use_stages = bool(cfg.preload_use_stages)
+                self._shift = tf.constant(cfg.model_cfg.preload_shift, dtype=tf.float32)
+                self._scale = tf.constant(cfg.model_cfg.preload_scale, dtype=tf.float32)
+                self._n_bolts = int(n_bolts)
 
             @tf.function(
                 input_signature=[
                     tf.TensorSpec(shape=[None, 3], dtype=tf.float32, name="X"),
-                    tf.TensorSpec(shape=[3], dtype=tf.float32, name="P"),
+                    tf.TensorSpec(shape=[None], dtype=tf.float32, name="P"),
+                    tf.TensorSpec(shape=[None], dtype=tf.int32, name="order"),
                 ]
             )
-            def __call__(self, X, P):
-                params = {"P": tf.reshape(P, (3,))}
+            def __call__(self, X, P, order):
+                params = self._prepare_params(P, order)
                 return self._model.u_fn(X, params)
 
-        module = _PINNModule(self.model)
+            def _prepare_params(self, P, order):
+                P = tf.reshape(P, (self._n_bolts,))
+                if not self._use_stages:
+                    return {"P": P}
+                order = self._normalize_order(order)
+                stage_P, stage_feat = self._build_stage_tensors(P, order)
+                return {"P": stage_P[-1], "P_hat": stage_feat[-1]}
+
+            def _normalize_order(self, order):
+                order = tf.reshape(order, (self._n_bolts,))
+                default = tf.range(self._n_bolts, dtype=tf.int32)
+                cond = tf.reduce_all(order >= 0)
+                order = tf.where(cond, order, default)
+                minv = tf.reduce_min(order)
+                maxv = tf.reduce_max(order)
+
+                def _one_based():
+                    return order - 1
+
+                order = tf.cond(
+                    tf.logical_and(tf.greater_equal(minv, 1), tf.less_equal(maxv, self._n_bolts)),
+                    _one_based,
+                    lambda: order,
+                )
+                return order
+
+            def _build_stage_tensors(self, P, order):
+                stage_count = self._n_bolts
+                cumulative = tf.zeros_like(P)
+                mask = tf.zeros_like(P)
+                loads_ta = tf.TensorArray(tf.float32, size=stage_count)
+                masks_ta = tf.TensorArray(tf.float32, size=stage_count)
+                last_ta = tf.TensorArray(tf.float32, size=stage_count)
+
+                def body(i, cum, mask_vec, loads, masks, lasts):
+                    bolt = tf.gather(order, i)
+                    bolt = tf.clip_by_value(bolt, 0, self._n_bolts - 1)
+                    load_val = tf.gather(P, bolt)
+                    idx = tf.reshape(bolt, (1, 1))
+                    cum = tf.tensor_scatter_nd_update(cum, idx, tf.reshape(load_val, (1,)))
+                    mask_vec = tf.tensor_scatter_nd_update(
+                        mask_vec, idx, tf.ones((1,), dtype=tf.float32)
+                    )
+                    loads = loads.write(i, cum)
+                    masks = masks.write(i, mask_vec)
+                    last_vec = tf.zeros_like(P)
+                    last_vec = tf.tensor_scatter_nd_update(
+                        last_vec, idx, tf.ones((1,), dtype=tf.float32)
+                    )
+                    lasts = lasts.write(i, last_vec)
+                    return i + 1, cum, mask_vec, loads, masks, lasts
+
+                _, cumulative, mask, loads_ta, masks_ta, last_ta = tf.while_loop(
+                    lambda i, *_: tf.less(i, stage_count),
+                    body,
+                    (0, cumulative, mask, loads_ta, masks_ta, last_ta),
+                )
+
+                stage_P = loads_ta.stack()
+                stage_masks = masks_ta.stack()
+                stage_last = last_ta.stack()
+
+                indices = tf.reshape(order, (-1, 1))
+                ranks = tf.cast(tf.range(stage_count), tf.float32)
+                rank_vec = tf.tensor_scatter_nd_update(
+                    tf.zeros((self._n_bolts,), tf.float32), indices, ranks
+                )
+                if stage_count > 1:
+                    rank_vec = rank_vec / tf.cast(stage_count - 1, tf.float32)
+                else:
+                    rank_vec = tf.zeros_like(rank_vec)
+
+                feats_ta = tf.TensorArray(tf.float32, size=stage_count)
+                for i in range(stage_count):
+                    norm = (stage_P[i] - self._shift) / self._scale
+                    feat = tf.concat(
+                        [norm, stage_masks[i], stage_last[i], rank_vec], axis=0
+                    )
+                    feats_ta = feats_ta.write(i, feat)
+
+                stage_feat = feats_ta.stack()
+                return stage_P, stage_feat
+
+        module = _PINNModule(self.model, self.cfg, n_bolts)
         tf.saved_model.save(module, export_dir)
         print(f"[trainer] SavedModel exported -> {export_dir}")
         return export_dir
