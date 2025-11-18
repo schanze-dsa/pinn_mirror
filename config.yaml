@@ -10,7 +10,10 @@
 # ------------------------------------------------------------
 
 # 材料标签的枚举（顺序无所谓，但名字要和下面 material_properties 一致）
-material_enum: [jingmian, structural_steel, zhijia]
+material_enum:
+  - jingmian
+  - structural_steel
+  - zhijia
 
 # 各材料的属性。当前 DFEM 静力分析只会用到 E 和 nu，
 # 其它参数为后续屈服判定、动力学、热–结构耦合等做准备。
@@ -110,27 +113,43 @@ bolts:
     up_surface_key:   'ASM::"bolt3 up"'
     down_surface_key: 'ASM::"bolt3 down"'
 
+# 预紧分阶段/顺序设置（enabled=true 则训练/推理都会按照顺序分步加载）
+preload_staging:
+  enabled: true              # 启用分阶段加载 -> PINN 输入包含顺序信息
+  randomize_order: true      # 训练时随机打乱三颗螺栓的加载顺序
+  repeat: 3                  # 每组顺序持续的步数（>1 时可重复使用同一组合）
+  shuffle: false             # 若提供 sequence 列表，是否在 epoch 间随机打乱条目
+  jitter: 0.0                # 顺序列表在训练时叠加的 ±jitter 噪声（N）
+  relaxation: 0.25           # 顺序松弛系数；>0 时早拧的螺栓载荷放大、晚拧的减小
+  # sequence:               # 如需固定顺序，可取消注释并填写：
+  #   - values: [800, 600, 500]
+  #     order:  [1, 3, 2]    # 顺序字段支持 1-based 或 0-based
+
 # ------------------------------------------------------------
 # 4. 接触对设置（master/slave surface 名需与 INP 中一致）
 # ------------------------------------------------------------
 contact_pairs:
-  # 镜面与各螺栓帽/垫片接触
-  - master_key: 'ASM::"mirror1 up"'
-    slave_key:  'ASM::"bolt1 mirror s"'
-    interaction: 'fri'      # 考虑摩擦
-  - master_key: 'ASM::"mirror2 up"'
-    slave_key:  'ASM::"bolt2 mirror s"'
+  # INP 中定义的 13 组接触对（主/从表面名需与 INP 完全一致）
+  - master_key: 'ASM::"mirror1 auto"'
+    slave_key:  'ASM::"auto mirror1"'
     interaction: 'fri'
-  - master_key: 'ASM::"mirror3 up"'
-    slave_key:  'ASM::"bolt3 mirror s"'
+  - master_key: 'ASM::"bolt1 auto down"'
+    slave_key:  'ASM::"bolt1 down"'
     interaction: 'fri'
-
-  # 各螺栓头/垫片与其下部结构的接触
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key:  'ASM::"bolt1 up"'
+    interaction: 'fri'
   - master_key: 'ASM::"bolt1 auto s"'
     slave_key:  'ASM::"bolt1 s"'
     interaction: 'fri'
   - master_key: 'ASM::"bolt1 mirror s"'
     slave_key:  'ASM::"bolt1 s"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt2 auto down"'
+    slave_key:  'ASM::"bolt2 down"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key:  'ASM::"bolt2 uo"'
     interaction: 'fri'
   - master_key: 'ASM::"bolt2 auto s"'
     slave_key:  'ASM::"bolt2 s"'
@@ -138,25 +157,17 @@ contact_pairs:
   - master_key: 'ASM::"bolt2 mirror s"'
     slave_key:  'ASM::"bolt2 s"'
     interaction: 'fri'
+  - master_key: 'ASM::"bolt3 auto down"'
+    slave_key:  'ASM::"bolt3 down"'
+    interaction: 'fri'
+  - master_key: 'ASM::"bolt3 mirror up"'
+    slave_key:  'ASM::"bolt3 up"'
+    interaction: 'fri'
   - master_key: 'ASM::"bolt3 auto s"'
     slave_key:  'ASM::"bolt3 s"'
     interaction: 'fri'
   - master_key: 'ASM::"bolt3 mirror s"'
     slave_key:  'ASM::"bolt3 s"'
-    interaction: 'fri'
-
-  # 螺栓上表面之间的接触（防止装配间隙导致相对位移异常）
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key:  'ASM::"bolt1 up"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt2 mirror up"'
-    slave_key:  'ASM::"bolt1 up"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt1 mirror up"'
-    slave_key:  'ASM::"bolt2 uo"'
-    interaction: 'fri'
-  - master_key: 'ASM::"bolt3 mirror up"'
-    slave_key:  'ASM::"bolt3 up"'
     interaction: 'fri'
 
 # ------------------------------------------------------------
@@ -166,13 +177,24 @@ network_config:
   model_type: pinn         # 之后会 DFEM 化：网络预测节点位移/场
   input_dim: 3             # 例如三个预紧力或加载参数
   output_dim: 1            # 目标量维度；如需输出完整位移场可在代码中扩展
-  layers: [64, 64, 32]
+  layers:
+    - 64
+    - 64
+    - 32
 
 optimizer_config:
   type: Adam
-  learning_rate: 0.001
+  learning_rate: 0.0005
+  grad_clip_norm: 1.0e6
   batch_size: 32
-  epochs: 500
+  epochs: 1000              # Adam 阶段的迭代步数
+  lbfgs:
+    enabled: true           # 是否在 Adam 之后追加 L-BFGS 精调
+    max_iter: 200           # L-BFGS 最大迭代次数
+    tolerance: 1.0e-6       # 收敛判据（目标函数相对变化）
+    history_size: 50        # 拟牛顿历史记忆对数
+    line_search: 50         # 线搜索最大迭代
+    reuse_last_batch: true  # true 表示复用 Adam 最后一次随机样本
 
 # ------------------------------------------------------------
 # 6. 弹性 DFEM 配置（ElasticityConfig）
@@ -203,7 +225,11 @@ loss_config:
     temperature: 1.0        # softmax 温度
     min_weight: 0.1         # 单项权重下限
     max_weight: 10.0        # 单项权重上限
-    focus_terms: [w_int, w_cn, w_ct]  # 重点自适应的损失项
+    focus_terms:
+      - w_int
+      - w_cn
+      - w_ct
+      - w_pre   # 重点自适应的损失项
 
 # ------------------------------------------------------------
 # 8. 输出与可视化
@@ -216,6 +242,14 @@ output_config:
 # 9. INP 文件路径
 # ------------------------------------------------------------
 inp_path: D:/shuangfan/shuangfan.inp
+
+# ------------------------------------------------------------
+# 10. 训练采样/调度（main.py 会读取这些值覆盖默认兜底）
+# ------------------------------------------------------------
+n_contact_points_per_pair: 2400     # 每对接触面的采样数（单阶段）
+preload_n_points_each: 800         # 单个螺栓端面的采样数
+resample_contact_every: 5          # 每隔多少步重采样接触点（0=只采样首步）
+alm_update_every: 75               # 接触 ALM 罚乘子更新周期
 
 
 n_tie_points: 2000
