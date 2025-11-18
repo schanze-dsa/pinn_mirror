@@ -255,6 +255,7 @@ class GraphConvLayer(tf.keras.layers.Layer):
         rel_mean = tf.reduce_mean(rel, axis=1)
         rel_std = tf.math.reduce_std(rel, axis=1)
         rel_feat = tf.concat([rel_mean, rel_std], axis=-1)   # (N, 6)
+        rel_feat = tf.cast(rel_feat, feat.dtype)
 
         mix = tf.concat([feat, agg, rel_feat], axis=-1)
         out = self.lin(mix)
