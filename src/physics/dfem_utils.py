@@ -10,7 +10,6 @@
 # ================================================================
 
 import numpy as np
-import tensorflow as tf
 
 
 # ---------------------------------------------------------------
@@ -33,17 +32,23 @@ def tetra_B_and_volume(X4):
     if vol <= 1e-16:
         raise ValueError("四面体体积过小，可能退化。")
 
-    # 形函数梯度（常梯度四面体的标准公式）
-    # N1 = a1 + b1*x + c1*y + d1*z, 但梯度直接由几何决定
-    def grad_N(v1, v2, v3):
-        return np.cross(v2 - v1, v3 - v1) / (6.0 * vol)
+    # 形函数梯度：通过解线性系统得到常梯度 (∂Ni/∂x, ∂Ni/∂y, ∂Ni/∂z)
+    V = np.array(
+        [
+            [1.0, *x1],
+            [1.0, *x2],
+            [1.0, *x3],
+            [1.0, *x4],
+        ],
+        dtype=np.float64,
+    )
 
-    g1 = grad_N(x2, x3, x4)
-    g2 = grad_N(x3, x4, x1)
-    g3 = grad_N(x4, x1, x2)
-    g4 = grad_N(x1, x2, x3)
+    try:
+        coeffs = np.linalg.solve(V, np.eye(4))  # shape (4,4)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("四面体几何退化，无法求解形函数梯度。") from exc
 
-    grads = [g1, g2, g3, g4]
+    grads = coeffs[1:, :].T  # (4,3)
 
     # Voigt 形式 B (6, 12)
     B = np.zeros((6, 12), dtype=np.float32)
@@ -74,17 +79,21 @@ def build_dfem_subcells(asm, part2mat, materials):
 
     输出：
         dict:
-            X_nodes_tf : (Nnode, 3)
-            B_tf       : (Nsub, 6, 12)
-            vol_tf     : (Nsub,)
-            w_tf       : (Nsub,)
-            lam_tf     : (Nsub,)
-            mu_tf      : (Nsub,)
-            dof_idx_tf : (Nsub, 12)
+            X_nodes : (Nnode, 3)
+            B       : (Nsub, 6, 12)
+            w       : (Nsub,)
+            lam     : (Nsub,)
+            mu      : (Nsub,)
+            dof_idx : (Nsub, 12)
     """
 
-    X_nodes = asm.nodes  # shape = (Nnode, 3)
-    X_nodes_tf = tf.constant(X_nodes, dtype=tf.float32)
+    if not getattr(asm, "nodes", None):
+        raise ValueError("AssemblyModel 缺少节点坐标信息 (asm.nodes 为空)。")
+
+    # 节点在 AssemblyModel 中以 dict[nid] = (x,y,z) 存储，需转换为 0-based 顺序数组
+    node_ids = sorted(int(nid) for nid in asm.nodes.keys())
+    id2idx = {nid: i for i, nid in enumerate(node_ids)}
+    X_nodes = np.asarray([asm.nodes[nid] for nid in node_ids], dtype=np.float32)
 
     B_list = []
     vol_list = []
@@ -93,64 +102,82 @@ def build_dfem_subcells(asm, part2mat, materials):
     dof_idx_list = []
 
     # 遍历所有 Part（CD3D8/C3D4 都被拆成四面体）
-    for part in asm.parts.values():
-        mat_name = part2mat.get(part.name, None)
+    for part_name, part in asm.parts.items():
+        mat_name = part2mat.get(part_name, None)
         if mat_name is None:
-            raise KeyError(f"Part '{part.name}' 无材料映射。请检查 part2mat。")
+            raise KeyError(f"Part '{part_name}' 无材料映射。请检查 part2mat。")
 
         if mat_name not in materials:
             raise KeyError(f"材料 '{mat_name}' 未在 materials 字典中注册。")
 
-        E, nu = materials[mat_name]
+        mat_props = materials[mat_name]
+        if isinstance(mat_props, (tuple, list)) and len(mat_props) >= 2:
+            E, nu = float(mat_props[0]), float(mat_props[1])
+        elif isinstance(mat_props, dict):
+            try:
+                E = float(mat_props["E"])
+                nu = float(mat_props["nu"])
+            except KeyError as exc:
+                raise KeyError(f"材料 '{mat_name}' 需要提供 E 与 nu。") from exc
+        else:
+            raise TypeError(
+                f"材料 '{mat_name}' 的属性需为 (E, nu) 或包含 E/nu 的字典，实际为 {type(mat_props)}。"
+            )
         lam = (E * nu) / ((1 + nu) * (1 - 2 * nu))
         mu = E / (2 * (1 + nu))
 
-        for elem in part.elems:
-            conn = elem.conn  # element 的节点列表 (例如 C3D8 是 8 点)
+        for blk in getattr(part, "element_blocks", []):
+            etype = (blk.elem_type or "").upper()
+            if etype not in {"C3D4", "C3D8"}:
+                # 目前仅支持常用的四面体/六面体，其他类型如 C3D10/C3D20 需额外实现拆分
+                continue
 
-            # 把 C3D8 拆成 4 个四面体；若本来就是 C3D4 则只生成 1 个
-            if len(conn) == 8:
-                tet_conn = [
-                    [conn[0], conn[1], conn[3], conn[4]],
-                    [conn[1], conn[2], conn[3], conn[6]],
-                    [conn[1], conn[5], conn[4], conn[6]],
-                    [conn[3], conn[4], conn[7], conn[6]],
-                ]
-            elif len(conn) == 4:
-                tet_conn = [conn]
-            else:
-                raise ValueError(f"不支持的单元节点数: {len(conn)}")
+            for conn_raw in blk.connectivity:
+                conn = [int(n) for n in conn_raw]
 
-            # 每个四面体都构造 B、vol、局部 DOF 索引
-            for tet in tet_conn:
-                X4 = X_nodes[tet, :]
-                B, vol = tetra_B_and_volume(X4)
+                if etype == "C3D8":
+                    if len(conn) < 8:
+                        raise ValueError(f"C3D8 单元期望 8 个节点，实际 {len(conn)}。")
+                    tet_conns = [
+                        [conn[0], conn[1], conn[3], conn[4]],
+                        [conn[1], conn[2], conn[3], conn[6]],
+                        [conn[1], conn[5], conn[4], conn[6]],
+                        [conn[3], conn[4], conn[7], conn[6]],
+                    ]
+                else:  # C3D4
+                    if len(conn) < 4:
+                        raise ValueError(f"C3D4 单元期望至少 4 个节点，实际 {len(conn)}。")
+                    tet_conns = [conn[:4]]
 
-                B_list.append(B)
-                vol_list.append(vol)
-                lam_list.append(lam)
-                mu_list.append(mu)
+                for tet in tet_conns:
+                    try:
+                        idxs = [id2idx[int(nid)] for nid in tet]
+                    except KeyError as exc:
+                        raise KeyError(f"四面体节点 {tet} 不在 AssemblyModel.nodes 中。") from exc
 
-                # 对四点 → 每点 3 个 DOF → 共 12 个自由度
-                dof_idx = []
-                for nid in tet:
-                    dof_idx.extend([3 * nid + 0, 3 * nid + 1, 3 * nid + 2])
-                dof_idx_list.append(dof_idx)
+                    X4 = X_nodes[idxs, :]
+                    B, vol = tetra_B_and_volume(X4)
 
-    # 转成 TensorFlow 张量
-    B_tf = tf.constant(np.array(B_list, dtype=np.float32))              # (Nsub, 6, 12)
-    vol_tf = tf.constant(np.array(vol_list, dtype=np.float32))          # (Nsub,)
-    w_tf = vol_tf                                                        # 权重 = 小单元体积
-    lam_tf = tf.constant(np.array(lam_list, dtype=np.float32))          # (Nsub,)
-    mu_tf = tf.constant(np.array(mu_list, dtype=np.float32))            # (Nsub,)
-    dof_idx_tf = tf.constant(np.array(dof_idx_list, dtype=np.int32))    # (Nsub, 12)
+                    B_list.append(B)
+                    vol_list.append(vol)
+                    lam_list.append(lam)
+                    mu_list.append(mu)
+
+                    dof_idx = []
+                    for idx in idxs:
+                        base = 3 * idx
+                        dof_idx.extend([base + 0, base + 1, base + 2])
+                    dof_idx_list.append(dof_idx)
+
+    # 汇总为 NumPy 数组，供 ElasticityEnergy 缓存为 TensorFlow 张量
+    if not B_list:
+        raise ValueError("未从装配中提取到任何 DFEM 子单元，请检查材料映射与单元类型。")
 
     return dict(
-        X_nodes_tf=X_nodes_tf,
-        B_tf=B_tf,
-        vol_tf=vol_tf,
-        w_tf=w_tf,
-        lam_tf=lam_tf,
-        mu_tf=mu_tf,
-        dof_idx_tf=dof_idx_tf,
+        X_nodes=X_nodes,
+        B=np.asarray(B_list, dtype=np.float32),
+        w=np.asarray(vol_list, dtype=np.float32),
+        lam=np.asarray(lam_list, dtype=np.float32),
+        mu=np.asarray(mu_list, dtype=np.float32),
+        dof_idx=np.asarray(dof_idx_list, dtype=np.int32),
     )
