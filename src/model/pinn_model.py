@@ -311,7 +311,13 @@ class GraphConvLayer(tf.keras.layers.Layer):
 
 def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
     """
-    返回每个点的 k 个邻居索引 (N, k)，通过按块计算 pairwise 距离来控制显存占用。
+    返回每个点的 k 个邻居索引 (N, k)。
+
+    早期实现即便做了按行分块，依旧需要为每个行块一次性构造大小为
+    (chunk × N) 的距离矩阵，N 动辄上万时会产生数百 MB 的瞬时分配，从而
+    触发 GPU OOM。这里改为 *双层分块*：对于每个行块，再按列块遍历全集，
+    仅保留当前行块的 top-k 中间结果，使得任一时刻只需保存
+    (chunk × chunk) 的距离矩阵，内存需求降到线性级别。
     """
 
     x = tf.cast(x, tf.float32)
@@ -320,13 +326,13 @@ def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
     chunk = max(int(chunk_size), 1)
     k_const = tf.constant(k, dtype=tf.int32)
     chunk_const = tf.constant(chunk, dtype=tf.int32)
+    large_val = tf.constant(1e30, dtype=tf.float32)
 
     def _empty():
         return tf.zeros((0, k), dtype=tf.int32)
 
     def _build():
         x_sq = tf.reduce_sum(tf.square(x), axis=1)  # (N,)
-        all_idx = tf.range(n)
         ta = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True, clear_after_read=False)
 
         def _cond(start, *_):
@@ -335,31 +341,60 @@ def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
         def _body(start, ta_handle, write_idx):
             end = tf.minimum(n, start + chunk_const)
             rows = tf.range(start, end)
+            chunk_len = tf.shape(rows)[0]
             x_chunk = tf.gather(x, rows)
             chunk_sq = tf.gather(x_sq, rows)
-            dist = (
-                tf.expand_dims(chunk_sq, 1)
-                + tf.expand_dims(x_sq, 0)
-                - 2.0 * tf.matmul(x_chunk, x, transpose_b=True)
+            best_shape = tf.stack([chunk_len, k_const])
+            best_dist = tf.fill(best_shape, large_val)
+            best_idx = tf.zeros(best_shape, dtype=tf.int32)
+
+            def _inner_cond(col_start, *_):
+                return tf.less(col_start, n)
+
+            def _inner_body(col_start, best_d, best_i):
+                col_end = tf.minimum(n, col_start + chunk_const)
+                cols = tf.range(col_start, col_end)
+                x_cols = tf.gather(x, cols)
+                col_sq = tf.gather(x_sq, cols)
+                dist = (
+                    tf.expand_dims(chunk_sq, 1)
+                    + tf.expand_dims(col_sq, 0)
+                    - 2.0 * tf.matmul(x_chunk, x_cols, transpose_b=True)
+                )
+                dist = tf.maximum(dist, 0.0)
+                same = tf.cast(
+                    tf.equal(tf.expand_dims(rows, 1), tf.expand_dims(cols, 0)),
+                    dist.dtype,
+                )
+                dist = dist + same * 1e9
+
+                combined_dist = tf.concat([best_d, dist], axis=1)
+                tiled_cols = tf.tile(
+                    tf.expand_dims(tf.cast(cols, tf.int32), 0), [chunk_len, 1]
+                )
+                combined_idx = tf.concat([best_i, tiled_cols], axis=1)
+
+                neg_dist = -combined_dist
+                vals, top_idx = tf.math.top_k(neg_dist, k=k)
+                new_best_dist = -vals
+                new_best_idx = tf.gather(combined_idx, top_idx, batch_dims=1)
+                return col_end, new_best_dist, new_best_idx
+
+            start_inner = tf.constant(0, dtype=tf.int32)
+            _, best_final, idx_final = tf.while_loop(
+                _inner_cond,
+                _inner_body,
+                (start_inner, best_dist, best_idx),
+                parallel_iterations=1,
             )
-            dist = tf.maximum(dist, 0.0)
-            mask = tf.cast(tf.equal(tf.expand_dims(rows, 1), tf.expand_dims(all_idx, 0)), dist.dtype)
-            dist = dist + mask * 1e9
-            idx = tf.argsort(dist, axis=-1)[:, :k]
-            cur_k = tf.shape(idx)[1]
-
-            def _pad():
-                deficit = k_const - cur_k
-                pad_vals = tf.tile(idx[:, -1:], [1, deficit])
-                return tf.concat([idx, pad_vals], axis=1)
-
-            idx = tf.cond(tf.less(cur_k, k_const), _pad, lambda: idx)
-            ta_handle = ta_handle.write(write_idx, tf.cast(idx, tf.int32))
+            ta_handle = ta_handle.write(write_idx, idx_final)
             return end, ta_handle, write_idx + 1
 
         start0 = tf.constant(0, dtype=tf.int32)
         write0 = tf.constant(0, dtype=tf.int32)
-        _, ta_final, _ = tf.while_loop(_cond, _body, (start0, ta, write0))
+        _, ta_final, _ = tf.while_loop(
+            _cond, _body, (start0, ta, write0), parallel_iterations=1
+        )
         return ta_final.concat()
 
     return tf.cond(tf.equal(n, 0), _empty, _build)
