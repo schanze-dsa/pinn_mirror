@@ -281,10 +281,13 @@ class GraphConvLayer(tf.keras.layers.Layer):
                 feat_chunk = tf.gather(feat32, rows)            # (chunk, C)
                 coords_chunk = tf.gather(coords32, rows)        # (chunk, 3)
                 idx_chunk = tf.gather(knn_idx, rows)            # (chunk, K)
+                idx_chunk = tf.ensure_shape(idx_chunk, (None, self.k))
                 neighbors = tf.gather(feat32, idx_chunk)        # (chunk, K, C)
+                neighbors = tf.ensure_shape(neighbors, (None, self.k, None))
                 agg = tf.reduce_mean(neighbors, axis=1)         # (chunk, C)
 
                 nbr_coords = tf.gather(coords32, idx_chunk)     # (chunk, K, 3)
+                nbr_coords = tf.ensure_shape(nbr_coords, (None, self.k, 3))
                 rel = nbr_coords - tf.expand_dims(coords_chunk, axis=1)
                 rel_mean = tf.reduce_mean(rel, axis=1)
                 rel_std = tf.math.reduce_std(rel, axis=1)
