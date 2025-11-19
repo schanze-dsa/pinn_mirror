@@ -63,6 +63,7 @@ class FieldConfig:
     w0: float = 30.0          # only for SIREN (sine) first layer frequency
     use_graph: bool = True    # 是否改用 GCN 主干而非传统 MLP
     graph_k: int = 12         # kNN 图中的邻居数量
+    graph_knn_chunk: int = 2048  # 构建 kNN 图时一次处理的节点数量
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
@@ -265,33 +266,60 @@ class GraphConvLayer(tf.keras.layers.Layer):
         return out
 
 
-def _pairwise_distances(x: tf.Tensor) -> tf.Tensor:
-    x = tf.cast(x, tf.float32)
-    x_sq = tf.reduce_sum(tf.square(x), axis=1, keepdims=True)
-    dist = x_sq - 2.0 * tf.matmul(x, x, transpose_b=True) + tf.transpose(x_sq)
-    dist = tf.maximum(dist, 0.0)
-    return dist
+def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
+    """
+    返回每个点的 k 个邻居索引 (N, k)，通过按块计算 pairwise 距离来控制显存占用。
+    """
 
-
-def _build_knn_graph(x: tf.Tensor, k: int) -> tf.Tensor:
-    """返回每个点的 k 个邻居索引 (N, k)。"""
     x = tf.cast(x, tf.float32)
     n = tf.shape(x)[0]
     k = max(int(k), 1)
+    chunk = max(int(chunk_size), 1)
     k_const = tf.constant(k, dtype=tf.int32)
+    chunk_const = tf.constant(chunk, dtype=tf.int32)
 
-    dist = _pairwise_distances(x)
-    mask = tf.eye(n, dtype=tf.float32) * 1e9
-    dist = dist + mask
-    idx = tf.argsort(dist, axis=-1)[:, :k]  # (N, <=k)
-    cur_k = tf.shape(idx)[1]
-    def _pad_needed():
-        deficit = k_const - cur_k
-        pad = tf.tile(idx[:, -1:], [1, deficit])
-        return tf.concat([idx, pad], axis=1)
+    def _empty():
+        return tf.zeros((0, k), dtype=tf.int32)
 
-    idx = tf.cond(tf.less(cur_k, k_const), _pad_needed, lambda: idx)
-    return tf.cast(idx, tf.int32)
+    def _build():
+        x_sq = tf.reduce_sum(tf.square(x), axis=1)  # (N,)
+        all_idx = tf.range(n)
+        ta = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True, clear_after_read=False)
+
+        def _cond(start, *_):
+            return tf.less(start, n)
+
+        def _body(start, ta_handle, write_idx):
+            end = tf.minimum(n, start + chunk_const)
+            rows = tf.range(start, end)
+            x_chunk = tf.gather(x, rows)
+            chunk_sq = tf.gather(x_sq, rows)
+            dist = (
+                tf.expand_dims(chunk_sq, 1)
+                + tf.expand_dims(x_sq, 0)
+                - 2.0 * tf.matmul(x_chunk, x, transpose_b=True)
+            )
+            dist = tf.maximum(dist, 0.0)
+            mask = tf.cast(tf.equal(tf.expand_dims(rows, 1), tf.expand_dims(all_idx, 0)), dist.dtype)
+            dist = dist + mask * 1e9
+            idx = tf.argsort(dist, axis=-1)[:, :k]
+            cur_k = tf.shape(idx)[1]
+
+            def _pad():
+                deficit = k_const - cur_k
+                pad_vals = tf.tile(idx[:, -1:], [1, deficit])
+                return tf.concat([idx, pad_vals], axis=1)
+
+            idx = tf.cond(tf.less(cur_k, k_const), _pad, lambda: idx)
+            ta_handle = ta_handle.write(write_idx, tf.cast(idx, tf.int32))
+            return end, ta_handle, write_idx + 1
+
+        start0 = tf.constant(0, dtype=tf.int32)
+        write0 = tf.constant(0, dtype=tf.int32)
+        _, ta_final, _ = tf.while_loop(_cond, _body, (start0, ta, write0))
+        return ta_final.concat()
+
+    return tf.cond(tf.equal(n, 0), _empty, _build)
 
 
 # -----------------------------
@@ -441,7 +469,7 @@ class DisplacementNet(tf.keras.Model):
 
         def graph_forward():
             coords = tf.cast(x, tf.float32)
-            knn_idx = _build_knn_graph(coords, self.cfg.graph_k)
+            knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
             hcur = self.graph_proj(h)
             for layer in self.graph_layers:
                 hcur = layer(hcur, coords, knn_idx, training=training)
