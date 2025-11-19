@@ -63,7 +63,7 @@ class FieldConfig:
     w0: float = 30.0          # only for SIREN (sine) first layer frequency
     use_graph: bool = True    # 是否改用 GCN 主干而非传统 MLP
     graph_k: int = 12         # kNN 图中的邻居数量
-    graph_knn_chunk: int = 2048  # 构建 kNN 图时一次处理的节点数量
+    graph_knn_chunk: int = 2048  # 构建 kNN/图卷积时每批处理的节点数量
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
@@ -224,13 +224,21 @@ class MLP(tf.keras.layers.Layer):
 class GraphConvLayer(tf.keras.layers.Layer):
     """简单的消息传递层：聚合 kNN 邻居并结合相对坐标统计。"""
 
-    def __init__(self, hidden_dim: int, k: int, act: str, dropout: float = 0.0):
+    def __init__(
+        self,
+        hidden_dim: int,
+        k: int,
+        act: str,
+        dropout: float = 0.0,
+        chunk_size: int = 2048,
+    ):
         # 始终在 float32 下计算，避免混合精度下的溢出/NaN
         super().__init__(dtype=tf.float32)
         self.hidden_dim = hidden_dim
         self.k = max(int(k), 1)
         self.act = _get_activation(act)
         self.dropout = float(max(dropout, 0.0))
+        self.chunk_size = max(int(chunk_size), 1)
         self.lin = tf.keras.layers.Dense(
             hidden_dim,
             kernel_initializer="he_uniform",
@@ -253,23 +261,52 @@ class GraphConvLayer(tf.keras.layers.Layer):
         feat32 = tf.cast(feat, tf.float32)
         coords32 = tf.cast(coords, tf.float32)
 
-        neighbors = tf.gather(feat32, knn_idx)               # (N, K, C)
-        agg = tf.reduce_mean(neighbors, axis=1)              # (N, C)
+        n = tf.shape(feat32)[0]
+        chunk_const = tf.constant(self.chunk_size, dtype=tf.int32)
 
-        nbr_coords = tf.gather(coords32, knn_idx)            # (N, K, 3)
-        rel = nbr_coords - tf.expand_dims(coords32, axis=1)  # (N, K, 3)
-        rel_mean = tf.reduce_mean(rel, axis=1)
-        rel_std = tf.math.reduce_std(rel, axis=1)
-        rel_feat = tf.concat([rel_mean, rel_std], axis=-1)   # (N, 6)
+        def _empty_out():
+            return tf.zeros((0, self.hidden_dim), dtype=tf.float32)
 
-        mix = tf.concat([feat32, agg, rel_feat], axis=-1)
-        out = self.lin(mix)
-        out = self.act(out)
-        if self.dropout > 0.0 and training:
-            out = tf.nn.dropout(out, rate=self.dropout)
+        def _compute():
+            ta = tf.TensorArray(
+                dtype=tf.float32, size=0, dynamic_size=True, clear_after_read=False
+            )
+
+            def _cond(start, *_):
+                return tf.less(start, n)
+
+            def _body(start, ta_handle, write_idx):
+                end = tf.minimum(n, start + chunk_const)
+                rows = tf.range(start, end)
+                feat_chunk = tf.gather(feat32, rows)            # (chunk, C)
+                coords_chunk = tf.gather(coords32, rows)        # (chunk, 3)
+                idx_chunk = tf.gather(knn_idx, rows)            # (chunk, K)
+                neighbors = tf.gather(feat32, idx_chunk)        # (chunk, K, C)
+                agg = tf.reduce_mean(neighbors, axis=1)         # (chunk, C)
+
+                nbr_coords = tf.gather(coords32, idx_chunk)     # (chunk, K, 3)
+                rel = nbr_coords - tf.expand_dims(coords_chunk, axis=1)
+                rel_mean = tf.reduce_mean(rel, axis=1)
+                rel_std = tf.math.reduce_std(rel, axis=1)
+                rel_feat = tf.concat([rel_mean, rel_std], axis=-1)  # (chunk, 6)
+
+                mix = tf.concat([feat_chunk, agg, rel_feat], axis=-1)
+                out = self.lin(mix)
+                out = self.act(out)
+                if self.dropout > 0.0 and training:
+                    out = tf.nn.dropout(out, rate=self.dropout)
+                ta_handle = ta_handle.write(write_idx, out)
+                return end, ta_handle, write_idx + 1
+
+            start0 = tf.constant(0, dtype=tf.int32)
+            write0 = tf.constant(0, dtype=tf.int32)
+            _, ta_final, _ = tf.while_loop(_cond, _body, (start0, ta, write0))
+            return ta_final.concat()
+
+        out32 = tf.cond(tf.equal(n, 0), _empty_out, _compute)
         if input_dtype != tf.float32:
-            out = tf.cast(out, input_dtype)
-        return out
+            out32 = tf.cast(out32, input_dtype)
+        return out32
 
 
 def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
@@ -407,6 +444,7 @@ class DisplacementNet(tf.keras.Model):
                     k=cfg.graph_k,
                     act=cfg.act,
                     dropout=cfg.graph_dropout,
+                    chunk_size=cfg.graph_knn_chunk,
                 )
                 for _ in range(cfg.graph_layers)
             ]
