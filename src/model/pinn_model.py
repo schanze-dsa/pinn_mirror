@@ -66,6 +66,7 @@ class FieldConfig:
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
+    graph_max_nodes: int = 4096  # 节点超过该阈值时自动回退到 MLP，防止构图 OOM
 
 @dataclass
 class ModelConfig:
@@ -329,6 +330,7 @@ class DisplacementNet(tf.keras.Model):
         self.cfg = cfg
         self.is_siren = (cfg.act.lower() == "sine")
         self.use_graph = bool(cfg.use_graph)
+        self.residual_skips = set(cfg.residual_skips or tuple())
 
         # Fourier PE
         self.pe = GaussianFourierFeatures(
@@ -338,6 +340,27 @@ class DisplacementNet(tf.keras.Model):
         in_dim_total = self.pe.out_dim + cfg.cond_dim
         self.act = _get_activation(cfg.act)
         self.w0 = cfg.w0
+
+        # 始终构建 MLP 主干（即使启用 GCN，也可在节点过多时退回）
+        self.in_linear = tf.keras.layers.Dense(
+            cfg.width,
+            kernel_initializer="he_uniform",
+            dtype=tf.float32,
+        )
+        self.blocks = []
+        for _ in range(cfg.depth):
+            self.blocks.append(
+                tf.keras.layers.Dense(
+                    cfg.width,
+                    kernel_initializer="he_uniform",
+                    dtype=tf.float32,
+                )
+            )
+        self.out_linear = tf.keras.layers.Dense(
+            cfg.out_dim,
+            kernel_initializer="glorot_uniform",
+            dtype=tf.float32,
+        )
 
         if self.use_graph:
             self.graph_proj = tf.keras.layers.Dense(
@@ -360,27 +383,6 @@ class DisplacementNet(tf.keras.Model):
                 kernel_initializer="glorot_uniform",
                 dtype=tf.float32,
             )
-        else:
-            self.in_linear = tf.keras.layers.Dense(
-                cfg.width,
-                kernel_initializer="he_uniform",
-                dtype=tf.float32,
-            )
-            self.blocks = []
-            for _ in range(cfg.depth):
-                self.blocks.append(
-                    tf.keras.layers.Dense(
-                        cfg.width,
-                        kernel_initializer="he_uniform",
-                        dtype=tf.float32,
-                    )
-                )
-            self.out_linear = tf.keras.layers.Dense(
-                cfg.out_dim,
-                kernel_initializer="glorot_uniform",
-                dtype=tf.float32,
-            )
-            self.residual_skips = set(cfg.residual_skips)
 
     def call(self, x: tf.Tensor, z: tf.Tensor, training: bool | None = False) -> tf.Tensor:
         """
@@ -419,27 +421,44 @@ class DisplacementNet(tf.keras.Model):
         x_feat = tf.cast(self.pe(x), tf.float32)  # (N, pe_dim)
         h = tf.concat([x_feat, zb], axis=-1)
 
-        if self.use_graph:
+        def mlp_forward():
+            h0 = self.in_linear(h)
+            if self.cfg.act == "sine":
+                h0 = tf.sin(self.w0 * h0)
+            else:
+                h0 = self.act(h0)
+
+            hcur = h0
+            for idx, dense in enumerate(self.blocks, start=1):
+                hcur = dense(hcur)
+                if self.cfg.act == "sine":
+                    hcur = tf.sin(hcur)
+                else:
+                    hcur = self.act(hcur)
+                if idx in self.residual_skips:
+                    hcur = hcur + h0  # simple residual skip
+
+            return self.out_linear(hcur)
+
+        def graph_forward():
             coords = tf.cast(x, tf.float32)
             knn_idx = _build_knn_graph(coords, self.cfg.graph_k)
             hcur = self.graph_proj(h)
             for layer in self.graph_layers:
                 hcur = layer(hcur, coords, knn_idx, training=training)
             hcur = self.graph_norm(hcur)
-            u = self.graph_out(hcur)
+            return self.graph_out(hcur)
+
+        if self.use_graph:
+            max_nodes = int(getattr(self.cfg, "graph_max_nodes", 0) or 0)
+            if max_nodes > 0:
+                max_nodes_const = tf.constant(max_nodes, dtype=tf.int32)
+                use_graph = tf.less_equal(tf.shape(x)[0], max_nodes_const)
+                u = tf.cond(use_graph, graph_forward, mlp_forward)
+            else:
+                u = graph_forward()
         else:
-            # trunk with residual skips from input h0
-            h0 = self.in_linear(h)
-            h0 = self.act(h0) if self.cfg.act != "sine" else tf.sin(self.w0 * h0)
-
-            hcur = h0
-            for idx, dense in enumerate(self.blocks, start=1):
-                hcur = dense(hcur)
-                hcur = self.act(hcur) if self.cfg.act != "sine" else tf.sin(hcur)
-                if idx in self.residual_skips:
-                    hcur = hcur + h0  # simple residual skip
-
-            u = self.out_linear(hcur)  # (N,3)
+            u = mlp_forward()
         # 在半精度策略下，强制回落到 float32，避免在物理能量项中产生 NaN
         return tf.cast(u, tf.float32)
 
