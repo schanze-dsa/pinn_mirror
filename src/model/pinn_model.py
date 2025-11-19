@@ -233,14 +233,15 @@ class GraphConvLayer(tf.keras.layers.Layer):
         k: int,
         act: str,
         dropout: float = 0.0,
-        chunk_size: int = 2048,
+        chunk_size: int | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.k = max(int(k), 1)
         self.act = _get_activation(act)
         self.dropout = float(max(dropout, 0.0))
-        self.chunk_size = max(int(chunk_size), 1)
+        # chunk_size 参数仅为向后兼容保留；新实现为一次性并行求解
+        self._unused_chunk = chunk_size
         self.lin = tf.keras.layers.Dense(
             hidden_dim,
             kernel_initializer="he_uniform",
@@ -262,57 +263,26 @@ class GraphConvLayer(tf.keras.layers.Layer):
         feat = tf.ensure_shape(feat, (None, self.hidden_dim))
         coords = tf.cast(coords, input_dtype)
         coords = tf.ensure_shape(coords, (None, 3))
+        knn_idx = tf.ensure_shape(knn_idx, (None, self.k))
 
-        n = tf.shape(feat)[0]
-        chunk_const = tf.constant(self.chunk_size, dtype=tf.int32)
+        neighbors = tf.gather(feat, knn_idx)  # (N, K, C)
+        neighbors.set_shape([None, self.k, self.hidden_dim])
+        agg = tf.reduce_mean(neighbors, axis=1)  # (N, C)
+        agg.set_shape([None, self.hidden_dim])
 
-        def _empty_out():
-            return tf.zeros((0, self.hidden_dim), dtype=input_dtype)
+        nbr_coords = tf.gather(coords, knn_idx)  # (N, K, 3)
+        nbr_coords.set_shape([None, self.k, 3])
+        rel = nbr_coords - tf.expand_dims(coords, axis=1)
+        rel_mean = tf.reduce_mean(rel, axis=1)
+        rel_std = tf.math.reduce_std(rel, axis=1)
+        rel_feat = tf.concat([rel_mean, rel_std], axis=-1)  # (N, 6)
+        rel_feat.set_shape([None, 6])
 
-        def _compute():
-            ta = tf.TensorArray(
-                dtype=input_dtype, size=0, dynamic_size=True, clear_after_read=False
-            )
-
-            def _cond(start, *_):
-                return tf.less(start, n)
-
-            def _body(start, ta_handle, write_idx):
-                end = tf.minimum(n, start + chunk_const)
-                rows = tf.range(start, end)
-                feat_chunk = tf.gather(feat, rows)              # (chunk, C)
-                feat_chunk = tf.ensure_shape(feat_chunk, (None, self.hidden_dim))
-                coords_chunk = tf.gather(coords, rows)          # (chunk, 3)
-                coords_chunk = tf.ensure_shape(coords_chunk, (None, 3))
-                idx_chunk = tf.gather(knn_idx, rows)            # (chunk, K)
-                idx_chunk = tf.ensure_shape(idx_chunk, (None, self.k))
-                neighbors = tf.gather(feat, idx_chunk)          # (chunk, K, C)
-                neighbors = tf.ensure_shape(neighbors, (None, self.k, self.hidden_dim))
-                agg = tf.reduce_mean(neighbors, axis=1)         # (chunk, C)
-                agg = tf.ensure_shape(agg, (None, self.hidden_dim))
-
-                nbr_coords = tf.gather(coords, idx_chunk)       # (chunk, K, 3)
-                nbr_coords = tf.ensure_shape(nbr_coords, (None, self.k, 3))
-                rel = nbr_coords - tf.expand_dims(coords_chunk, axis=1)
-                rel_mean = tf.reduce_mean(rel, axis=1)
-                rel_std = tf.math.reduce_std(rel, axis=1)
-                rel_feat = tf.concat([rel_mean, rel_std], axis=-1)  # (chunk, 6)
-
-                rel_feat = tf.ensure_shape(rel_feat, (None, 6))
-                mix = tf.concat([feat_chunk, agg, rel_feat], axis=-1)
-                out = self.lin(mix)
-                out = self.act(out)
-                if self.dropout > 0.0 and training:
-                    out = tf.nn.dropout(out, rate=self.dropout)
-                ta_handle = ta_handle.write(write_idx, out)
-                return end, ta_handle, write_idx + 1
-
-            start0 = tf.constant(0, dtype=tf.int32)
-            write0 = tf.constant(0, dtype=tf.int32)
-            _, ta_final, _ = tf.while_loop(_cond, _body, (start0, ta, write0))
-            return ta_final.concat()
-
-        out = tf.cond(tf.equal(n, 0), _empty_out, _compute)
+        mix = tf.concat([feat, agg, rel_feat], axis=-1)
+        out = self.lin(mix)
+        out = self.act(out)
+        if self.dropout > 0.0 and training:
+            out = tf.nn.dropout(out, rate=self.dropout)
         return out
 
 
