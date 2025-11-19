@@ -8,7 +8,7 @@ Displacement field network for DFEM/PINN with preload conditioning.
 Components:
 - ParamEncoder: encodes normalized preload vector (P1,P2,P3) -> condition z
 - GaussianFourierFeatures: optional positional encoding for coordinates
-- DisplacementNet: MLP with residual skips; inputs [x_feat, z] -> u(x; P)
+- DisplacementNet: Graph neural network (GCN) backbone; inputs [x_feat, z] -> u(x; P)
 
 Public factory:
     model = create_displacement_model(cfg)      # returns DisplacementModel
@@ -55,13 +55,14 @@ class FieldConfig:
     in_dim_coord: int = 3     # xyz (normalized outside if需要)
     fourier: FourierConfig = FourierConfig()
     cond_dim: int = 64
+    # 以下 legacy MLP 参数仅保留兼容性；当前实现始终走 GCN 主干
     width: int = 256
     depth: int = 7
-    act: str = "silu"         # silu|gelu|relu|tanh|sine(SIREN)
-    residual_skips: Tuple[int, int] = (3, 6)  # add skip from input features to these layers
+    act: str = "silu"
+    residual_skips: Tuple[int, int] = (3, 6)
     out_dim: int = 3          # displacement ux,uy,uz
-    w0: float = 30.0          # only for SIREN (sine) first layer frequency
-    use_graph: bool = True    # 是否改用 GCN 主干而非传统 MLP
+    w0: float = 30.0
+    use_graph: bool = True    # 是否启用 GCN 主干；若为 False 将报错
     graph_k: int = 12         # kNN 图中的邻居数量
     graph_knn_chunk: int = 1024  # 构建 kNN/图卷积时每批处理的节点数量
     graph_layers: int = 4     # 图卷积层数
@@ -445,9 +446,7 @@ class DisplacementNet(tf.keras.Model):
     def __init__(self, cfg: FieldConfig):
         super().__init__()
         self.cfg = cfg
-        self.is_siren = (cfg.act.lower() == "sine")
         self.use_graph = bool(cfg.use_graph)
-        self.residual_skips = set(cfg.residual_skips or tuple())
 
         # Fourier PE
         self.pe = GaussianFourierFeatures(
@@ -455,47 +454,30 @@ class DisplacementNet(tf.keras.Model):
         )
 
         in_dim_total = self.pe.out_dim + cfg.cond_dim
-        self.act = _get_activation(cfg.act)
-        self.w0 = cfg.w0
+        if not self.use_graph:
+            raise ValueError(
+                "FieldConfig.use_graph=False 已不再支持；请开启 GCN 主干以运行位移网络。"
+            )
 
-        # 始终构建 MLP 主干（即使启用 GCN，也可在节点过多时退回）
-        self.in_linear = tf.keras.layers.Dense(
-            cfg.width,
+        self.graph_proj = tf.keras.layers.Dense(
+            cfg.graph_width,
             kernel_initializer="he_uniform",
         )
-        self.blocks = []
-        for _ in range(cfg.depth):
-            self.blocks.append(
-                tf.keras.layers.Dense(
-                    cfg.width,
-                    kernel_initializer="he_uniform",
-                )
+        self.graph_layers = [
+            GraphConvLayer(
+                hidden_dim=cfg.graph_width,
+                k=cfg.graph_k,
+                act=cfg.act,
+                dropout=cfg.graph_dropout,
+                chunk_size=cfg.graph_knn_chunk,
             )
-        self.out_linear = tf.keras.layers.Dense(
+            for _ in range(cfg.graph_layers)
+        ]
+        self.graph_norm = tf.keras.layers.LayerNormalization(axis=-1)
+        self.graph_out = tf.keras.layers.Dense(
             cfg.out_dim,
             kernel_initializer="glorot_uniform",
         )
-
-        if self.use_graph:
-            self.graph_proj = tf.keras.layers.Dense(
-                cfg.graph_width,
-                kernel_initializer="he_uniform",
-            )
-            self.graph_layers = [
-                GraphConvLayer(
-                    hidden_dim=cfg.graph_width,
-                    k=cfg.graph_k,
-                    act=cfg.act,
-                    dropout=cfg.graph_dropout,
-                    chunk_size=cfg.graph_knn_chunk,
-                )
-                for _ in range(cfg.graph_layers)
-            ]
-            self.graph_norm = tf.keras.layers.LayerNormalization(axis=-1)
-            self.graph_out = tf.keras.layers.Dense(
-                cfg.out_dim,
-                kernel_initializer="glorot_uniform",
-            )
 
     def call(self, x: tf.Tensor, z: tf.Tensor, training: bool | None = False) -> tf.Tensor:
         """
@@ -535,25 +517,6 @@ class DisplacementNet(tf.keras.Model):
             x_feat = tf.cast(x_feat, feat_dtype)
         h = tf.concat([x_feat, zb], axis=-1)
 
-        def mlp_forward():
-            h0 = self.in_linear(h)
-            if self.cfg.act == "sine":
-                h0 = tf.sin(self.w0 * h0)
-            else:
-                h0 = self.act(h0)
-
-            hcur = h0
-            for idx, dense in enumerate(self.blocks, start=1):
-                hcur = dense(hcur)
-                if self.cfg.act == "sine":
-                    hcur = tf.sin(hcur)
-                else:
-                    hcur = self.act(hcur)
-                if idx in self.residual_skips:
-                    hcur = hcur + h0  # simple residual skip
-
-            return self.out_linear(hcur)
-
         def graph_forward():
             coords = x
             knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
@@ -563,11 +526,7 @@ class DisplacementNet(tf.keras.Model):
             hcur = self.graph_norm(hcur)
             return self.graph_out(hcur)
 
-        if self.use_graph:
-            u = graph_forward()
-        else:
-            u = mlp_forward()
-        return u
+        return graph_forward()
 
 
 # -----------------------------
