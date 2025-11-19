@@ -211,20 +211,20 @@ elasticity_config:
 # ------------------------------------------------------------
 loss_config:
   base_weights:
-    w_int: 1.0e-4      # 内能
-    w_cn: 1.0e-4      # 法向接触能量
-    w_ct: 1.0e-4      # 摩擦能量/摩擦残差
-    w_tie: 1.0e-4     # 绑定/多体约束
-    w_bc: 1.0e-4      # 边界条件
-    w_pre: 1.0e-4     # 预紧功（乘在 -W_pre 上）
+    w_int: 1.0e-7      # 内能
+    w_cn: 1.0e-7      # 法向接触能量
+    w_ct: 1.0e-7      # 摩擦能量/摩擦残差
+    w_tie: 1.0e-7     # 绑定/多体约束
+    w_bc: 1.0e-7      # 边界条件
+    w_pre: 1.0e-7     # 预紧功（乘在 -W_pre 上）
 
   adaptive:
     enabled: true           # 是否启用自适应加权（weighted PINN）
     update_every: 10        # 每多少个 global step 更新一次权重
     ema_decay: 0.99         # 残差/能量的 EMA 衰减系数
     temperature: 1.0        # softmax 温度
-    min_weight: 1.0e-1      # 单项权重下限
-    max_weight: 1.0e1       # 单项权重上限
+    min_weight: 1.0e-9      # 单项权重下限
+    max_weight: 1.0e2       # 单项权重上限
     focus_terms:
       - w_int
       - w_cn
