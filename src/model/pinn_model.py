@@ -61,6 +61,12 @@ class FieldConfig:
     residual_skips: Tuple[int, int] = (3, 6)  # add skip from input features to these layers
     out_dim: int = 3          # displacement ux,uy,uz
     w0: float = 30.0          # only for SIREN (sine) first layer frequency
+    use_graph: bool = True    # 是否改用 GCN 主干而非传统 MLP
+    graph_k: int = 12         # kNN 图中的邻居数量
+    graph_knn_chunk: int = 2048  # 构建 kNN/图卷积时每批处理的节点数量
+    graph_layers: int = 4     # 图卷积层数
+    graph_width: int = 192    # 每层的隐藏特征维度
+    graph_dropout: float = 0.0
 
 @dataclass
 class ModelConfig:
@@ -215,6 +221,185 @@ class MLP(tf.keras.layers.Layer):
         return y
 
 
+class GraphConvLayer(tf.keras.layers.Layer):
+    """简单的消息传递层：聚合 kNN 邻居并结合相对坐标统计。"""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        k: int,
+        act: str,
+        dropout: float = 0.0,
+        chunk_size: int = 2048,
+    ):
+        # 始终在 float32 下计算，避免混合精度下的溢出/NaN
+        super().__init__(dtype=tf.float32)
+        self.hidden_dim = hidden_dim
+        self.k = max(int(k), 1)
+        self.act = _get_activation(act)
+        self.dropout = float(max(dropout, 0.0))
+        self.chunk_size = max(int(chunk_size), 1)
+        self.lin = tf.keras.layers.Dense(
+            hidden_dim,
+            kernel_initializer="he_uniform",
+            dtype=tf.float32,
+        )
+
+    def call(
+        self,
+        feat: tf.Tensor,
+        coords: tf.Tensor,
+        knn_idx: tf.Tensor,
+        training: bool | None = False,
+    ) -> tf.Tensor:
+        """
+        feat   : (N, C)
+        coords : (N, 3)
+        knn_idx: (N, K)
+        """
+        input_dtype = feat.dtype
+        feat32 = tf.cast(feat, tf.float32)
+        coords32 = tf.cast(coords, tf.float32)
+
+        n = tf.shape(feat32)[0]
+        chunk_const = tf.constant(self.chunk_size, dtype=tf.int32)
+
+        def _empty_out():
+            return tf.zeros((0, self.hidden_dim), dtype=tf.float32)
+
+        def _compute():
+            ta = tf.TensorArray(
+                dtype=tf.float32, size=0, dynamic_size=True, clear_after_read=False
+            )
+
+            def _cond(start, *_):
+                return tf.less(start, n)
+
+            def _body(start, ta_handle, write_idx):
+                end = tf.minimum(n, start + chunk_const)
+                rows = tf.range(start, end)
+                feat_chunk = tf.gather(feat32, rows)            # (chunk, C)
+                coords_chunk = tf.gather(coords32, rows)        # (chunk, 3)
+                idx_chunk = tf.gather(knn_idx, rows)            # (chunk, K)
+                neighbors = tf.gather(feat32, idx_chunk)        # (chunk, K, C)
+                agg = tf.reduce_mean(neighbors, axis=1)         # (chunk, C)
+
+                nbr_coords = tf.gather(coords32, idx_chunk)     # (chunk, K, 3)
+                rel = nbr_coords - tf.expand_dims(coords_chunk, axis=1)
+                rel_mean = tf.reduce_mean(rel, axis=1)
+                rel_std = tf.math.reduce_std(rel, axis=1)
+                rel_feat = tf.concat([rel_mean, rel_std], axis=-1)  # (chunk, 6)
+
+                mix = tf.concat([feat_chunk, agg, rel_feat], axis=-1)
+                out = self.lin(mix)
+                out = self.act(out)
+                if self.dropout > 0.0 and training:
+                    out = tf.nn.dropout(out, rate=self.dropout)
+                ta_handle = ta_handle.write(write_idx, out)
+                return end, ta_handle, write_idx + 1
+
+            start0 = tf.constant(0, dtype=tf.int32)
+            write0 = tf.constant(0, dtype=tf.int32)
+            _, ta_final, _ = tf.while_loop(_cond, _body, (start0, ta, write0))
+            return ta_final.concat()
+
+        out32 = tf.cond(tf.equal(n, 0), _empty_out, _compute)
+        if input_dtype != tf.float32:
+            out32 = tf.cast(out32, input_dtype)
+        return out32
+
+
+def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
+    """
+    返回每个点的 k 个邻居索引 (N, k)。
+
+    早期实现即便做了按行分块，依旧需要为每个行块一次性构造大小为
+    (chunk × N) 的距离矩阵，N 动辄上万时会产生数百 MB 的瞬时分配，从而
+    触发 GPU OOM。这里改为 *双层分块*：对于每个行块，再按列块遍历全集，
+    仅保留当前行块的 top-k 中间结果，使得任一时刻只需保存
+    (chunk × chunk) 的距离矩阵，内存需求降到线性级别。
+    """
+
+    x = tf.cast(x, tf.float32)
+    n = tf.shape(x)[0]
+    k = max(int(k), 1)
+    chunk = max(int(chunk_size), 1)
+    k_const = tf.constant(k, dtype=tf.int32)
+    chunk_const = tf.constant(chunk, dtype=tf.int32)
+    large_val = tf.constant(1e30, dtype=tf.float32)
+
+    def _empty():
+        return tf.zeros((0, k), dtype=tf.int32)
+
+    def _build():
+        x_sq = tf.reduce_sum(tf.square(x), axis=1)  # (N,)
+        ta = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True, clear_after_read=False)
+
+        def _cond(start, *_):
+            return tf.less(start, n)
+
+        def _body(start, ta_handle, write_idx):
+            end = tf.minimum(n, start + chunk_const)
+            rows = tf.range(start, end)
+            chunk_len = tf.shape(rows)[0]
+            x_chunk = tf.gather(x, rows)
+            chunk_sq = tf.gather(x_sq, rows)
+            best_shape = tf.stack([chunk_len, k_const])
+            best_dist = tf.fill(best_shape, large_val)
+            best_idx = tf.zeros(best_shape, dtype=tf.int32)
+
+            def _inner_cond(col_start, *_):
+                return tf.less(col_start, n)
+
+            def _inner_body(col_start, best_d, best_i):
+                col_end = tf.minimum(n, col_start + chunk_const)
+                cols = tf.range(col_start, col_end)
+                x_cols = tf.gather(x, cols)
+                col_sq = tf.gather(x_sq, cols)
+                dist = (
+                    tf.expand_dims(chunk_sq, 1)
+                    + tf.expand_dims(col_sq, 0)
+                    - 2.0 * tf.matmul(x_chunk, x_cols, transpose_b=True)
+                )
+                dist = tf.maximum(dist, 0.0)
+                same = tf.cast(
+                    tf.equal(tf.expand_dims(rows, 1), tf.expand_dims(cols, 0)),
+                    dist.dtype,
+                )
+                dist = dist + same * 1e9
+
+                combined_dist = tf.concat([best_d, dist], axis=1)
+                tiled_cols = tf.tile(
+                    tf.expand_dims(tf.cast(cols, tf.int32), 0), [chunk_len, 1]
+                )
+                combined_idx = tf.concat([best_i, tiled_cols], axis=1)
+
+                neg_dist = -combined_dist
+                vals, top_idx = tf.math.top_k(neg_dist, k=k)
+                new_best_dist = -vals
+                new_best_idx = tf.gather(combined_idx, top_idx, batch_dims=1)
+                return col_end, new_best_dist, new_best_idx
+
+            start_inner = tf.constant(0, dtype=tf.int32)
+            _, best_final, idx_final = tf.while_loop(
+                _inner_cond,
+                _inner_body,
+                (start_inner, best_dist, best_idx),
+                parallel_iterations=1,
+            )
+            ta_handle = ta_handle.write(write_idx, idx_final)
+            return end, ta_handle, write_idx + 1
+
+        start0 = tf.constant(0, dtype=tf.int32)
+        write0 = tf.constant(0, dtype=tf.int32)
+        _, ta_final, _ = tf.while_loop(
+            _cond, _body, (start0, ta, write0), parallel_iterations=1
+        )
+        return ta_final.concat()
+
+    return tf.cond(tf.equal(n, 0), _empty, _build)
+
+
 # -----------------------------
 # Networks
 # -----------------------------
@@ -249,14 +434,19 @@ class DisplacementNet(tf.keras.Model):
         super().__init__()
         self.cfg = cfg
         self.is_siren = (cfg.act.lower() == "sine")
+        self.use_graph = bool(cfg.use_graph)
+        self.residual_skips = set(cfg.residual_skips or tuple())
 
         # Fourier PE
         self.pe = GaussianFourierFeatures(
             in_dim=cfg.in_dim_coord, num=cfg.fourier.num, sigma=cfg.fourier.sigma
         )
 
-        # main trunk
         in_dim_total = self.pe.out_dim + cfg.cond_dim
+        self.act = _get_activation(cfg.act)
+        self.w0 = cfg.w0
+
+        # 始终构建 MLP 主干（即使启用 GCN，也可在节点过多时退回）
         self.in_linear = tf.keras.layers.Dense(
             cfg.width,
             kernel_initializer="he_uniform",
@@ -271,17 +461,36 @@ class DisplacementNet(tf.keras.Model):
                     dtype=tf.float32,
                 )
             )
-        self.act = _get_activation(cfg.act)
         self.out_linear = tf.keras.layers.Dense(
             cfg.out_dim,
             kernel_initializer="glorot_uniform",
             dtype=tf.float32,
         )
 
-        self.residual_skips = set(cfg.residual_skips)
-        self.w0 = cfg.w0
+        if self.use_graph:
+            self.graph_proj = tf.keras.layers.Dense(
+                cfg.graph_width,
+                kernel_initializer="he_uniform",
+                dtype=tf.float32,
+            )
+            self.graph_layers = [
+                GraphConvLayer(
+                    hidden_dim=cfg.graph_width,
+                    k=cfg.graph_k,
+                    act=cfg.act,
+                    dropout=cfg.graph_dropout,
+                    chunk_size=cfg.graph_knn_chunk,
+                )
+                for _ in range(cfg.graph_layers)
+            ]
+            self.graph_norm = tf.keras.layers.LayerNormalization(axis=-1)
+            self.graph_out = tf.keras.layers.Dense(
+                cfg.out_dim,
+                kernel_initializer="glorot_uniform",
+                dtype=tf.float32,
+            )
 
-    def call(self, x: tf.Tensor, z: tf.Tensor) -> tf.Tensor:
+    def call(self, x: tf.Tensor, z: tf.Tensor, training: bool | None = False) -> tf.Tensor:
         """
         x : (N,3) coordinates (already normalized if you采用归一化)
         z : (B,cond_dim) or (cond_dim,)
@@ -318,18 +527,38 @@ class DisplacementNet(tf.keras.Model):
         x_feat = tf.cast(self.pe(x), tf.float32)  # (N, pe_dim)
         h = tf.concat([x_feat, zb], axis=-1)
 
-        # trunk with residual skips from input h0
-        h0 = self.in_linear(h)
-        h0 = self.act(h0) if self.cfg.act != "sine" else tf.sin(self.w0 * h0)
+        def mlp_forward():
+            h0 = self.in_linear(h)
+            if self.cfg.act == "sine":
+                h0 = tf.sin(self.w0 * h0)
+            else:
+                h0 = self.act(h0)
 
-        hcur = h0
-        for idx, dense in enumerate(self.blocks, start=1):
-            hcur = dense(hcur)
-            hcur = self.act(hcur) if self.cfg.act != "sine" else tf.sin(hcur)
-            if idx in self.residual_skips:
-                hcur = hcur + h0  # simple residual skip
+            hcur = h0
+            for idx, dense in enumerate(self.blocks, start=1):
+                hcur = dense(hcur)
+                if self.cfg.act == "sine":
+                    hcur = tf.sin(hcur)
+                else:
+                    hcur = self.act(hcur)
+                if idx in self.residual_skips:
+                    hcur = hcur + h0  # simple residual skip
 
-        u = self.out_linear(hcur)  # (N,3)
+            return self.out_linear(hcur)
+
+        def graph_forward():
+            coords = tf.cast(x, tf.float32)
+            knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
+            hcur = self.graph_proj(h)
+            for layer in self.graph_layers:
+                hcur = layer(hcur, coords, knn_idx, training=training)
+            hcur = self.graph_norm(hcur)
+            return self.graph_out(hcur)
+
+        if self.use_graph:
+            u = graph_forward()
+        else:
+            u = mlp_forward()
         # 在半精度策略下，强制回落到 float32，避免在物理能量项中产生 NaN
         return tf.cast(u, tf.float32)
 
