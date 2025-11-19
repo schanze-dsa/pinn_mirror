@@ -37,6 +37,44 @@ import matplotlib.pyplot as plt
 from matplotlib.tri import Triangulation
 
 
+def _coerce_params_for_forward(params: dict) -> dict:
+    """Ensure params contain a single-stage payload consumable by ``u_fn``."""
+
+    if not isinstance(params, dict):
+        return params
+    if "stages" not in params:
+        return params
+
+    stages = params.get("stages")
+    final = None
+    if isinstance(stages, dict):
+        P_seq = stages.get("P")
+        Z_seq = stages.get("P_hat")
+        if P_seq is not None and Z_seq is not None:
+            final = {"P": P_seq[-1], "P_hat": Z_seq[-1]}
+            rank_tensor = stages.get("stage_rank")
+            if rank_tensor is not None:
+                if getattr(rank_tensor, "shape", None) is not None and rank_tensor.shape.rank == 2:
+                    final["stage_rank"] = rank_tensor[-1]
+                else:
+                    final["stage_rank"] = rank_tensor
+    elif isinstance(stages, (list, tuple)) and stages:
+        last_stage = stages[-1]
+        if isinstance(last_stage, dict):
+            final = dict(last_stage)
+        else:
+            p_val, z_val = last_stage
+            final = {"P": p_val, "P_hat": z_val}
+
+    if final is None:
+        return params
+
+    for key in ("stage_order", "stage_rank", "stage_count"):
+        if key in params and key not in final:
+            final[key] = params[key]
+    return final
+
+
 def _eval_displacement_batched(u_fn, params, points: np.ndarray, batch_size: int) -> np.ndarray:
     """Evaluate ``u_fn`` on ``points`` in batches to control memory usage."""
 
@@ -47,6 +85,8 @@ def _eval_displacement_batched(u_fn, params, points: np.ndarray, batch_size: int
         import tensorflow as tf
     except ImportError as exc:  # pragma: no cover - tensorflow is required upstream
         raise RuntimeError("TensorFlow is required for evaluating the PINN model") from exc
+
+    params = _coerce_params_for_forward(params)
 
     if batch_size is None or batch_size <= 0:
         batch_size = points.shape[0]

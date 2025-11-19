@@ -759,18 +759,47 @@ class Trainer:
         params["stage_count"] = tf.constant(stage_count, dtype=tf.int32)
         return params
 
-    def _extract_final_stage_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        if (
+    def _extract_final_stage_params(
+        self, params: Dict[str, Any], keep_context: bool = False
+    ) -> Dict[str, Any]:
+        """Return the last staged parameter set, optionally carrying context."""
+
+        if not (
             self.cfg.preload_use_stages
             and isinstance(params, dict)
             and "stages" in params
         ):
-            stages = params["stages"]
-            if isinstance(stages, dict) and stages:
-                last_P = stages["P"][-1]
-                last_feat = stages["P_hat"][-1]
-                return {"P": last_P, "P_hat": last_feat}
-        return params
+            return params
+
+        stages = params["stages"]
+        final: Optional[Dict[str, tf.Tensor]] = None
+        if isinstance(stages, dict) and stages:
+            last_P = stages.get("P")
+            last_feat = stages.get("P_hat")
+            if last_P is not None and last_feat is not None:
+                final = {"P": last_P[-1], "P_hat": last_feat[-1]}
+                rank_tensor = stages.get("stage_rank")
+                if rank_tensor is not None:
+                    if getattr(rank_tensor, "shape", None) is not None and rank_tensor.shape.rank == 2:
+                        final["stage_rank"] = rank_tensor[-1]
+                    else:
+                        final["stage_rank"] = rank_tensor
+        elif isinstance(stages, (list, tuple)) and stages:
+            last_stage = stages[-1]
+            if isinstance(last_stage, dict):
+                final = dict(last_stage)
+            else:
+                p_val, z_val = last_stage
+                final = {"P": p_val, "P_hat": z_val}
+
+        if final is None:
+            return params
+
+        if keep_context:
+            for key in ("stage_order", "stage_rank", "stage_count"):
+                if key in params and key not in final:
+                    final[key] = params[key]
+        return final
 
     def _make_warmup_case(self) -> Dict[str, np.ndarray]:
         mid = 0.5 * (float(self.cfg.preload_min) + float(self.cfg.preload_max))
@@ -1673,7 +1702,7 @@ class Trainer:
             order_arr = None
             order_display = None
         params_full = self._make_preload_params(case)
-        params = self._extract_final_stage_params(params_full)
+        params = self._extract_final_stage_params(params_full, keep_context=True)
         title = title_prefix or self.cfg.viz_title_prefix
         if order_display:
             title = f"{title}  (order={order_display})"
@@ -1758,10 +1787,6 @@ class Trainer:
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
         )
-        if stage_count > 1:
-            rank_vec = rank_vec / tf.cast(stage_count - 1, tf.float32)
-        else:
-            rank_vec = tf.zeros_like(rank_vec)
 
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
@@ -1784,7 +1809,7 @@ class Trainer:
                 self.cfg.out_dir, f"deflection_{i+1:02d}{suffix}.png"
             )
             params_full = self._make_preload_params(preload_case)
-            params_eval = self._extract_final_stage_params(params_full)
+            params_eval = self._extract_final_stage_params(params_full, keep_context=True)
             try:
                 _, _, data_path = self._call_viz(P, params_eval, save_path, title)
                 if not os.path.exists(save_path):
