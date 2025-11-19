@@ -1758,6 +1758,10 @@ class Trainer:
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
         )
+        if stage_count > 1:
+            rank_vec = rank_vec / tf.cast(stage_count - 1, tf.float32)
+        else:
+            rank_vec = tf.zeros_like(rank_vec)
 
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
