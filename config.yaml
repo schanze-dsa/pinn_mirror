@@ -220,7 +220,7 @@ loss_config:
 
   adaptive:
     enabled: true           # 是否启用自适应加权（weighted PINN）
-    update_every: 50        # 每多少个 global step 更新一次权重
+    update_every: 10        # 每多少个 global step 更新一次权重
     ema_decay: 0.99         # 残差/能量的 EMA 衰减系数
     temperature: 1.0        # softmax 温度
     min_weight: 0.1         # 单项权重下限
