@@ -715,6 +715,13 @@ class Trainer:
             rank_matrix_tf = tf.repeat(
                 tf.expand_dims(rank_tf, axis=0), repeats=int(len(stages)), axis=0
             )
+        mask_tensor = (
+            tf.convert_to_tensor(masks, dtype=tf.float32) if masks is not None else None
+        )
+        last_tensor = (
+            tf.convert_to_tensor(lasts, dtype=tf.float32) if lasts is not None else None
+        )
+
         stage_params_P: List[tf.Tensor] = []
         stage_params_feat: List[tf.Tensor] = []
         stage_count = int(len(stages))
@@ -733,10 +740,10 @@ class Trainer:
             p_stage = tf.convert_to_tensor(stages[idx], dtype=tf.float32)
             norm = (p_stage - shift) / scale
             feat_parts = [norm]
-            if masks is not None:
-                feat_parts.append(tf.convert_to_tensor(masks[idx], dtype=tf.float32))
-            if lasts is not None:
-                feat_parts.append(tf.convert_to_tensor(lasts[idx], dtype=tf.float32))
+            if mask_tensor is not None:
+                feat_parts.append(mask_tensor[idx])
+            if last_tensor is not None:
+                feat_parts.append(last_tensor[idx])
             if rank_tf is not None:
                 feat_parts.append(rank_tf)
             features = tf.concat(feat_parts, axis=0)
@@ -747,12 +754,19 @@ class Trainer:
         stage_tensor_P.set_shape((stage_count, n_bolts))
         stage_tensor_feat = tf.stack(stage_params_feat, axis=0)
         stage_tensor_feat.set_shape((stage_count, feat_dim))
-        params["stages"] = {
+        stage_dict: Dict[str, tf.Tensor] = {
             "P": stage_tensor_P,
             "P_hat": stage_tensor_feat,
         }
+        if mask_tensor is not None:
+            mask_tensor.set_shape((stage_count, n_bolts))
+            stage_dict["stage_mask"] = mask_tensor
+        if last_tensor is not None:
+            last_tensor.set_shape((stage_count, n_bolts))
+            stage_dict["stage_last"] = last_tensor
         if rank_matrix_tf is not None:
-            params["stages"]["stage_rank"] = rank_matrix_tf
+            stage_dict["stage_rank"] = rank_matrix_tf
+        params["stages"] = stage_dict
         params["stage_order"] = order_tf
         if rank_tf is not None:
             params["stage_rank"] = rank_tf
@@ -796,7 +810,13 @@ class Trainer:
             return params
 
         if keep_context:
-            for key in ("stage_order", "stage_rank", "stage_count"):
+            for key in (
+                "stage_order",
+                "stage_rank",
+                "stage_count",
+                "stage_mask",
+                "stage_last",
+            ):
                 if key in params and key not in final:
                     final[key] = params[key]
         return final

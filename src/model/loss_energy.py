@@ -267,12 +267,20 @@ class TotalEnergy:
             stage_tensor_P = stages.get("P")
             stage_tensor_feat = stages.get("P_hat")
             stage_tensor_rank = stages.get("stage_rank")
+            stage_tensor_mask = stages.get("stage_mask")
+            stage_tensor_last = stages.get("stage_last")
             if stage_tensor_P is None or stage_tensor_feat is None:
                 stage_seq: List[Dict[str, tf.Tensor]] = []
             else:
                 stacked_rank = None
                 if stage_tensor_rank is not None:
                     stacked_rank = tf.convert_to_tensor(stage_tensor_rank)
+                stacked_mask = None
+                if stage_tensor_mask is not None:
+                    stacked_mask = tf.convert_to_tensor(stage_tensor_mask)
+                stacked_last = None
+                if stage_tensor_last is not None:
+                    stacked_last = tf.convert_to_tensor(stage_tensor_last)
                 stage_seq = []
                 for idx, (p, z) in enumerate(
                     zip(tf.unstack(stage_tensor_P, axis=0), tf.unstack(stage_tensor_feat, axis=0))
@@ -283,6 +291,10 @@ class TotalEnergy:
                             entry["stage_rank"] = stacked_rank[idx]
                         else:
                             entry["stage_rank"] = stacked_rank
+                    if stacked_mask is not None:
+                        entry["stage_mask"] = stacked_mask[idx]
+                    if stacked_last is not None:
+                        entry["stage_last"] = stacked_last[idx]
                     stage_seq.append(entry)
         else:
             stage_seq = []
