@@ -20,12 +20,12 @@ material_enum:
 material_properties:
   jingmian:
     # ---- 基本弹性参数（当前 DFEM 会用到）----
-    E: 6.9e10           # Pa，杨氏模量
+    E: 6.9e4            # MPa，杨氏模量
     nu: 0.33            # 泊松比
 
     # 冗余弹性量（由 E, nu 推导，保留便于校验/扩展）
-    bulk_modulus: 6.7647e10   # Pa，体积模量 K
-    shear_modulus: 2.594e10   # Pa，剪切模量 G
+    bulk_modulus: 6.7647e4    # MPa，体积模量 K
+    shear_modulus: 2.594e4    # MPa，剪切模量 G
 
     # 密度与热学参数（后续若做动力学/热应力可用）
     density: 2700.0           # kg/m^3
@@ -34,9 +34,9 @@ material_properties:
     cp: 896.0                 # J/(kg·K)，比热容
 
     # 强度参数（屈服/极限），可用于后处理安全系数或损伤指标
-    sigma_y_tension: 2.8e8        # Pa，拉伸屈服强度
-    sigma_y_compression: 2.8e8    # Pa，压缩屈服强度
-    sigma_u_tension: 3.1e8        # Pa，拉伸极限强度
+    sigma_y_tension: 2.8e2        # MPa，拉伸屈服强度
+    sigma_y_compression: 2.8e2    # MPa，压缩屈服强度
+    sigma_u_tension: 3.1e2        # MPa，拉伸极限强度
 
     # 如需疲劳分析，可在此增加 S–N 曲线数据
     # sn_curve:
@@ -48,12 +48,12 @@ material_properties:
 
   structural_steel:
     # ---- 基本弹性参数 ----
-    E: 2.0e11          # Pa，杨氏模量
+    E: 2.0e5           # MPa，杨氏模量
     nu: 0.30           # 泊松比
 
     # 冗余弹性量
-    bulk_modulus: 1.6667e11   # Pa，体积模量 K
-    shear_modulus: 7.6923e10  # Pa，剪切模量 G
+    bulk_modulus: 1.6667e5    # MPa，体积模量 K
+    shear_modulus: 7.6923e4   # MPa，剪切模量 G
 
     # 密度与热学参数
     density: 7850.0           # kg/m^3
@@ -62,18 +62,18 @@ material_properties:
     cp: 434.0                 # J/(kg·K)
 
     # 强度参数
-    sigma_y_tension: 2.5e8        # Pa
-    sigma_y_compression: 2.5e8    # Pa
-    sigma_u_tension: 4.6e8        # Pa
+    sigma_y_tension: 2.5e2        # MPa
+    sigma_y_compression: 2.5e2    # MPa
+    sigma_u_tension: 4.6e2        # MPa
 
   zhijia:
     # ---- 基本弹性参数 ----
-    E: 7.42e10         # Pa，杨氏模量
+    E: 7.42e4          # MPa，杨氏模量
     nu: 0.36           # 泊松比
 
     # 冗余弹性量
-    bulk_modulus: 8.8333e10   # Pa，体积模量 K
-    shear_modulus: 2.7279e10  # Pa，剪切模量 G
+    bulk_modulus: 8.8333e4    # MPa，体积模量 K
+    shear_modulus: 2.7279e4   # MPa，剪切模量 G
 
     # 密度与热学参数
     density: 2850.0           # kg/m^3
@@ -82,9 +82,9 @@ material_properties:
     cp: 460.0                 # J/(kg·K)
 
     # 强度参数
-    sigma_y_tension: 2.8e8        # Pa
-    sigma_y_compression: 2.8e8    # Pa
-    sigma_u_tension: 3.1e8        # Pa
+    sigma_y_tension: 2.8e2        # MPa
+    sigma_y_compression: 2.8e2    # MPa
+    sigma_u_tension: 3.1e2        # MPa
 
 # ------------------------------------------------------------
 # 2. Part → 材料映射（需与 INP 中 Part 名一致）
