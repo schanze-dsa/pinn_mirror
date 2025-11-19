@@ -55,11 +55,41 @@ class BoundaryConfig:
 class BoundaryPenalty:
     """
     Displacement boundary penalty energy.
+
+    Similar to :class:`TiePenalty`, the constructor accepts a superset of the
+    modern configuration so that older call-sites (e.g. ``BoundaryPenalty(alpha
+    =..., dof1=..., dof2=..., kind=...)``) keep working.  ``attach_ties_bcs``
+    still relies on that signature when constructing penalties from Abaqus
+    ``*Boundary`` definitions.
     """
 
-    def __init__(self, cfg: Optional[BoundaryConfig] = None):
-        self.cfg = cfg or BoundaryConfig()
+    def __init__(
+        self,
+        cfg: Optional[BoundaryConfig] = None,
+        *,
+        alpha: Optional[float] = None,
+        dtype: Optional[str] = None,
+        dof1: Optional[int] = None,
+        dof2: Optional[int] = None,
+        kind: Optional[str] = None,
+        **_legacy_kwargs,
+    ):
+        if cfg is None:
+            cfg = BoundaryConfig()
+
+        if alpha is not None:
+            cfg = BoundaryConfig(alpha=alpha, dtype=cfg.dtype)
+        if dtype is not None:
+            cfg = BoundaryConfig(alpha=cfg.alpha, dtype=dtype)
+
+        self.cfg = cfg
         self.dtype = tf.float32 if self.cfg.dtype == "float32" else tf.float64
+
+        # Store legacy boundary metadata so the ``build`` alias can reconstruct
+        # masks similar to the historical implementation.
+        self._legacy_dof1 = dof1
+        self._legacy_dof2 = dof2
+        self._legacy_kind = kind.upper() if isinstance(kind, str) else None
 
         # per-batch tensors
         self.X: Optional[tf.Tensor] = None          # (N,3)
@@ -72,12 +102,14 @@ class BoundaryPenalty:
 
     # ---------- build ----------
 
-    def build_from_numpy(self,
-                         X_bc: np.ndarray,
-                         dof_mask: np.ndarray,
-                         u_target: Optional[np.ndarray],
-                         w_bc: Optional[np.ndarray],
-                         extra_w: Optional[np.ndarray] = None):
+    def build_from_numpy(
+        self,
+        X_bc: np.ndarray,
+        dof_mask: np.ndarray,
+        u_target: Optional[np.ndarray],
+        w_bc: Optional[np.ndarray],
+        extra_w: Optional[np.ndarray] = None,
+    ):
         """
         Prepare tensors from NumPy arrays.
         - If u_target is None, defaults to zeros.
@@ -111,6 +143,42 @@ class BoundaryPenalty:
     def reset_for_new_batch(self):
         self.X = self.mask = self.u_target = self.w = None
         self._N = 0
+
+    # ---- compatibility aliases -------------------------------------------------
+
+    def _legacy_mask(self, N: int) -> np.ndarray:
+        mask = np.zeros((N, 3), dtype=np.float32)
+
+        if self._legacy_kind == "ENCASTRE":
+            mask.fill(1.0)
+            return mask
+
+        if self._legacy_dof1 is None:
+            return mask
+
+        d1 = int(self._legacy_dof1)
+        d2 = int(self._legacy_dof2) if self._legacy_dof2 is not None else d1
+
+        for dof in range(min(d1, d2), max(d1, d2) + 1):
+            if 1 <= dof <= 3:
+                mask[:, dof - 1] = 1.0
+
+        return mask
+
+    def build(
+        self,
+        X_bc: np.ndarray,
+        dof_mask: Optional[np.ndarray] = None,
+        u_target: Optional[np.ndarray] = None,
+        w_bc: Optional[np.ndarray] = None,
+        extra_w: Optional[np.ndarray] = None,
+    ):
+        """Backward-compatible build helper used by ``attach_ties_bcs``."""
+
+        X_np = np.asarray(X_bc)
+        if dof_mask is None:
+            dof_mask = self._legacy_mask(X_np.shape[0])
+        self.build_from_numpy(X_np, dof_mask, u_target, w_bc, extra_w)
 
     # ---------- energy ----------
 
