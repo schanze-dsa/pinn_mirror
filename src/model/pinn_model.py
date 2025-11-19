@@ -160,7 +160,7 @@ class MLP(tf.keras.layers.Layer):
         final_dim: Optional[int] = None,
         w0: float = 30.0,
         siren: bool = False,
-        dtype: tf.dtypes.DType = tf.float32,
+        dtype: Optional[tf.dtypes.DType] = None,
     ):
         super().__init__()
         self.width = width
@@ -173,19 +173,21 @@ class MLP(tf.keras.layers.Layer):
 
         self.layers_dense = []
         for i in range(depth):
-            self.layers_dense.append(
-                tf.keras.layers.Dense(
-                    width,
-                    kernel_initializer=self._kernel_init(i),
-                    dtype=self._dense_dtype,
-                )
-            )
+            dense_kwargs = {
+                "units": width,
+                "kernel_initializer": self._kernel_init(i),
+            }
+            if self._dense_dtype is not None:
+                dense_kwargs["dtype"] = self._dense_dtype
+            self.layers_dense.append(tf.keras.layers.Dense(**dense_kwargs))
         if final_dim is not None:
-            self.final_dense = tf.keras.layers.Dense(
-                final_dim,
-                kernel_initializer="glorot_uniform",
-                dtype=self._dense_dtype,
-            )
+            final_kwargs = {
+                "units": final_dim,
+                "kernel_initializer": "glorot_uniform",
+            }
+            if self._dense_dtype is not None:
+                final_kwargs["dtype"] = self._dense_dtype
+            self.final_dense = tf.keras.layers.Dense(**final_kwargs)
         else:
             self.final_dense = None
 
@@ -232,8 +234,7 @@ class GraphConvLayer(tf.keras.layers.Layer):
         dropout: float = 0.0,
         chunk_size: int = 2048,
     ):
-        # 始终在 float32 下计算，避免混合精度下的溢出/NaN
-        super().__init__(dtype=tf.float32)
+        super().__init__()
         self.hidden_dim = hidden_dim
         self.k = max(int(k), 1)
         self.act = _get_activation(act)
@@ -242,7 +243,6 @@ class GraphConvLayer(tf.keras.layers.Layer):
         self.lin = tf.keras.layers.Dense(
             hidden_dim,
             kernel_initializer="he_uniform",
-            dtype=tf.float32,
         )
 
     def call(
@@ -258,20 +258,19 @@ class GraphConvLayer(tf.keras.layers.Layer):
         knn_idx: (N, K)
         """
         input_dtype = feat.dtype
-        feat32 = tf.cast(feat, tf.float32)
-        feat32 = tf.ensure_shape(feat32, (None, self.hidden_dim))
-        coords32 = tf.cast(coords, tf.float32)
-        coords32 = tf.ensure_shape(coords32, (None, 3))
+        feat = tf.ensure_shape(feat, (None, self.hidden_dim))
+        coords = tf.cast(coords, input_dtype)
+        coords = tf.ensure_shape(coords, (None, 3))
 
-        n = tf.shape(feat32)[0]
+        n = tf.shape(feat)[0]
         chunk_const = tf.constant(self.chunk_size, dtype=tf.int32)
 
         def _empty_out():
-            return tf.zeros((0, self.hidden_dim), dtype=tf.float32)
+            return tf.zeros((0, self.hidden_dim), dtype=input_dtype)
 
         def _compute():
             ta = tf.TensorArray(
-                dtype=tf.float32, size=0, dynamic_size=True, clear_after_read=False
+                dtype=input_dtype, size=0, dynamic_size=True, clear_after_read=False
             )
 
             def _cond(start, *_):
@@ -280,18 +279,18 @@ class GraphConvLayer(tf.keras.layers.Layer):
             def _body(start, ta_handle, write_idx):
                 end = tf.minimum(n, start + chunk_const)
                 rows = tf.range(start, end)
-                feat_chunk = tf.gather(feat32, rows)            # (chunk, C)
+                feat_chunk = tf.gather(feat, rows)              # (chunk, C)
                 feat_chunk = tf.ensure_shape(feat_chunk, (None, self.hidden_dim))
-                coords_chunk = tf.gather(coords32, rows)        # (chunk, 3)
+                coords_chunk = tf.gather(coords, rows)          # (chunk, 3)
                 coords_chunk = tf.ensure_shape(coords_chunk, (None, 3))
                 idx_chunk = tf.gather(knn_idx, rows)            # (chunk, K)
                 idx_chunk = tf.ensure_shape(idx_chunk, (None, self.k))
-                neighbors = tf.gather(feat32, idx_chunk)        # (chunk, K, C)
+                neighbors = tf.gather(feat, idx_chunk)          # (chunk, K, C)
                 neighbors = tf.ensure_shape(neighbors, (None, self.k, self.hidden_dim))
                 agg = tf.reduce_mean(neighbors, axis=1)         # (chunk, C)
                 agg = tf.ensure_shape(agg, (None, self.hidden_dim))
 
-                nbr_coords = tf.gather(coords32, idx_chunk)     # (chunk, K, 3)
+                nbr_coords = tf.gather(coords, idx_chunk)       # (chunk, K, 3)
                 nbr_coords = tf.ensure_shape(nbr_coords, (None, self.k, 3))
                 rel = nbr_coords - tf.expand_dims(coords_chunk, axis=1)
                 rel_mean = tf.reduce_mean(rel, axis=1)
@@ -312,10 +311,8 @@ class GraphConvLayer(tf.keras.layers.Layer):
             _, ta_final, _ = tf.while_loop(_cond, _body, (start0, ta, write0))
             return ta_final.concat()
 
-        out32 = tf.cond(tf.equal(n, 0), _empty_out, _compute)
-        if input_dtype != tf.float32:
-            out32 = tf.cast(out32, input_dtype)
-        return out32
+        out = tf.cond(tf.equal(n, 0), _empty_out, _compute)
+        return out
 
 
 def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
@@ -430,7 +427,6 @@ class ParamEncoder(tf.keras.layers.Layer):
             depth=cfg.depth,
             act=cfg.act,
             final_dim=cfg.out_dim,
-            dtype=tf.float32,
         )
 
     def call(self, P_hat: tf.Tensor) -> tf.Tensor:
@@ -466,7 +462,6 @@ class DisplacementNet(tf.keras.Model):
         self.in_linear = tf.keras.layers.Dense(
             cfg.width,
             kernel_initializer="he_uniform",
-            dtype=tf.float32,
         )
         self.blocks = []
         for _ in range(cfg.depth):
@@ -474,20 +469,17 @@ class DisplacementNet(tf.keras.Model):
                 tf.keras.layers.Dense(
                     cfg.width,
                     kernel_initializer="he_uniform",
-                    dtype=tf.float32,
                 )
             )
         self.out_linear = tf.keras.layers.Dense(
             cfg.out_dim,
             kernel_initializer="glorot_uniform",
-            dtype=tf.float32,
         )
 
         if self.use_graph:
             self.graph_proj = tf.keras.layers.Dense(
                 cfg.graph_width,
                 kernel_initializer="he_uniform",
-                dtype=tf.float32,
             )
             self.graph_layers = [
                 GraphConvLayer(
@@ -503,7 +495,6 @@ class DisplacementNet(tf.keras.Model):
             self.graph_out = tf.keras.layers.Dense(
                 cfg.out_dim,
                 kernel_initializer="glorot_uniform",
-                dtype=tf.float32,
             )
 
     def call(self, x: tf.Tensor, z: tf.Tensor, training: bool | None = False) -> tf.Tensor:
@@ -513,15 +504,14 @@ class DisplacementNet(tf.keras.Model):
         Returns:
             u: (N,3)
         """
-        # Mixed-precision policies may feed float16 inputs even though the
-        # network itself operates in float32. Force the spatial samples and
-        # conditioning vectors back to float32 before further processing.
-        x = tf.cast(x, tf.float32)
-
+        x = tf.convert_to_tensor(x)
+        z = tf.convert_to_tensor(z)
         # Broadcast z to N samples
         if z.shape.rank == 1:
             z = tf.reshape(z, (1, -1))
-        z = tf.cast(z, tf.float32)
+        feat_dtype = x.dtype
+        if z.dtype != feat_dtype:
+            z = tf.cast(z, feat_dtype)
         # If B>1 and N>1, support either B==N (per-point conditioning) or B==1 (global)
         N = tf.shape(x)[0]
         B = tf.shape(z)[0]
@@ -533,14 +523,16 @@ class DisplacementNet(tf.keras.Model):
             zb = tf.repeat(z, repeats=N, axis=0)
         else:
             zb = z  # assume B==N
-        zb = tf.cast(zb, tf.float32)
+        if zb.dtype != feat_dtype:
+            zb = tf.cast(zb, feat_dtype)
 
         # positional encoding
-        # Positional encoding can inherit a mixed policy dtype (float16) from
-        # the caller even though the dense trunk expects float32.  Always cast
-        # the encoded features back to float32 before concatenation to avoid
-        # dtype mismatches when `zb` stays in float32.
-        x_feat = tf.cast(self.pe(x), tf.float32)  # (N, pe_dim)
+        # Positional encoding may inherit a dtype (e.g., float16 under mixed
+        # precision) different from the conditioning vector; cast so both sides
+        # agree before concatenation.
+        x_feat = self.pe(x)
+        if x_feat.dtype != feat_dtype:
+            x_feat = tf.cast(x_feat, feat_dtype)
         h = tf.concat([x_feat, zb], axis=-1)
 
         def mlp_forward():
@@ -563,7 +555,7 @@ class DisplacementNet(tf.keras.Model):
             return self.out_linear(hcur)
 
         def graph_forward():
-            coords = tf.cast(x, tf.float32)
+            coords = x
             knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
             hcur = self.graph_proj(h)
             for layer in self.graph_layers:
@@ -575,8 +567,7 @@ class DisplacementNet(tf.keras.Model):
             u = graph_forward()
         else:
             u = mlp_forward()
-        # 在半精度策略下，强制回落到 float32，避免在物理能量项中产生 NaN
-        return tf.cast(u, tf.float32)
+        return u
 
 
 # -----------------------------
@@ -626,7 +617,7 @@ class DisplacementModel:
 
         P_hat = tf.convert_to_tensor(P_hat, dtype=tf.float32)
         z = self.encoder(P_hat)          # (B, cond_dim)
-        u = self.field(tf.cast(X, tf.float32), z)   # (N,3)
+        u = self.field(tf.convert_to_tensor(X), z)   # (N,3)
         return u
 
 
