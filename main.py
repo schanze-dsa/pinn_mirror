@@ -23,6 +23,8 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")  # 可选：减少冗余日�
 
 import sys
 import argparse
+import math
+from datetime import datetime
 from dataclasses import asdict
 import yaml  # 新增：读取 config.yaml
 
@@ -275,6 +277,114 @@ def _prepare_config_with_autoguess():
         max_steps=train_steps,
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
+    cfg.adam_steps = cfg.max_steps
+
+    cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))
+    if "grad_clip_norm" in optimizer_cfg:
+        cfg.grad_clip_norm = float(optimizer_cfg["grad_clip_norm"])
+    if "log_every" in optimizer_cfg:
+        cfg.log_every = int(optimizer_cfg["log_every"])
+
+    lbfgs_cfg = optimizer_cfg.get("lbfgs", {}) or {}
+    cfg.lbfgs_enabled = bool(optimizer_cfg.get("lbfgs_enabled", cfg.lbfgs_enabled))
+    if lbfgs_cfg:
+        cfg.lbfgs_enabled = bool(lbfgs_cfg.get("enabled", cfg.lbfgs_enabled))
+        cfg.lbfgs_max_iter = int(lbfgs_cfg.get("max_iter", cfg.lbfgs_max_iter))
+        cfg.lbfgs_tolerance = float(lbfgs_cfg.get("tolerance", cfg.lbfgs_tolerance))
+        cfg.lbfgs_history_size = int(lbfgs_cfg.get("history_size", cfg.lbfgs_history_size))
+        cfg.lbfgs_line_search = int(lbfgs_cfg.get("line_search", cfg.lbfgs_line_search))
+        cfg.lbfgs_reuse_last_batch = bool(
+            lbfgs_cfg.get("reuse_last_batch", cfg.lbfgs_reuse_last_batch)
+        )
+
+    # ===== 预紧分阶段 / 顺序设置 =====
+    staging_cfg = cfg_yaml.get("preload_staging", {}) or {}
+
+    # 顶层布尔开关优先，其次是 staging_cfg 内的 enabled
+    use_stages_val = cfg_yaml.get("preload_use_stages", None)
+    if use_stages_val is not None:
+        cfg.preload_use_stages = bool(use_stages_val)
+    if "enabled" in staging_cfg:
+        cfg.preload_use_stages = bool(staging_cfg["enabled"])
+
+    random_order_val = cfg_yaml.get("preload_randomize_order", None)
+    if random_order_val is not None:
+        cfg.preload_randomize_order = bool(random_order_val)
+    if "randomize_order" in staging_cfg:
+        cfg.preload_randomize_order = bool(staging_cfg["randomize_order"])
+
+    if "repeat" in staging_cfg:
+        cfg.preload_sequence_repeat = int(staging_cfg["repeat"])
+    if "shuffle" in staging_cfg:
+        cfg.preload_sequence_shuffle = bool(staging_cfg["shuffle"])
+    if "jitter" in staging_cfg:
+        cfg.preload_sequence_jitter = float(staging_cfg["jitter"])
+
+    relax_top = cfg_yaml.get("preload_rank_relaxation", None)
+    if relax_top is not None:
+        cfg.preload_cfg.rank_relaxation = float(relax_top)
+    if "relaxation" in staging_cfg:
+        cfg.preload_cfg.rank_relaxation = float(staging_cfg["relaxation"])
+
+    seq_overrides = cfg_yaml.get("preload_sequence", None)
+    if seq_overrides:
+        cfg.preload_sequence = list(seq_overrides)
+    seq_from_staging = staging_cfg.get("sequence", None)
+    if seq_from_staging:
+        cfg.preload_sequence = list(seq_from_staging)
+
+    if cfg.preload_sequence:
+        cfg.preload_use_stages = True
+
+    # ===== 损失加权配置（含自适应） =====
+    loss_cfg_yaml = cfg_yaml.get("loss_config", {}) or {}
+    base_weights_yaml = loss_cfg_yaml.get("base_weights", {}) or {}
+    weight_key_map = {
+        "w_int": ("w_int", "E_int"),
+        "w_cn": ("w_cn", "E_cn"),
+        "w_ct": ("w_ct", "E_ct"),
+        "w_tie": ("w_tie", "E_tie"),
+        "w_bc": ("w_bc", "E_bc"),
+        "w_pre": ("w_pre", "W_pre"),
+    }
+    for yaml_key, (attr, _) in weight_key_map.items():
+        if yaml_key in base_weights_yaml:
+            setattr(cfg.total_cfg, attr, float(base_weights_yaml[yaml_key]))
+
+    adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
+    cfg.loss_adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
+    cfg.loss_update_every = int(adaptive_cfg.get("update_every", cfg.loss_update_every))
+    cfg.loss_ema_decay = float(adaptive_cfg.get("ema_decay", cfg.loss_ema_decay))
+    if "min_weight" in adaptive_cfg:
+        cfg.loss_min_factor = float(adaptive_cfg["min_weight"])
+    if "max_weight" in adaptive_cfg:
+        cfg.loss_max_factor = float(adaptive_cfg["max_weight"])
+    temperature = float(adaptive_cfg.get("temperature", 0.0) or 0.0)
+    if temperature > 0.0:
+        cfg.loss_gamma = 1.0 / temperature
+    else:
+        cfg.loss_gamma = float(adaptive_cfg.get("gamma", cfg.loss_gamma))
+
+    focus_terms_yaml = adaptive_cfg.get("focus_terms", []) or []
+    focus_terms = []
+    for item in focus_terms_yaml:
+        key = str(item).strip()
+        mapping = weight_key_map.get(key)
+        if mapping is None:
+            continue
+        focus_terms.append(mapping[1])
+    cfg.loss_focus_terms = tuple(focus_terms)
+    cfg.total_cfg.adaptive_scheme = adaptive_cfg.get("scheme", cfg.total_cfg.adaptive_scheme)
+
+    # 若启用分阶段加载但 focus_terms 未包含 W_pre，则自动加入以增强预紧信号
+    if cfg.preload_use_stages and "W_pre" not in cfg.loss_focus_terms:
+        cfg.loss_focus_terms = tuple(list(cfg.loss_focus_terms) + ["W_pre"])
+
+    cfg.resample_contact_every = int(
+        cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
+    )
+    cfg.alm_update_every = int(cfg_yaml.get("alm_update_every", cfg.alm_update_every))
+
 
     # ===== 显存友好覆盖（建议先这样跑通，再逐步调回） =====
     # 1) 提升模型表达能力（更宽更深的位移网络 + 更大的条件编码器）
@@ -292,11 +402,69 @@ def _prepare_config_with_autoguess():
     cfg.elas_cfg.n_points_per_step = int(elas_cfg_yaml.get("n_points_per_step", 4096))
     cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
 
-    # 3) 增大接触采样密度，并将重采样频率下调为每步刷新
-    cfg.n_contact_points_per_pair = max(cfg.n_contact_points_per_pair, 6000)
-    cfg.resample_contact_every = 1
-    #    预紧端面采样使用高密度样本以放大不同预紧力的影响
-    cfg.preload_n_points_each = max(cfg.preload_n_points_each, 800)
+    # 3) 接触/预紧采样：根据阶段数做显存友好的调整
+    stage_multiplier = 1
+    if cfg.preload_use_stages:
+        stage_multiplier = max(1, len(cfg.preload_specs))
+        if cfg.preload_sequence:
+            for entry in cfg.preload_sequence:
+                if isinstance(entry, dict):
+                    order = entry.get("order") or entry.get("orders")
+                    values = entry.get("values") or entry.get("P")
+                    if order is not None:
+                        stage_multiplier = max(stage_multiplier, len(order))
+                    elif values is not None:
+                        stage_multiplier = max(stage_multiplier, len(values))
+                elif isinstance(entry, (list, tuple)):
+                    stage_multiplier = max(stage_multiplier, len(entry))
+
+    contact_target = cfg.n_contact_points_per_pair
+    if stage_multiplier > 1:
+        per_stage_contact = max(256, math.ceil(contact_target / stage_multiplier))
+        approx_total_contact = per_stage_contact * stage_multiplier
+        if per_stage_contact != contact_target:
+            print(
+                "[main] 分阶段预紧启用：将每对接触采样从 "
+                f"{contact_target} 调整为每阶段 {per_stage_contact} (≈{approx_total_contact} 总点数)。"
+            )
+        # 分阶段计算仍会在同一梯度带内重复评估接触能，因此进一步限制总量
+        contact_cap = 2048
+        if per_stage_contact > contact_cap:
+            per_stage_contact = contact_cap
+            approx_total_contact = per_stage_contact * stage_multiplier
+            print(
+                "[main] 接触点上限触发：将每阶段采样压缩到 "
+                f"{per_stage_contact} (≈{approx_total_contact} 总点数)。"
+            )
+        cfg.n_contact_points_per_pair = per_stage_contact
+
+        preload_target = cfg.preload_n_points_each
+        per_stage_preload = max(128, math.ceil(preload_target / stage_multiplier))
+        approx_total_preload = per_stage_preload * stage_multiplier
+        if per_stage_preload != preload_target:
+            print(
+                "[main] 分阶段预紧启用：将每个螺栓端面的采样从 "
+                f"{preload_target} 调整为每阶段 {per_stage_preload} (≈{approx_total_preload} 总点数)。"
+            )
+        preload_cap = 1024
+        if per_stage_preload > preload_cap:
+            per_stage_preload = preload_cap
+            approx_total_preload = per_stage_preload * stage_multiplier
+            print(
+                "[main] 预紧点上限触发：将每阶段端面采样压缩到 "
+                f"{per_stage_preload} (≈{approx_total_preload} 总点数)。"
+            )
+        cfg.preload_n_points_each = per_stage_preload
+
+        elas_target = cfg.elas_cfg.n_points_per_step
+        per_stage_elas = max(1024, math.ceil(elas_target / stage_multiplier))
+        if per_stage_elas != elas_target:
+            print(
+                "[main] 分阶段预紧启用：将 DFEM 每步积分点从 "
+                f"{elas_target} 调整为每阶段 {per_stage_elas}。"
+            )
+            cfg.elas_cfg.n_points_per_step = per_stage_elas
+
 
     # 4) 混合精度（4080S 支持）
     cfg.mixed_precision = "mixed_float16"
@@ -392,13 +560,41 @@ def _print_pretrain_audit(cfg: TrainerConfig, asm) -> None:
 
     # 训练关键配置核对
     print("\n[训练配置核对]")
-    print(f"  - 训练步数 max_steps = {cfg.max_steps}")
+    print(f"  - Adam 阶段步数 = {cfg.max_steps}")
     print(f"  - 接触采样 n_contact_points_per_pair = {cfg.n_contact_points_per_pair}")
     print(f"  - 预紧采样 preload_n_points_each = {cfg.preload_n_points_each}")
     print(f"  - 预紧力范围 N = {cfg.preload_min} ~ {cfg.preload_max}")
+    print(f"  - 学习率 lr = {cfg.lr}")
+    print(
+        f"  - 梯度裁剪 grad_clip_norm = {getattr(cfg, 'grad_clip_norm', None)}"
+    )
+    print(
+        f"  - 接触重采样 resample_contact_every = {cfg.resample_contact_every}"
+    )
+    print(f"  - ALM 更新周期 alm_update_every = {cfg.alm_update_every}")
+    print(
+        "  - L-BFGS: enabled={}, max_iter={}, tol={}, history={}, line_search={}, reuse_last_batch={}".format(
+            cfg.lbfgs_enabled,
+            cfg.lbfgs_max_iter,
+            cfg.lbfgs_tolerance,
+            cfg.lbfgs_history_size,
+            cfg.lbfgs_line_search,
+            cfg.lbfgs_reuse_last_batch,
+        )
+    )
     print(f"  - 材料库（name -> (E, nu)）：{cfg.materials}")
     print(f"  - Part→材料：{cfg.part2mat}")
     print("======================================================================\n")
+
+
+def _default_saved_model_dir(out_dir: str) -> str:
+    """Return a timestamped SavedModel path inside ``out_dir``."""
+
+    base_dir = out_dir or "outputs"
+    root = os.path.abspath(os.path.join(base_dir, "saved_models"))
+    os.makedirs(root, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.join(root, f"pinn_saved_model_{stamp}")
 
 
 def _run_training(cfg, asm, export_saved_model: str = ""):
@@ -409,8 +605,14 @@ def _run_training(cfg, asm, export_saved_model: str = ""):
     trainer = Trainer(cfg)
     trainer.run()
 
-    if export_saved_model:
-        trainer.export_saved_model(export_saved_model)
+    export_dir = (export_saved_model or "").strip()
+    if export_dir:
+        export_dir = os.path.abspath(export_dir)
+        os.makedirs(os.path.dirname(export_dir), exist_ok=True)
+    else:
+        export_dir = _default_saved_model_dir(cfg.out_dir)
+        print(f"[main] 未提供 --export，将 SavedModel 写入: {export_dir}")
+    trainer.export_saved_model(export_dir)
 
     print("\n✅ 训练完成！请到 'outputs/' 查看 5 张 “MIRROR up” 变形云图（文件名包含三颗预紧力数值）。")
     print("   如需修改 INP 路径、表面名或超参，优先修改 config.yaml，如有需要再改 main.py 顶部 USER SETTINGS 默认值。")
@@ -423,6 +625,7 @@ def _run_inference(cfg,
                    data_out: str = "auto",
                    title_prefix: str = "",
                    show: bool = False,
+                   preload_order=None,
                    export_saved_model: str = ""):
     from train.trainer import Trainer
 
@@ -439,6 +642,7 @@ def _run_inference(cfg,
         title_prefix=title_prefix or None,
         show=show,
         data_out_path=data_out,
+        preload_order=preload_order,
     )
 
     print("\n✅ 推理完成！")
@@ -459,6 +663,13 @@ def main(argv=None):
     parser.add_argument(
         "--preload", nargs=3, type=float, metavar=("P1", "P2", "P3"),
         help="三个螺栓的预紧力，单位 N (仅在 --mode infer 时使用)"
+    )
+    parser.add_argument(
+        "--order", nargs=3, type=int, metavar=("B1", "B2", "B3"),
+        help=(
+            "分阶段推理时三颗螺栓的拧紧顺序；例如 '2 3 1' 表示第二颗先拧，"
+            "再拧第三、第一颗。留空则默认按 1-2-3 的顺序加载。"
+        ),
     )
     parser.add_argument(
         "--ckpt", default="",
@@ -503,6 +714,7 @@ def main(argv=None):
             data_out=args.data,
             title_prefix=args.title,
             show=args.show,
+            preload_order=args.order,
             export_saved_model=args.export,
         )
 

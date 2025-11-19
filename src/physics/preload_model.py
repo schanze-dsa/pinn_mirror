@@ -33,6 +33,7 @@ class BoltSurfaceSpec:
 class PreloadConfig:
     epsilon: float = 1e-12     # 数值安全项
     work_coeff: float = 1.0    # 预紧功系数，可按需要扩展
+    rank_relaxation: float = 0.0  # 顺序相关的松弛系数 (0 -> 不考虑顺序)
     # 可选：前向分块大小（若未在 cfg 里设置，也可由 _u_fn_chunked 内部默认取 2048）
     # forward_chunk: Optional[int] = None
 
@@ -283,6 +284,20 @@ class PreloadWork:
 
         P = tf.cond(p_len < nb_tf, _pad, _truncate)
         P = P[:nb]
+
+        stage_rank = params.get("stage_rank", None)
+        if stage_rank is not None:
+            rank_vec = tf.convert_to_tensor(stage_rank, dtype=tf.float32)
+            rank_vec = rank_vec[:nb]
+            relax = float(getattr(self.cfg, "rank_relaxation", 0.0) or 0.0)
+            if relax != 0.0:
+                if nb > 1:
+                    coeff = tf.constant(relax, dtype=tf.float32)
+                    center = tf.constant(0.5, dtype=tf.float32)
+                    scale = 1.0 + coeff * (center - rank_vec)
+                else:
+                    scale = tf.ones_like(rank_vec)
+                P = P * scale
 
         deltas = []
         for bolt in self._bolts:
