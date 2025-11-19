@@ -396,6 +396,64 @@ class Trainer:
             return
         pbar.set_postfix_str(self._wrap_bar_text(text))
 
+    def _loss_weight_lookup(self) -> Dict[str, float]:
+        """Assemble the latest per-term loss weights for logging."""
+
+        weights = {
+            "E_int": getattr(self.cfg.total_cfg, "w_int", 1.0),
+            "E_cn": getattr(self.cfg.total_cfg, "w_cn", 1.0),
+            "E_ct": getattr(self.cfg.total_cfg, "w_ct", 1.0),
+            "E_tie": getattr(self.cfg.total_cfg, "w_tie", 1.0),
+            "E_bc": getattr(self.cfg.total_cfg, "w_bc", 1.0),
+            "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
+        }
+        if self.loss_state is not None:
+            for key, value in self.loss_state.current.items():
+                try:
+                    weights[key] = float(value)
+                except Exception:
+                    weights[key] = value
+        return weights
+
+    @staticmethod
+    def _extract_part_scalar(parts: Mapping[str, tf.Tensor], *keys: str) -> Optional[float]:
+        for key in keys:
+            if key not in parts:
+                continue
+            value = parts[key]
+            try:
+                if isinstance(value, tf.Tensor):
+                    return float(value.numpy())
+                if isinstance(value, np.ndarray):
+                    return float(value)
+                return float(value)
+            except Exception:
+                continue
+        return None
+
+    def _format_energy_summary(self, parts: Mapping[str, tf.Tensor]) -> str:
+        display = [
+            ("E_int", "Eint"),
+            ("E_cn", "Ecn"),
+            ("E_ct", "Ect"),
+            ("E_tie", "Etie"),
+            ("E_bc", "Ebc"),
+            ("W_pre", "Wpre"),
+        ]
+        aliases = {
+            "E_cn": ("E_cn", "E_n"),
+            "E_ct": ("E_ct", "E_t"),
+        }
+        weights = self._loss_weight_lookup()
+        entries: List[str] = []
+        for key, label in display:
+            val = self._extract_part_scalar(parts, *aliases.get(key, (key,)))
+            if val is None:
+                continue
+            weight = weights.get(key, 0.0)
+            entries.append(f"{label}={val:.3e}(w={weight:.2f})")
+        return " ".join(entries)
+
     def _format_train_log_postfix(
         self,
         P_np: np.ndarray,
@@ -417,22 +475,7 @@ class Trainer:
         try:
             p1, p2, p3 = [int(x) for x in P_np.tolist()]
             pin = float(Pi.numpy())
-
-            def _part_val(key: str, alt_keys: Optional[Sequence[str]] = None) -> float:
-                if key in parts:
-                    return float(parts[key].numpy())
-                if alt_keys:
-                    for other in alt_keys:
-                        if other in parts:
-                            return float(parts[other].numpy())
-                return 0.0
-
-            eint = _part_val("E_int")
-            en = _part_val("E_cn", ("E_n",))
-            et = _part_val("E_ct", ("E_t",))
-            ebc = _part_val("E_bc")
-            etie = _part_val("E_tie")
-            wpre = _part_val("W_pre")
+            energy_disp = self._format_energy_summary(parts)
 
             bolt_txt = ""
             preload_stats = None
@@ -512,27 +555,7 @@ class Trainer:
                         order_txt = f" order={human_order}"
                 except Exception:
                     order_txt = " order=?"
-            # ---- 当前自适应权重 ----
-            default_weights = {
-                "E_int": getattr(self.cfg.total_cfg, "w_int", 1.0),
-                "E_cn": getattr(self.cfg.total_cfg, "w_cn", 1.0),
-                "E_ct": getattr(self.cfg.total_cfg, "w_ct", 1.0),
-                "E_tie": getattr(self.cfg.total_cfg, "w_tie", 1.0),
-                "E_bc": getattr(self.cfg.total_cfg, "w_bc", 1.0),
-                "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
-            }
-            weight_map = dict(default_weights)
-            if self.loss_state is not None:
-                weight_map.update(self.loss_state.current)
-
-            parts_disp = (
-                f"Eint={eint:.3e}(w={weight_map.get('E_int', 0.0):.2f}) "
-                f"Ecn={en:.3e}(w={weight_map.get('E_cn', 0.0):.2f}) "
-                f"Ect={et:.3e}(w={weight_map.get('E_ct', 0.0):.2f}) "
-                f"Etie={etie:.3e}(w={weight_map.get('E_tie', 0.0):.2f}) "
-                f"Ebc={ebc:.3e}(w={weight_map.get('E_bc', 0.0):.2f}) "
-                f"Wpre={wpre:.3e}(w={weight_map.get('W_pre', 0.0):.2f})"
-            )
+            parts_disp = energy_disp or ""
             postfix = (
                 f"P=[{p1},{p2},{p3}]N{order_txt} Π={pin:.3e} | {parts_disp} {bolt_txt} "
                 f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
@@ -1411,9 +1434,11 @@ class Trainer:
                     order_txt = ""
                     if order_np is not None:
                         order_txt = " order=" + "-".join(str(int(x) + 1) for x in order_np)
+                    energy_summary = self._format_energy_summary(parts)
+                    energy_txt = f" | {energy_summary}" if energy_summary else ""
                     train_note = (
                         f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}]"
-                        f"{order_txt} Π={pi_val:.2e} {rel_txt} {d_txt} "
+                        f"{order_txt}{energy_txt} | Π={pi_val:.2e} {rel_txt} {d_txt} "
                         f"grad={grad_val:.2e} {ema_txt}"
                     )
                     if step == 1:
@@ -1733,6 +1758,10 @@ class Trainer:
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
         )
+        if stage_count > 1:
+            rank_vec = rank_vec / tf.cast(stage_count - 1, tf.float32)
+        else:
+            rank_vec = tf.zeros_like(rank_vec)
 
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
