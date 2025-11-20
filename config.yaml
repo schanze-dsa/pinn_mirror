@@ -189,7 +189,7 @@ optimizer_config:
   batch_size: 32
   epochs: 1000              # Adam 阶段的迭代步数
   lbfgs:
-    enabled: true           # 是否在 Adam 之后追加 L-BFGS 精调
+    enabled: false           # 是否在 Adam 之后追加 L-BFGS 精调
     max_iter: 200           # L-BFGS 最大迭代次数
     tolerance: 1.0e-6       # 收敛判据（目标函数相对变化）
     history_size: 50        # 拟牛顿历史记忆对数
