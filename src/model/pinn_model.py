@@ -458,37 +458,46 @@ class DisplacementNet(tf.keras.Model):
         """
         x = tf.convert_to_tensor(x)
         z = tf.convert_to_tensor(z)
-        # Broadcast z to N samples
-        if z.shape.rank == 1:
-            z = tf.reshape(z, (1, -1))
-        feat_dtype = x.dtype
-        if z.dtype != feat_dtype:
-            z = tf.cast(z, feat_dtype)
-        # If B>1 and N>1, support either B==N (per-point conditioning) or B==1 (global)
-        B = tf.shape(z)[0]
-        N = tf.shape(x)[0]
-
-        # 使用 tf.cond 处理动态逻辑
-        # 如果 (B != 1) 且 (B != N)，则截取 z 的第一行，否则保持 z 不变
-        condition = tf.logical_and(tf.not_equal(B, 1), tf.not_equal(B, N))
-        z = tf.cond(condition, lambda: z[:1], lambda: z)
         
-        # 重新获取 B，确保形状信息更新
+        # Ensure z is 2D: (B, cond_dim)
+        # Static shape check if possible, otherwise dynamic
+        if z.shape.rank is not None and z.shape.rank == 1:
+            z = tf.reshape(z, (1, -1))
+        
+        # Broadcast z to N samples
+        # logic: if B != 1 and B != N, fallback to B=1; then broadcast B=1 to N
+        
+        N = tf.shape(x)[0]
         B = tf.shape(z)[0]
-        if tf.equal(B, 1):
-            zb = tf.repeat(z, repeats=N, axis=0)
-        else:
-            zb = z  # assume B==N
+
+        # --- 修复点 1：处理 Fallback 逻辑 ---
+        # 原代码: if tf.not_equal(B, 1) and tf.not_equal(B, N): ...
+        # 新代码: 使用 tf.cond
+        condition_fallback = tf.logical_and(tf.not_equal(B, 1), tf.not_equal(B, N))
+        z = tf.cond(condition_fallback, lambda: z[:1], lambda: z)
+        
+        # 更新 B (因为 z 可能变了)
+        B = tf.shape(z)[0]
+
+        # --- 修复点 2：处理广播逻辑 (你现在的报错点) ---
+        # 原代码: if tf.equal(B, 1): ... else: ...
+        # 新代码: 使用 tf.cond
+        zb = tf.cond(
+            tf.equal(B, 1), 
+            lambda: tf.repeat(z, repeats=N, axis=0), 
+            lambda: z
+        )
+
+        # --- 后续逻辑保持不变 ---
+        feat_dtype = x.dtype
         if zb.dtype != feat_dtype:
             zb = tf.cast(zb, feat_dtype)
 
         # positional encoding
-        # Positional encoding may inherit a dtype (e.g., float16 under mixed
-        # precision) different from the conditioning vector; cast so both sides
-        # agree before concatenation.
         x_feat = self.pe(x)
         if x_feat.dtype != feat_dtype:
             x_feat = tf.cast(x_feat, feat_dtype)
+        
         h = tf.concat([x_feat, zb], axis=-1)
 
         def graph_forward():
