@@ -100,7 +100,7 @@ class TrainerConfig:
     contact_pairs: List[Dict[str, str]] = field(default_factory=list)
     n_contact_points_per_pair: int = 6000
     contact_seed: int = 1234
-    contact_rar_enabled: bool = False          # 是否启用接触残差驱动的自适应重采样
+    contact_rar_enabled: bool = True           # 是否启用接触残差驱动的自适应重采样
     contact_rar_fraction: float = 0.5          # 每次重采样中，多少比例来自残差加权抽样
     contact_rar_temperature: float = 1.0       # >1 平滑、<1 更尖锐
     contact_rar_floor: float = 1e-6            # 防止全零残差
