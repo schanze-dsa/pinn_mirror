@@ -1350,7 +1350,13 @@ class Trainer:
             }
 
             # 4. 传递顺序相关的特征（如 rank），确保物理项也能感知阶段信息
-            stage_rank_tensor = stages_dict.get("stage_rank") or params_full.get("stage_rank")
+            # 注意：不能直接用 `or` 连接 Tensor（布尔上下文会触发 ValueError）
+            if "stage_rank" in stages_dict:
+                stage_rank_tensor = stages_dict["stage_rank"]
+            elif "stage_rank" in params_full:
+                stage_rank_tensor = params_full["stage_rank"]
+            else:
+                stage_rank_tensor = None
             if stage_rank_tensor is not None:
                 stage_rank_tensor = tf.convert_to_tensor(stage_rank_tensor)
                 if stage_rank_tensor.shape.rank == 2:
