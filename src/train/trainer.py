@@ -1194,15 +1194,30 @@ class Trainer:
             # 形状从 (feat_dim,) 变为 (1, feat_dim) 以适配 batch
             current_P_hat = stages_dict["P_hat"][stage_idx]
             current_P_hat = tf.reshape(current_P_hat, (1, -1))
-            
+
             # 2. 取出对应的物理力 P
             current_P = stages_dict["P"][stage_idx]
-            
+
             # 3. 构造真正喂给网络的字典，【显式包含 P_hat】
             params = {
                 "P": current_P,          # 物理计算用
                 "P_hat": current_P_hat,  # 网络输入用 (这就接通了顺序特征!)
             }
+
+            # 4. 传递顺序相关的特征（如 rank），确保物理项也能感知阶段信息
+            stage_rank_tensor = stages_dict.get("stage_rank") or params_full.get("stage_rank")
+            if stage_rank_tensor is not None:
+                stage_rank_tensor = tf.convert_to_tensor(stage_rank_tensor)
+                if stage_rank_tensor.shape.rank == 2:
+                    params["stage_rank"] = stage_rank_tensor[stage_idx]
+                else:
+                    params["stage_rank"] = stage_rank_tensor
+
+            # 5. 保留原有的统计上下文（顺序、阶段数），便于日志/可视化
+            if "stage_order" in params_full:
+                params["stage_order"] = params_full["stage_order"]
+            if "stage_count" in params_full:
+                params["stage_count"] = params_full["stage_count"]
         else:
             params = params_full
         # ==================== 【修复补丁】结束 ====================
