@@ -187,7 +187,7 @@ class TrainerConfig:
     viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
-    viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
+    viz_diagnose_blanks: bool = True        # 是否在生成云图时自动诊断留白原因
     save_best_on: str = "Pi"   # or "E_int"
 
 
