@@ -80,7 +80,7 @@ TRAIN_STEPS_DEFAULT = 4000
 CONTACT_POINTS_PER_PAIR_DEFAULT = 6000
 PRELOAD_FACE_POINTS_EACH_DEFAULT = 800
 # 三个螺栓随机预紧力范围（单位 N）
-PRELOAD_RANGE_N_DEFAULT = (200.0, 1000.0)
+PRELOAD_RANGE_N_DEFAULT = (500.0, 2000.0)
 # ===================================================
 
 # --- 项目内模块导入 ---
