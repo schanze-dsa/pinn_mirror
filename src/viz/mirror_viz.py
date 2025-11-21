@@ -179,7 +179,7 @@ class BlankRegionDiagnostics:
             f"[3] mesh coverage ratio (triangles vs convex hull): {self.coverage_ratio:.2%}",
             f"[4] refinement applied vs requested: {self.applied_subdiv} / {self.requested_subdiv}",
             f"[5] triangulation masked/dropped: mask={self.tri_masked}, drop={self.tri_dropped}",
-            f"[6] additional notes: {"; ".join(self.notes) if self.notes else 'none'}",
+            f"[6] additional notes: {'; '.join(self.notes) if self.notes else 'none'}",
         ]
         return lines
 
