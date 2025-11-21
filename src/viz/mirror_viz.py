@@ -298,8 +298,22 @@ def plot_mirror_deflection(asm: AssemblyModel,
         X_plot, UV_plot, tri_plot = X3D, UV, tri_idx
         u_plot, d_plot = u_base, d_base
 
+    # Detect invalid predictions that will render as holes
+    nonfinite_mask = ~np.isfinite(d_plot)
+    tri_mask = None
+    if np.any(nonfinite_mask):
+        bad = int(nonfinite_mask.sum())
+        frac = bad / float(d_plot.size)
+        print(
+            f"[viz] Warning: {bad}/{d_plot.size} deflection samples are NaN/Inf "
+            f"({frac:.2%}); affected triangles will appear blank."
+        )
+        tri_mask = np.any(nonfinite_mask[tri_plot], axis=1)
+
     # 4) Triangulation in 2D
     tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1], tri_plot)
+    if tri_mask is not None and np.any(tri_mask):
+        tri.set_mask(tri_mask)
 
     # 5) Draw
     fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
