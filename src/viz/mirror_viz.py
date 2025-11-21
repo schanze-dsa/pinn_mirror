@@ -478,7 +478,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            refine_max_points: Optional[int] = None,
                            eval_batch_size: int = 65_536,
                            diagnose_blanks: bool = False,
-                           auto_fill_blanks: bool = True,
+                           auto_fill_blanks: bool = False,
                            diag_out: Optional[Dict[str, BlankRegionDiagnostics]] = None):
     """
     Visualize deflection along the global mirror normal of the given surface.
@@ -590,33 +590,26 @@ def plot_mirror_deflection(asm: AssemblyModel,
             print("[viz] blank-check", line)
 
         coverage_threshold = 0.80
-        can_fill = diag_result.n_boundary_loops <= 1
         if auto_fill_blanks and diag_result.coverage_ratio_envelope < coverage_threshold:
-            if not can_fill:
-                diag_result.notes.append(
-                    "skip auto-fill: multiple boundary loops detected (e.g., ring/holes), "
-                    "preserving holes"
-                )
-            else:
-                print(
-                    f"[viz] coverage {diag_result.coverage_ratio_envelope:.2%} < {coverage_threshold:.0%}; "
-                    "re-triangulating in 2D to improve coverage.",
-                )
-                tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1])
-                boundary_mask = _mask_tris_with_loops(tri, UV_plot, diag_result.boundary_loops)
-                if np.any(boundary_mask):
-                    tri.set_mask(boundary_mask)
+            print(
+                f"[viz] coverage {diag_result.coverage_ratio_envelope:.2%} < {coverage_threshold:.0%}; "
+                "re-triangulating in 2D to improve coverage (holes preserved).",
+            )
+            tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1])
+            boundary_mask = _mask_tris_with_loops(tri, UV_plot, diag_result.boundary_loops)
+            if np.any(boundary_mask):
+                tri.set_mask(boundary_mask)
 
-                if np.any(nonfinite_mask):
-                    invalid_mask = np.any(nonfinite_mask[tri.triangles], axis=1)
-                    if np.any(invalid_mask):
-                        tri.set_mask(
-                            invalid_mask if tri.mask is None else (tri.mask | invalid_mask)
-                        )
+            if np.any(nonfinite_mask):
+                invalid_mask = np.any(nonfinite_mask[tri.triangles], axis=1)
+                if np.any(invalid_mask):
+                    tri.set_mask(
+                        invalid_mask if tri.mask is None else (tri.mask | invalid_mask)
+                    )
 
-                tri_plot = tri.triangles.astype(np.int32)
-                tri_mask = tri.mask
-                diag_result.notes.append("applied 2D re-triangulation to fill coverage gaps")
+            tri_plot = tri.triangles.astype(np.int32)
+            tri_mask = tri.mask
+            diag_result.notes.append("applied 2D re-triangulation to fill coverage gaps")
     if diag_out is not None:
         diag_out["blank_check"] = diag_result
 
