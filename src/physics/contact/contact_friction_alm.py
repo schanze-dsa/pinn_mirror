@@ -147,6 +147,7 @@ class FrictionContactALM:
         self._last_st: Optional[tf.Tensor] = None
         self._last_tau_trial: Optional[tf.Tensor] = None
         self._last_tau: Optional[tf.Tensor] = None
+        self._last_r_norm: Optional[tf.Tensor] = None
 
         self._built_N: int = 0
 
@@ -201,6 +202,7 @@ class FrictionContactALM:
         self._last_st = None
         self._last_tau_trial = None
         self._last_tau = None
+        self._last_r_norm = None
 
     def build_from_cat(
         self,
@@ -319,6 +321,7 @@ class FrictionContactALM:
             # 更新 cache（无 tau/tau_trial 概念，用 None）
             self._last_tau_trial = None
             self._last_tau = None
+            self._last_r_norm = r
 
             return Et, stats
 
@@ -362,6 +365,7 @@ class FrictionContactALM:
         # cache
         self._last_tau_trial = tau_trial
         self._last_tau = tau
+        self._last_r_norm = r_norm
 
         return Et, stats
 
