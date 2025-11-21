@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -169,14 +170,18 @@ class BlankRegionDiagnostics:
     nonfinite_uv: int
     tri_masked: int
     tri_dropped: int
-    coverage_ratio: float
+    coverage_ratio_hull: float
+    coverage_ratio_envelope: float
+    n_boundary_loops: int
+    envelope_area: float
     notes: List[str]
 
     def summary_lines(self) -> List[str]:
         lines = [
             f"[1] deflection NaN/Inf: {self.nonfinite_deflection}",
             f"[2] displacement/UV NaN/Inf: disp={self.nonfinite_displacement}, uv={self.nonfinite_uv}",
-            f"[3] mesh coverage ratio (triangles vs convex hull): {self.coverage_ratio:.2%}",
+            f"[3] coverage (triangles / convex hull): {self.coverage_ratio_hull:.2%}",
+            f"[3b] coverage (triangles / boundary envelope): {self.coverage_ratio_envelope:.2%}  loops={self.n_boundary_loops}",
             f"[4] refinement applied vs requested: {self.applied_subdiv} / {self.requested_subdiv}",
             f"[5] triangulation masked/dropped: mask={self.tri_masked}, drop={self.tri_dropped}",
             f"[6] additional notes: {'; '.join(self.notes) if self.notes else 'none'}",
@@ -189,8 +194,10 @@ class BlankRegionDiagnostics:
             return "(1) 挠度中存在 NaN/Inf，绘图被掩码"
         if self.nonfinite_displacement > 0 or self.nonfinite_uv > 0:
             return "(2) 位移向量或投影坐标含 NaN/Inf，导致三角化异常"
-        if self.coverage_ratio < 0.75:
-            return "(3) 网格覆盖率低于 75%，几何存在孔洞/稀疏大三角形"
+        if self.coverage_ratio_envelope < 0.80:
+            return "(3) 网格覆盖率低于 80%，几何存在孔洞/稀疏大三角形"
+        if self.coverage_ratio_hull < 0.75:
+            return "(3a) 凸包覆盖率低但边界覆盖正常，几何强凹或存在合法孔洞"
         if self.applied_subdiv < self.requested_subdiv:
             return "(4) 细分被 refine_max_points 裁剪，采样过于稀疏"
         if self.tri_masked > 0 or self.tri_dropped > 0:
@@ -244,6 +251,71 @@ def _triangle_area_sum(points: np.ndarray, tris: np.ndarray) -> float:
     return float(np.sum(np.abs(cross)) * 0.5)
 
 
+def _collect_boundary_loops(tris: np.ndarray) -> List[List[int]]:
+    """Extract boundary loops (edges used exactly once) from a triangle list."""
+
+    edge_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    for a, b, c in tris:
+        edges = [(a, b), (b, c), (c, a)]
+        for e0, e1 in edges:
+            key = (e0, e1) if e0 <= e1 else (e1, e0)
+            edge_counts[key] += 1
+
+    boundary_edges = [e for e, cnt in edge_counts.items() if cnt == 1]
+    if not boundary_edges:
+        return []
+
+    adj: Dict[int, List[int]] = defaultdict(list)
+    for e0, e1 in boundary_edges:
+        adj[e0].append(e1)
+        adj[e1].append(e0)
+
+    visited_edges = set()
+    loops: List[List[int]] = []
+
+    def next_neighbor(cur: int, prev: Optional[int]) -> Optional[int]:
+        nbrs = adj[cur]
+        if not nbrs:
+            return None
+        if prev is None:
+            return nbrs[0]
+        for n in nbrs:
+            if n != prev:
+                return n
+        return nbrs[0]
+
+    for edge in boundary_edges:
+        if edge in visited_edges or (edge[1], edge[0]) in visited_edges:
+            continue
+        loop = []
+        start, nxt = edge
+        cur, prev = start, nxt
+        loop.append(cur)
+        while True:
+            visited_edges.add((cur, prev))
+            loop.append(prev)
+            nxt2 = next_neighbor(prev, cur)
+            if nxt2 is None:
+                break
+            cur, prev = prev, nxt2
+            if prev == loop[0]:
+                break
+        loops.append(loop)
+    return loops
+
+
+def _loop_area(points: np.ndarray, loop: List[int]) -> float:
+    if len(loop) < 3:
+        return 0.0
+    pts = points[np.asarray(loop, dtype=np.int64)]
+    area = 0.0
+    for i in range(len(loop)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(loop)]
+        area += x1 * y2 - x2 * y1
+    return 0.5 * area
+
+
 def _diagnose_blank_regions(
     requested_subdiv: int,
     applied_subdiv: int,
@@ -264,13 +336,30 @@ def _diagnose_blank_regions(
 
     hull_area = _convex_hull_area(UV_plot)
     tri_area = _triangle_area_sum(UV_plot, tri_plot)
-    coverage_ratio = 0.0 if hull_area <= 0 else min(1.0, tri_area / hull_area)
+    coverage_ratio_hull = 0.0 if hull_area <= 0 else min(1.0, tri_area / hull_area)
+
+    boundary_loops = _collect_boundary_loops(tri_plot)
+    n_loops = len(boundary_loops)
+    loop_areas = [abs(_loop_area(UV_plot, loop)) for loop in boundary_loops]
+    envelope_area = float(sum(loop_areas)) if loop_areas else hull_area
+    if loop_areas:
+        # Treat the largest loop as the outer boundary; subtract smaller loops as holes when oriented oppositely
+        max_idx = int(np.argmax(loop_areas))
+        outer_area = loop_areas[max_idx]
+        hole_area = sum(loop_areas[:max_idx] + loop_areas[max_idx + 1:])
+        envelope_area = max(outer_area - hole_area, 0.0)
+
+    coverage_ratio_env = 0.0 if envelope_area <= 0 else min(1.0, tri_area / envelope_area)
 
     notes: List[str] = []
     if hull_area <= 0:
         notes.append("投影凸包面积为 0，可能所有点共线或重复")
     if tri_area <= 0:
         notes.append("三角面积总和为 0，可能存在退化三角形")
+    if n_loops > 1:
+        notes.append(f"检测到 {n_loops} 条边界环，可能存在孔洞/不连通的补丁")
+    if coverage_ratio_env >= 0.9 and coverage_ratio_hull < 0.75:
+        notes.append("凸包面积显著大于边界包络，几何可能强凹但覆盖良好")
 
     return BlankRegionDiagnostics(
         requested_subdiv=requested_subdiv,
@@ -280,7 +369,10 @@ def _diagnose_blank_regions(
         nonfinite_uv=nonfinite_uv,
         tri_masked=tri_masked,
         tri_dropped=tri_dropped,
-        coverage_ratio=coverage_ratio,
+        coverage_ratio_hull=coverage_ratio_hull,
+        coverage_ratio_envelope=coverage_ratio_env,
+        n_boundary_loops=n_loops,
+        envelope_area=envelope_area,
         notes=notes,
     )
 
