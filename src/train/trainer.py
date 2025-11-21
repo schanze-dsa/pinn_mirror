@@ -187,6 +187,7 @@ class TrainerConfig:
     viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
+    viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
     save_best_on: str = "Pi"   # or "E_int"
 
 
@@ -360,6 +361,7 @@ class Trainer:
         self.ckpt_manager = None
         self.best_metric = float("inf")
         self.last_viz_data_path: Optional[str] = None
+        self.last_viz_diag = None
 
         # —— 体检/调试可读
         self.X_vol = None
@@ -1960,6 +1962,8 @@ class Trainer:
             else:
                 resolved_data_path = data_out_path
 
+        diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
+
         _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
@@ -1979,8 +1983,11 @@ class Trainer:
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
+            diagnose_blanks=self.cfg.viz_diagnose_blanks,
+            diag_out=diag_out,
         )
 
+        self.last_viz_diag = diag_out.get("blank_check") if diag_out is not None else None
         self.last_viz_data_path = data_path
         if data_path:
             print(f"[viz] displacement data -> {data_path}")
@@ -1997,7 +2004,9 @@ class Trainer:
         if self.cfg.viz_write_data and out_path:
             data_path = os.path.splitext(out_path)[0] + ".txt"
 
-        return plot_mirror_deflection_by_name(
+        diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
+
+        result = plot_mirror_deflection_by_name(
             self.asm,
             bare,
             self.model.u_fn,
@@ -2015,7 +2024,13 @@ class Trainer:
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
+            diagnose_blanks=self.cfg.viz_diagnose_blanks,
+            diag_out=diag_out,
         )
+
+        if diag_out is not None:
+            self.last_viz_diag = diag_out.get("blank_check")
+        return result
 
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:

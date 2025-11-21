@@ -29,6 +29,7 @@ Author: you
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -156,6 +157,135 @@ from mesh.surface_utils import TriSurface, resolve_surface_to_tris, _fetch_xyz
 
 
 # -----------------------------
+# Diagnostics for blank regions
+# -----------------------------
+
+@dataclass
+class BlankRegionDiagnostics:
+    requested_subdiv: int
+    applied_subdiv: int
+    nonfinite_deflection: int
+    nonfinite_displacement: int
+    nonfinite_uv: int
+    tri_masked: int
+    tri_dropped: int
+    coverage_ratio: float
+    notes: List[str]
+
+    def summary_lines(self) -> List[str]:
+        lines = [
+            f"[1] deflection NaN/Inf: {self.nonfinite_deflection}",
+            f"[2] displacement/UV NaN/Inf: disp={self.nonfinite_displacement}, uv={self.nonfinite_uv}",
+            f"[3] mesh coverage ratio (triangles vs convex hull): {self.coverage_ratio:.2%}",
+            f"[4] refinement applied vs requested: {self.applied_subdiv} / {self.requested_subdiv}",
+            f"[5] triangulation masked/dropped: mask={self.tri_masked}, drop={self.tri_dropped}",
+            f"[6] additional notes: {"; ".join(self.notes) if self.notes else 'none'}",
+        ]
+        return lines
+
+    @property
+    def primary_cause(self) -> str:
+        if self.nonfinite_deflection > 0:
+            return "(1) 挠度中存在 NaN/Inf，绘图被掩码"
+        if self.nonfinite_displacement > 0 or self.nonfinite_uv > 0:
+            return "(2) 位移向量或投影坐标含 NaN/Inf，导致三角化异常"
+        if self.coverage_ratio < 0.75:
+            return "(3) 网格覆盖率低于 75%，几何存在孔洞/稀疏大三角形"
+        if self.applied_subdiv < self.requested_subdiv:
+            return "(4) 细分被 refine_max_points 裁剪，采样过于稀疏"
+        if self.tri_masked > 0 or self.tri_dropped > 0:
+            return "(5) 三角化阶段被掩码/丢弃，可能存在退化或重复点"
+        return "(6) 未发现明显异常，请检查输入数据或导出文件"
+
+
+def _convex_hull_area(points: np.ndarray) -> float:
+    """Compute 2D convex hull area via monotonic chain (no extra deps)."""
+
+    pts = np.unique(points, axis=0)
+    if pts.shape[0] < 3:
+        return 0.0
+
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[np.ndarray] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper: List[np.ndarray] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    hull = np.array(lower[:-1] + upper[:-1])
+    if hull.shape[0] < 3:
+        return 0.0
+    area = 0.0
+    for i in range(hull.shape[0]):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % hull.shape[0]]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+
+def _triangle_area_sum(points: np.ndarray, tris: np.ndarray) -> float:
+    if tris.size == 0:
+        return 0.0
+    p = points
+    t = tris
+    v1 = p[t[:, 1]] - p[t[:, 0]]
+    v2 = p[t[:, 2]] - p[t[:, 0]]
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    return float(np.sum(np.abs(cross)) * 0.5)
+
+
+def _diagnose_blank_regions(
+    requested_subdiv: int,
+    applied_subdiv: int,
+    UV_plot: np.ndarray,
+    tri_plot: np.ndarray,
+    tri: Triangulation,
+    u_plot: np.ndarray,
+    d_plot: np.ndarray,
+    tri_mask: Optional[np.ndarray],
+) -> BlankRegionDiagnostics:
+
+    nonfinite_deflection = int((~np.isfinite(d_plot)).sum())
+    nonfinite_disp = int((~np.isfinite(u_plot)).sum())
+    nonfinite_uv = int((~np.isfinite(UV_plot)).sum())
+
+    tri_masked = int(np.count_nonzero(tri_mask)) if tri_mask is not None else 0
+    tri_dropped = int(max(0, tri_plot.shape[0] - getattr(tri, "triangles", tri_plot).shape[0]))
+
+    hull_area = _convex_hull_area(UV_plot)
+    tri_area = _triangle_area_sum(UV_plot, tri_plot)
+    coverage_ratio = 0.0 if hull_area <= 0 else min(1.0, tri_area / hull_area)
+
+    notes: List[str] = []
+    if hull_area <= 0:
+        notes.append("投影凸包面积为 0，可能所有点共线或重复")
+    if tri_area <= 0:
+        notes.append("三角面积总和为 0，可能存在退化三角形")
+
+    return BlankRegionDiagnostics(
+        requested_subdiv=requested_subdiv,
+        applied_subdiv=applied_subdiv,
+        nonfinite_deflection=nonfinite_deflection,
+        nonfinite_displacement=nonfinite_disp,
+        nonfinite_uv=nonfinite_uv,
+        tri_masked=tri_masked,
+        tri_dropped=tri_dropped,
+        coverage_ratio=coverage_ratio,
+        notes=notes,
+    )
+
+
+# -----------------------------
 # Core helpers
 # -----------------------------
 
@@ -226,7 +356,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            draw_wireframe: bool = False,
                            refine_subdivisions: int = 0,
                            refine_max_points: Optional[int] = None,
-                           eval_batch_size: int = 65_536):
+                           eval_batch_size: int = 65_536,
+                           diagnose_blanks: bool = False,
+                           diag_out: Optional[Dict[str, BlankRegionDiagnostics]] = None):
     """
     Visualize deflection along the global mirror normal of the given surface.
 
@@ -254,6 +386,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle.
         refine_max_points   : Optional guardrail limiting the total evaluation points.
         eval_batch_size     : Batch size when querying ``u_fn`` for visualization.
+        diagnose_blanks     : If True, run a one-click diagnosis to pinpoint blank-region causes.
+        diag_out            : Optional dict to receive ``{"blank_check": BlankRegionDiagnostics}``
+                              for downstream logging.
 
     Returns:
         (fig, ax, data_path)
@@ -314,6 +449,24 @@ def plot_mirror_deflection(asm: AssemblyModel,
     tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1], tri_plot)
     if tri_mask is not None and np.any(tri_mask):
         tri.set_mask(tri_mask)
+
+    diag_result: Optional[BlankRegionDiagnostics] = None
+    if diagnose_blanks:
+        diag_result = _diagnose_blank_regions(
+            requested_subdiv=int(refine_subdivisions or 0),
+            applied_subdiv=applied_subdiv,
+            UV_plot=UV_plot,
+            tri_plot=tri_plot,
+            tri=tri,
+            u_plot=u_plot,
+            d_plot=d_plot,
+            tri_mask=tri_mask,
+        )
+        print("[viz] blank-check primary cause:", diag_result.primary_cause)
+        for line in diag_result.summary_lines():
+            print("[viz] blank-check", line)
+    if diag_out is not None:
+        diag_out["blank_check"] = diag_result
 
     # 5) Draw
     fig, ax = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
