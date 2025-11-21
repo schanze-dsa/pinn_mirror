@@ -460,7 +460,7 @@ class Trainer:
             if val is None:
                 continue
             weight = weights.get(key, 0.0)
-            entries.append(f"{label}={val:.3e}(w={weight:.2f})")
+            entries.append(f"{label}={val:.3e}(w={weight:.3g})")
         return " ".join(entries)
 
     def _format_train_log_postfix(
@@ -505,19 +505,26 @@ class Trainer:
             stick_ratio = None
             slip_ratio = None
             mean_gap = None
-            if isinstance(stats, Mapping):
-                val = stats.get("n_pen_ratio")
-                if val is not None:
-                    pen_ratio = float(val.numpy())
-                val = stats.get("t_stick_ratio")
-                if val is not None:
-                    stick_ratio = float(val.numpy())
-                val = stats.get("t_slip_ratio")
-                if val is not None:
-                    slip_ratio = float(val.numpy())
-                val = stats.get("n_mean_gap")
-                if val is not None:
-                    mean_gap = float(val.numpy())
+
+            def _get_stat_float(*keys: str) -> Optional[float]:
+                if not isinstance(stats, Mapping):
+                    return None
+                for key in keys:
+                    val = stats.get(key)
+                    if val is None:
+                        continue
+                    try:
+                        if hasattr(val, "numpy"):
+                            return float(val.numpy())
+                        return float(val)
+                    except Exception:
+                        continue
+                return None
+
+            pen_ratio = _get_stat_float("n_pen_ratio", "cn_pen_ratio", "pen_ratio")
+            stick_ratio = _get_stat_float("t_stick_ratio", "stick_ratio")
+            slip_ratio = _get_stat_float("t_slip_ratio", "slip_ratio")
+            mean_gap = _get_stat_float("n_mean_gap", "cn_mean_gap", "mean_gap")
 
             grad_disp = f"grad={grad_val:.2e}"
             rel_pct = rel_pi * 100.0 if rel_pi is not None else None
