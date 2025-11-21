@@ -100,6 +100,13 @@ class TrainerConfig:
     contact_pairs: List[Dict[str, str]] = field(default_factory=list)
     n_contact_points_per_pair: int = 6000
     contact_seed: int = 1234
+    contact_rar_enabled: bool = True           # 是否启用接触残差驱动的自适应重采样
+    contact_rar_fraction: float = 0.5          # 每次重采样中，多少比例来自残差加权抽样
+    contact_rar_temperature: float = 1.0       # >1 平滑、<1 更尖锐
+    contact_rar_floor: float = 1e-6            # 防止全零残差
+    contact_rar_uniform_ratio: float = 0.3     # 保留多少比例的全局均匀点，避免过拟合热点
+    contact_rar_fric_mix: float = 0.4          # 穿透 vs 摩擦残差的混合系数
+    contact_rar_balance_pairs: bool = True     # 是否保持各接触对的样本占比
 
     # 预紧
     preload_specs: List[Dict[str, str]] = field(default_factory=list)
@@ -110,8 +117,8 @@ class TrainerConfig:
     bcs: List[Dict[str, Any]] = field(default_factory=list)
 
     # 预紧力范围（N）
-    preload_min: float = 200.0
-    preload_max: float = 1000.0
+    preload_min: float = 500.0
+    preload_max: float = 2000.0
     preload_sequence: List[Any] = field(default_factory=list)
     preload_sequence_repeat: int = 1
     preload_sequence_shuffle: bool = False
@@ -180,6 +187,7 @@ class TrainerConfig:
     viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
+    viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
     save_best_on: str = "Pi"   # or "E_int"
 
 
@@ -204,6 +212,8 @@ class Trainer:
         self._last_preload_order: Optional[np.ndarray] = None
         self._last_preload_case: Optional[Dict[str, np.ndarray]] = None
         self._train_vars: List[tf.Variable] = []
+        self._contact_rar_cache: Optional[Dict[str, Any]] = None
+        self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
 
         if cfg.preload_sequence:
             sanitized: List[np.ndarray] = []
@@ -351,6 +361,7 @@ class Trainer:
         self.ckpt_manager = None
         self.best_metric = float("inf")
         self.last_viz_data_path: Optional[str] = None
+        self.last_viz_diag = None
 
         # —— 体检/调试可读
         self.X_vol = None
@@ -451,7 +462,7 @@ class Trainer:
             if val is None:
                 continue
             weight = weights.get(key, 0.0)
-            entries.append(f"{label}={val:.3e}(w={weight:.2f})")
+            entries.append(f"{label}={val:.3e}(w={weight:.3g})")
         return " ".join(entries)
 
     def _format_train_log_postfix(
@@ -496,19 +507,26 @@ class Trainer:
             stick_ratio = None
             slip_ratio = None
             mean_gap = None
-            if isinstance(stats, Mapping):
-                val = stats.get("n_pen_ratio")
-                if val is not None:
-                    pen_ratio = float(val.numpy())
-                val = stats.get("t_stick_ratio")
-                if val is not None:
-                    stick_ratio = float(val.numpy())
-                val = stats.get("t_slip_ratio")
-                if val is not None:
-                    slip_ratio = float(val.numpy())
-                val = stats.get("n_mean_gap")
-                if val is not None:
-                    mean_gap = float(val.numpy())
+
+            def _get_stat_float(*keys: str) -> Optional[float]:
+                if not isinstance(stats, Mapping):
+                    return None
+                for key in keys:
+                    val = stats.get(key)
+                    if val is None:
+                        continue
+                    try:
+                        if hasattr(val, "numpy"):
+                            return float(val.numpy())
+                        return float(val)
+                    except Exception:
+                        continue
+                return None
+
+            pen_ratio = _get_stat_float("n_pen_ratio", "cn_pen_ratio", "pen_ratio")
+            stick_ratio = _get_stat_float("t_stick_ratio", "stick_ratio")
+            slip_ratio = _get_stat_float("t_slip_ratio", "slip_ratio")
+            mean_gap = _get_stat_float("n_mean_gap", "cn_mean_gap", "mean_gap")
 
             grad_disp = f"grad={grad_val:.2e}"
             rel_pct = rel_pi * 100.0 if rel_pi is not None else None
@@ -1005,6 +1023,8 @@ class Trainer:
                     cat = cmap.concatenate()
                     self.contact = ContactOperator(cfg.contact_cfg)
                     self.contact.build_from_cat(cat, extra_weights=None, auto_orient=True)
+                    self._current_contact_cat = cat
+                    self._contact_rar_cache = None
                     total_pts = len(cmap)
                     src_txt = f"（{contact_source}）" if contact_source else ""
                     print(
@@ -1103,6 +1123,140 @@ class Trainer:
         )
         return total
 
+    # ----------------- Contact-driven RAR -----------------
+
+    def _update_contact_rar_cache(self):
+        """Cache残差信息，供下一次接触重采样时做重要性抽样。"""
+
+        if not self.cfg.contact_rar_enabled:
+            self._contact_rar_cache = None
+            return
+        if self.contact is None or self._current_contact_cat is None:
+            self._contact_rar_cache = None
+            return
+
+        metrics = self.contact.last_sample_metrics()
+        if not metrics:
+            self._contact_rar_cache = None
+            return
+
+        imp: Optional[np.ndarray] = None
+        if "gap" in metrics:
+            pen = np.maximum(-metrics["gap"], 0.0)
+            imp = pen
+        if "fric_res" in metrics:
+            fr = np.abs(metrics["fric_res"])
+            if imp is None:
+                imp = fr
+            else:
+                alpha = float(np.clip(self.cfg.contact_rar_fric_mix, 0.0, 1.0))
+                imp = (1.0 - alpha) * imp + alpha * fr
+
+        if imp is None or imp.size == 0:
+            self._contact_rar_cache = None
+            return
+
+        imp = np.where(np.isfinite(imp), imp, 0.0)
+        self._contact_rar_cache = {
+            "importance": imp,
+            "cat": self._current_contact_cat,
+            "meta": self.contact.last_meta(),
+        }
+
+    def _maybe_apply_contact_rar(
+        self, cat_uniform: Dict[str, np.ndarray], step_index: int
+    ) -> Tuple[Dict[str, np.ndarray], str]:
+        """
+        将上一批接触残差转化为重要性抽样，混合到本次接触样本中。
+
+        Returns
+        -------
+        cat_new : dict
+            可能重排/混合后的 contact cat。
+        note : str
+            用于进度条/日志的附加说明。
+        """
+
+        if (
+            not self.cfg.contact_rar_enabled
+            or self._contact_rar_cache is None
+            or self._contact_rar_cache.get("cat") is None
+        ):
+            return cat_uniform, ""
+
+        source_cat: Dict[str, np.ndarray] = self._contact_rar_cache.get("cat", {})
+        importance: Optional[np.ndarray] = self._contact_rar_cache.get("importance")
+        if importance is None or importance.shape[0] != source_cat.get("xs", np.zeros((0, 3))).shape[0]:
+            return cat_uniform, ""
+
+        total_n = int(cat_uniform.get("xs", np.zeros((0, 3))).shape[0])
+        if total_n == 0:
+            return cat_uniform, ""
+
+        rar_frac = float(np.clip(self.cfg.contact_rar_fraction, 0.0, 1.0))
+        min_uniform = int(np.round(total_n * np.clip(self.cfg.contact_rar_uniform_ratio, 0.0, 1.0)))
+        n_rar = int(np.round(total_n * rar_frac))
+        if n_rar + min_uniform > total_n:
+            n_rar = max(0, total_n - min_uniform)
+        n_uniform = max(0, total_n - n_rar)
+        if n_rar <= 0:
+            return cat_uniform, ""
+
+        temp = max(self.cfg.contact_rar_temperature, 1e-6)
+        weights = np.power(importance + self.cfg.contact_rar_floor, 1.0 / temp)
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        if float(weights.sum()) <= 0.0:
+            return cat_uniform, ""
+
+        rng = np.random.default_rng(self.cfg.contact_seed + step_index * 17)
+        pair_ids = None
+        meta = self._contact_rar_cache.get("meta") or {}
+        if meta:
+            pair_ids = meta.get("pair_id")
+        if pair_ids is None:
+            pair_ids = source_cat.get("pair_id")
+
+        rar_indices: List[int] = []
+        if self.cfg.contact_rar_balance_pairs and pair_ids is not None:
+            pair_ids = np.asarray(pair_ids).reshape(-1)
+            total_src = max(1, pair_ids.shape[0])
+            for pid in np.unique(pair_ids):
+                mask = pair_ids == pid
+                if not np.any(mask):
+                    continue
+                quota = int(np.round(n_rar * float(mask.sum()) / float(total_src)))
+                quota = max(1 if n_rar > 0 else 0, quota)
+                probs = weights[mask]
+                probs = probs / (probs.sum() + 1e-12)
+                candidates = np.flatnonzero(mask)
+                rar_indices.extend(list(rng.choice(candidates, size=quota, replace=True, p=probs)))
+            if len(rar_indices) > n_rar:
+                rar_indices = rar_indices[:n_rar]
+        else:
+            probs = weights / (weights.sum() + 1e-12)
+            rar_indices = list(rng.choice(weights.shape[0], size=n_rar, replace=True, p=probs))
+
+        if not rar_indices:
+            return cat_uniform, ""
+
+        rar_indices = np.asarray(rar_indices, dtype=np.int64)
+        if rar_indices.shape[0] < n_rar:
+            rar_indices = rng.choice(rar_indices, size=n_rar, replace=True)
+
+        uni_indices = np.arange(cat_uniform["xs"].shape[0])
+        if n_uniform < uni_indices.shape[0]:
+            uni_indices = rng.choice(uni_indices, size=n_uniform, replace=False)
+
+        cat_new: Dict[str, np.ndarray] = {}
+        for key, arr in cat_uniform.items():
+            src_arr = source_cat.get(key, arr)
+            rar_part = src_arr[rar_indices] if rar_indices.size > 0 else src_arr[:0]
+            uni_part = arr[uni_indices] if n_uniform > 0 else arr[:0]
+            cat_new[key] = np.concatenate([rar_part, uni_part], axis=0)
+
+        note = f"RAR {len(rar_indices)}/{total_n}"
+        return cat_new, note
+
     # 在 Trainer 类里新增/覆盖这个方法
     def _collect_trainable_variables(self):
         m = self.model
@@ -1194,15 +1348,36 @@ class Trainer:
             # 形状从 (feat_dim,) 变为 (1, feat_dim) 以适配 batch
             current_P_hat = stages_dict["P_hat"][stage_idx]
             current_P_hat = tf.reshape(current_P_hat, (1, -1))
-            
+
             # 2. 取出对应的物理力 P
             current_P = stages_dict["P"][stage_idx]
-            
+
             # 3. 构造真正喂给网络的字典，【显式包含 P_hat】
             params = {
                 "P": current_P,          # 物理计算用
                 "P_hat": current_P_hat,  # 网络输入用 (这就接通了顺序特征!)
             }
+
+            # 4. 传递顺序相关的特征（如 rank），确保物理项也能感知阶段信息
+            # 注意：不能直接用 `or` 连接 Tensor（布尔上下文会触发 ValueError）
+            if "stage_rank" in stages_dict:
+                stage_rank_tensor = stages_dict["stage_rank"]
+            elif "stage_rank" in params_full:
+                stage_rank_tensor = params_full["stage_rank"]
+            else:
+                stage_rank_tensor = None
+            if stage_rank_tensor is not None:
+                stage_rank_tensor = tf.convert_to_tensor(stage_rank_tensor)
+                if stage_rank_tensor.shape.rank == 2:
+                    params["stage_rank"] = stage_rank_tensor[stage_idx]
+                else:
+                    params["stage_rank"] = stage_rank_tensor
+
+            # 5. 保留原有的统计上下文（顺序、阶段数），便于日志/可视化
+            if "stage_order" in params_full:
+                params["stage_order"] = params_full["stage_order"]
+            if "stage_count" in params_full:
+                params["stage_count"] = params_full["stage_count"]
         else:
             params = params_full
         # ==================== 【修复补丁】结束 ====================
@@ -1431,6 +1606,7 @@ class Trainer:
                     contact_note = "跳过"
                     if self.contact is None:
                         contact_note = "跳过 (无接触体)"
+                        self._contact_rar_cache = None
                     else:
                         should_resample = step == 1
                         if not should_resample and self.cfg.resample_contact_every > 0:
@@ -1447,14 +1623,21 @@ class Trainer:
                                     base_seed=self.cfg.contact_seed,
                                     step_index=step,
                                 )
+                                cat_uniform = cmap.concatenate()
+                                cat, rar_note = self._maybe_apply_contact_rar(
+                                    cat_uniform, step
+                                )
                                 self.contact.reset_for_new_batch()
-                                cat = cmap.concatenate()
                                 self.contact.build_from_cat(
                                     cat, extra_weights=None, auto_orient=True
                                 )
+                                self._current_contact_cat = cat
                                 contact_note = f"更新 {len(cmap)} 点"
+                                if rar_note:
+                                    contact_note += f" | {rar_note}"
                             except Exception as exc:
                                 contact_note = "更新失败"
+                                self._contact_rar_cache = None
                                 print(f"[contact] 第 {step} 步接触重采样失败：{exc}")
                         else:
                             if self.cfg.resample_contact_every <= 0:
@@ -1480,6 +1663,7 @@ class Trainer:
                     P_np = preload_case["P"]
                     order_np = preload_case.get("order")
                     self._last_preload_case = copy.deepcopy(preload_case)
+                    self._update_contact_rar_cache()
                     pi_val = float(Pi.numpy())
                     if self._pi_baseline is None:
                         self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
@@ -1778,6 +1962,8 @@ class Trainer:
             else:
                 resolved_data_path = data_out_path
 
+        diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
+
         _, _, data_path = plot_mirror_deflection_by_name(
             self.asm,
             self.cfg.mirror_surface_name,
@@ -1797,8 +1983,11 @@ class Trainer:
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
+            diagnose_blanks=self.cfg.viz_diagnose_blanks,
+            diag_out=diag_out,
         )
 
+        self.last_viz_diag = diag_out.get("blank_check") if diag_out is not None else None
         self.last_viz_data_path = data_path
         if data_path:
             print(f"[viz] displacement data -> {data_path}")
@@ -1815,7 +2004,9 @@ class Trainer:
         if self.cfg.viz_write_data and out_path:
             data_path = os.path.splitext(out_path)[0] + ".txt"
 
-        return plot_mirror_deflection_by_name(
+        diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
+
+        result = plot_mirror_deflection_by_name(
             self.asm,
             bare,
             self.model.u_fn,
@@ -1833,7 +2024,13 @@ class Trainer:
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
             eval_batch_size=self.cfg.viz_eval_batch_size,
+            diagnose_blanks=self.cfg.viz_diagnose_blanks,
+            diag_out=diag_out,
         )
+
+        if diag_out is not None:
+            self.last_viz_diag = diag_out.get("blank_check")
+        return result
 
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
@@ -1881,8 +2078,15 @@ class Trainer:
 class _SavedModelModule(tf.Module):
     """TensorFlow module exposing the PINN forward pass for SavedModel export."""
 
-    def __init__(self, model: DisplacementModel, use_stages: bool,
-                 shift: float, scale: float, n_bolts: int):
+    @tf.autograph.experimental.do_not_convert
+    def __init__(
+        self,
+        model: DisplacementModel,
+        use_stages: bool,
+        shift: float,
+        scale: float = 1.0,
+        n_bolts: int = 3,
+    ):
         super().__init__(name="pinn_saved_model")
         # 1. 显式追踪子模块 (关键修复)
         # 将 DisplacementModel 的核心子层挂载到 self 上，确保 TF 能追踪到变量

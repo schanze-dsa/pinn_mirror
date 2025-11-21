@@ -96,6 +96,7 @@ class ContactOperator:
         self._built: bool = False
         self._N: int = 0
         self._step: int = 0
+        self._meta: Dict[str, np.ndarray] = {}
 
     # ---------- build per batch ----------
 
@@ -138,6 +139,8 @@ class ContactOperator:
         self._N = int(cat["xs"].shape[0])
         self._built = True
         self._step = 0
+        keep_keys = ["pair_id", "slave_tri_idx", "master_tri_idx", "w_area", "xs", "xm", "n", "t1", "t2"]
+        self._meta = {k: v for k, v in cat.items() if k in keep_keys}
 
     def reset_for_new_batch(self):
         """Clear internal state so you can rebuild with a new set of contact samples."""
@@ -146,6 +149,7 @@ class ContactOperator:
         self._built = False
         self._N = 0
         self._step = 0
+        self._meta = {}
 
     # ---------- energy & update ----------
 
@@ -206,6 +210,36 @@ class ContactOperator:
             self.friction.update_multipliers(u_fn, params)
 
         self._step += 1
+
+    # ---------- residual export (for adaptive sampling) ----------
+
+    def last_sample_metrics(self) -> Dict[str, np.ndarray]:
+        """
+        Return per-sample residual-like metrics from the latest energy call.
+
+        Useful for residual-adaptive resampling (RAR):
+            - "gap": raw normal gap g (negative => penetration)
+            - "fric_res": ||r_t|| or |s_t| depending on friction mode
+        If contact has not been evaluated since the last build/reset, returns empty dict.
+        """
+
+        metrics: Dict[str, np.ndarray] = {}
+        if getattr(self.normal, "_last_gap", None) is not None:
+            try:
+                metrics["gap"] = np.asarray(self.normal._last_gap.numpy()).reshape(-1)
+            except Exception:
+                pass
+        if getattr(self.friction, "_last_r_norm", None) is not None:
+            try:
+                metrics["fric_res"] = np.asarray(self.friction._last_r_norm.numpy()).reshape(-1)
+            except Exception:
+                pass
+        return metrics
+
+    def last_meta(self) -> Dict[str, np.ndarray]:
+        """Return shallow-copied metadata for the current batch of contact samples."""
+
+        return dict(self._meta)
 
     # ---------- schedules / setters ----------
 
