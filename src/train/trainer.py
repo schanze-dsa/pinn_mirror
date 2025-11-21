@@ -117,8 +117,8 @@ class TrainerConfig:
     bcs: List[Dict[str, Any]] = field(default_factory=list)
 
     # 预紧力范围（N）
-    preload_min: float = 200.0
-    preload_max: float = 1000.0
+    preload_min: float = 500.0
+    preload_max: float = 2000.0
     preload_sequence: List[Any] = field(default_factory=list)
     preload_sequence_repeat: int = 1
     preload_sequence_shuffle: bool = False
