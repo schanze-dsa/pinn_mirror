@@ -2063,8 +2063,15 @@ class Trainer:
 class _SavedModelModule(tf.Module):
     """TensorFlow module exposing the PINN forward pass for SavedModel export."""
 
-    def __init__(self, model: DisplacementModel, use_stages: bool,
-                 shift: float, scale: float, n_bolts: int):
+    @tf.autograph.experimental.do_not_convert
+    def __init__(
+        self,
+        model: DisplacementModel,
+        use_stages: bool,
+        shift: float,
+        scale: float = 1.0,
+        n_bolts: int = 3,
+    ):
         super().__init__(name="pinn_saved_model")
         # 1. 显式追踪子模块 (关键修复)
         # 将 DisplacementModel 的核心子层挂载到 self 上，确保 TF 能追踪到变量
