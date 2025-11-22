@@ -112,17 +112,25 @@ def _eval_surface_or_assembly(
     eval_batch_size: int,
     eval_scope: str,
 ):
-    """Evaluate displacements either on surface nodes only or on all assembly nodes.
+    """Evaluate displacements on the whole assembly, then slice out the surface.
+
+    To align与“全结构求解、只输出表面”需求，如果装配提供了全局节点，则始终先
+    对所有节点求解，再用表面节点索引提取对应位移；只有当装配缺少全局节点
+    表时，才退回到仅对表面节点求解。
 
     Returns ``(u_surface, eval_meta)`` where ``u_surface`` aligns with ``surface_points``
     and ``eval_meta`` optionally carries assembly-wide displacements to reuse.
     """
 
     scope_key = (eval_scope or "surface").strip().lower()
-    use_all = scope_key in {"all", "assembly", "global", "full"}
 
-    if not use_all or not getattr(asm, "nodes", None):
+    if not getattr(asm, "nodes", None):
         return _eval_displacement_batched(u_fn, params, surface_points, eval_batch_size), {}
+
+    if scope_key not in {"all", "assembly", "global", "full"}:
+        print(
+            f"[viz] eval_scope='{scope_key}' 被强制为 'assembly' 以对全结构求解后再切表面"
+        )
 
     # Evaluate over all assembly nodes once, then gather the surface subset.
     global_nid = np.array(sorted(asm.nodes.keys()), dtype=np.int64)
@@ -137,7 +145,7 @@ def _eval_surface_or_assembly(
     lookup = {int(n): u_all[i] for i, n in enumerate(global_nid)}
     u_surface = np.stack([lookup[int(n)] for n in surface_node_ids], axis=0)
 
-    return u_surface, {"global_nodes": global_nid, "u_all": u_all}
+    return u_surface, {"global_nodes": global_nid, "u_all": u_all, "requested_scope": scope_key}
 
 
 def _refine_surface_samples(X3D: np.ndarray,
@@ -579,9 +587,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle.
         refine_max_points   : Optional guardrail limiting the total evaluation points.
         eval_batch_size     : Batch size when querying ``u_fn`` for visualization.
-        eval_scope          : "surface" 仅对表面节点求位移；"assembly"/"all" 会先对装配中
-                              全部节点求解，再提取对应表面节点的结果（可能更耗时但结果
-                              与全局场保持一致）。
+        eval_scope          : 参数保留向后兼容；只要装配提供全局节点，就会强制对
+                              全部节点求解（"assembly"），再提取对应表面节点的结果。
+                              仅当缺少全局节点表时才退回“只评估表面节点”。
         diagnose_blanks     : If True, run a one-click diagnosis to pinpoint blank-region causes.
         auto_fill_blanks    : If True and coverage is low, rebuild a 2D triangulation to fill holes
                               based on boundary loops (keeps NaN/Inf masking).
@@ -616,8 +624,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
     )
     eval_scope_info = None
     if eval_meta:
+        effective_mode = "assembly"
         eval_scope_info = {
-            "mode": eval_scope_key,
+            "mode": effective_mode,
+            "requested": eval_meta.get("requested_scope", eval_scope_key),
             "global_node_count": int(eval_meta.get("global_nodes", np.array([])).shape[0]),
         }
     d_base = u_base @ n  # (Nu,) scalar deflection along global mirror normal
