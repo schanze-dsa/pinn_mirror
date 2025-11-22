@@ -145,7 +145,12 @@ def _eval_surface_or_assembly(
     lookup = {int(n): u_all[i] for i, n in enumerate(global_nid)}
     u_surface = np.stack([lookup[int(n)] for n in surface_node_ids], axis=0)
 
-    return u_surface, {"global_nodes": global_nid, "u_all": u_all, "requested_scope": scope_key}
+    return u_surface, {
+        "global_nodes": global_nid,
+        "global_xyz": global_xyz,
+        "u_all": u_all,
+        "requested_scope": scope_key,
+    }
 
 
 def _refine_surface_samples(X3D: np.ndarray,
@@ -546,6 +551,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            show: bool = False,
                            data_out_path: Optional[str] = "auto",
                            surface_mesh_out_path: Optional[str] = "auto",
+                           plot_full_structure: bool = False,
+                           full_structure_out_path: Optional[str] = "auto",
+                           full_structure_data_out_path: Optional[str] = None,
                            style: str = "smooth",
                            cmap: Optional[str] = None,
                            draw_wireframe: bool = False,
@@ -576,9 +584,19 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            (triangles only, no displacement). If "auto" and
                            ``out_path`` is provided, a ``*_surface.ply`` next to
                            the figure is written. Use ``None``/"none" to disable.
+        plot_full_structure  : If True and assembly nodes are available, also plot
+                           a displacement magnitude map for the whole assembly
+                           (scatter projected to the same best-fit plane).
+        full_structure_out_path : Path to write the full-structure displacement
+                           plot. If "auto" and ``out_path`` is provided, writes
+                           ``*_assembly.png`` next to the surface plot.
+        full_structure_data_out_path : Optional path to write the assembly-wide
+                           displacement samples (x,y,z,ux,uy,uz,|u|,u,v). If
+                           None, no extra dataset is written; if "auto" and
+                           ``out_path`` is provided, writes ``*_assembly.txt``.
         style            : "smooth" to render a Gouraud-shaded tripcolor map
-                           (Abaqus-like), "flat" for flat shading, or
-                           "contour" to use tricontourf as in the legacy
+                            (Abaqus-like), "flat" for flat shading, or
+                            "contour" to use tricontourf as in the legacy
                            implementation.
         cmap             : Optional matplotlib colormap name; defaults to
                            ``"turbo"`` for smooth/flat styles and
@@ -760,6 +778,88 @@ def plot_mirror_deflection(asm: AssemblyModel,
     else:
         title = title_prefix
     ax.set_title(title)
+
+    # Optional assembly-wide displacement map (scatter)
+    full_plot_path: Optional[Path] = None
+    full_data_path: Optional[Path] = None
+    if plot_full_structure and eval_meta:
+        g_nid = eval_meta.get("global_nodes")
+        g_xyz = eval_meta.get("global_xyz")
+        u_all = eval_meta.get("u_all")
+        if g_nid is not None and g_xyz is not None and u_all is not None:
+            resolved_full = full_structure_out_path
+            if isinstance(resolved_full, str):
+                key = resolved_full.strip().lower()
+                if key == "auto":
+                    resolved_full = (
+                        Path(out_path).with_stem(Path(out_path).stem + "_assembly")
+                        if out_path
+                        else None
+                    )
+                elif key in {"", "none"}:
+                    resolved_full = None
+                else:
+                    resolved_full = Path(resolved_full)
+            if isinstance(resolved_full, Path):
+                full_plot_path = resolved_full.with_suffix(".png")
+
+            resolved_full_data = full_structure_data_out_path
+            if isinstance(resolved_full_data, str):
+                key = resolved_full_data.strip().lower()
+                if key == "auto":
+                    resolved_full_data = (
+                        Path(out_path).with_stem(Path(out_path).stem + "_assembly").with_suffix(".txt")
+                        if out_path
+                        else None
+                    )
+                elif key in {"", "none"}:
+                    resolved_full_data = None
+                else:
+                    resolved_full_data = Path(resolved_full_data)
+
+            uv_all = _project_to_plane(g_xyz, c, e1, e2)
+            disp_mag = np.linalg.norm(u_all, axis=1)
+            disp_max = float(np.max(disp_mag)) if disp_mag.size else 0.0
+            norm_full = colors.Normalize(vmin=0.0, vmax=disp_max + 1e-16)
+            fig_full, ax_full = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
+            sc = ax_full.scatter(
+                uv_all[:, 0], uv_all[:, 1], c=disp_mag, cmap=cmap, norm=norm_full, s=6.0, alpha=0.9
+            )
+            cbar_full = fig_full.colorbar(sc, ax=ax_full, shrink=0.92, pad=0.02)
+            cbar_full.set_label(f"Displacement magnitude [{units}]")
+            ax_full.set_aspect("equal", adjustable="box")
+            ax_full.set_xlabel("u (best-fit plane)")
+            ax_full.set_ylabel("v (best-fit plane)")
+            title_full = f"{title_prefix}  |  Assembly displacement magnitude"
+            ax_full.set_title(title_full)
+
+            if isinstance(resolved_full, Path):
+                full_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig_full.savefig(full_plot_path, dpi=180)
+                print(f"[viz] assembly displacement -> {full_plot_path}")
+            if isinstance(resolved_full, Path) and show:
+                plt.show()
+            else:
+                plt.close(fig_full)
+
+            if isinstance(resolved_full_data, Path):
+                full_data_path = resolved_full_data
+                full_data_path.parent.mkdir(parents=True, exist_ok=True)
+                header = [
+                    "# Assembly-wide displacement samples exported by plot_mirror_deflection",
+                    f"# units={units} surface={surface_key}",
+                    f"# n_nodes={len(g_nid)}",  # type: ignore[arg-type]
+                    "# columns: node_id x y z u_x u_y u_z |u| u_plane v_plane",
+                ]
+                with full_data_path.open("w", encoding="utf-8") as fp:
+                    fp.write("\n".join(header) + "\n")
+                    for idx, nid in enumerate(g_nid):
+                        fp.write(
+                            f"{int(nid):10d} "
+                            f"{g_xyz[idx, 0]: .8f} {g_xyz[idx, 1]: .8f} {g_xyz[idx, 2]: .8f} "
+                            f"{u_all[idx, 0]: .8f} {u_all[idx, 1]: .8f} {u_all[idx, 2]: .8f} "
+                            f"{disp_mag[idx]: .8f} {uv_all[idx, 0]: .8f} {uv_all[idx, 1]: .8f}\n"
+                        )
 
     # Save / show
     data_path: Optional[Path] = None

@@ -185,6 +185,8 @@ class TrainerConfig:
     viz_draw_wireframe: bool = False
     viz_write_data: bool = True             # export displacement samples next to figure
     viz_write_surface_mesh: bool = True     # export reconstructed FE surface mesh next to figure
+    viz_plot_full_structure: bool = True    # 导出全装配的位移云图
+    viz_write_full_structure_data: bool = False  # 记录全装配位移数据
     viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
@@ -1971,6 +1973,12 @@ class Trainer:
         else:
             resolved_mesh_path = None
 
+        full_plot_enabled = bool(self.cfg.viz_plot_full_structure)
+        full_struct_out = "auto" if (full_plot_enabled and out_path) else None
+        full_struct_data = (
+            "auto" if (full_plot_enabled and self.cfg.viz_write_full_structure_data and out_path) else None
+        )
+
         diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
 
         _, _, data_path = plot_mirror_deflection_by_name(
@@ -1987,6 +1995,9 @@ class Trainer:
             show=show,
             data_out_path=resolved_data_path,
             surface_mesh_out_path=resolved_mesh_path,
+            plot_full_structure=full_plot_enabled,
+            full_structure_out_path=full_struct_out,
+            full_structure_data_out_path=full_struct_data,
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
@@ -2020,6 +2031,12 @@ class Trainer:
         if self.cfg.viz_write_surface_mesh and out_path:
             mesh_path = "auto"
 
+        full_plot_enabled = bool(self.cfg.viz_plot_full_structure)
+        full_struct_out = "auto" if (full_plot_enabled and out_path) else None
+        full_struct_data = (
+            "auto" if (full_plot_enabled and self.cfg.viz_write_full_structure_data and out_path) else None
+        )
+
         diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
 
         result = plot_mirror_deflection_by_name(
@@ -2035,6 +2052,9 @@ class Trainer:
             symmetric=self.cfg.viz_symmetric,
             data_out_path=data_path,
             surface_mesh_out_path=mesh_path,
+            plot_full_structure=full_plot_enabled,
+            full_structure_out_path=full_struct_out,
+            full_structure_data_out_path=full_struct_data,
             style=self.cfg.viz_style,
             cmap=self.cfg.viz_colormap,
             draw_wireframe=self.cfg.viz_draw_wireframe,
