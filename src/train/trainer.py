@@ -183,7 +183,8 @@ class TrainerConfig:
     viz_symmetric: bool = True              # keep color limits symmetric around 0
     viz_units: str = "mm"
     viz_draw_wireframe: bool = False
-    viz_surface_enabled: bool = False       # 是否渲染单一镜面云图
+    viz_surface_enabled: bool = True        # 是否渲染单一镜面云图
+    viz_surface_source: str = "part_top"    # "surface" 使用 INP 表面；"part_top" 优先用零件外表面上表面
     viz_write_data: bool = True             # export displacement samples next to figure
     viz_write_surface_mesh: bool = True     # export reconstructed FE surface mesh next to figure
     viz_plot_full_structure: bool = True    # 导出全装配（或指定零件）的位移云图
@@ -1991,6 +1992,7 @@ class Trainer:
             P_values=tuple(float(x) for x in P),
             out_path=out_path,
             render_surface=self.cfg.viz_surface_enabled,
+            surface_source=self.cfg.viz_surface_source,
             title_prefix=title,
             units=self.cfg.viz_units,
             levels=self.cfg.viz_levels,
@@ -2052,6 +2054,7 @@ class Trainer:
             P_values=tuple(float(x) for x in P.reshape(-1)),
             out_path=out_path,
             render_surface=self.cfg.viz_surface_enabled,
+            surface_source=self.cfg.viz_surface_source,
             title_prefix=title,
             units=self.cfg.viz_units,
             levels=self.cfg.viz_levels,

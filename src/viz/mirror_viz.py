@@ -219,7 +219,261 @@ def _refine_surface_samples(X3D: np.ndarray,
 from matplotlib import colors
 
 from inp_io.inp_parser import AssemblyModel
-from mesh.surface_utils import TriSurface, resolve_surface_to_tris, _fetch_xyz
+from mesh.surface_utils import (
+    TriSurface,
+    compute_tri_geometry,
+    resolve_surface_to_tris,
+    triangulate_part_boundary,
+    _fetch_xyz,
+)
+
+
+# -----------------------------
+# Diagnostics for blank regions
+# -----------------------------
+
+@dataclass
+class BlankRegionDiagnostics:
+    requested_subdiv: int
+    applied_subdiv: int
+    nonfinite_deflection: int
+    nonfinite_displacement: int
+    nonfinite_uv: int
+    tri_masked: int
+    tri_dropped: int
+    coverage_ratio_hull: float
+    coverage_ratio_envelope: float
+    n_boundary_loops: int
+    envelope_area: float
+    notes: List[str]
+    boundary_loops: List[List[int]]
+
+    def summary_lines(self) -> List[str]:
+        lines = [
+            f"[1] deflection NaN/Inf: {self.nonfinite_deflection}",
+            f"[2] displacement/UV NaN/Inf: disp={self.nonfinite_displacement}, uv={self.nonfinite_uv}",
+            f"[3] coverage (triangles / convex hull): {self.coverage_ratio_hull:.2%}",
+            f"[3b] coverage (triangles / boundary envelope): {self.coverage_ratio_envelope:.2%}  loops={self.n_boundary_loops}",
+            f"[4] refinement applied vs requested: {self.applied_subdiv} / {self.requested_subdiv}",
+            f"[5] triangulation masked/dropped: mask={self.tri_masked}, drop={self.tri_dropped}",
+            f"[6] additional notes: {'; '.join(self.notes) if self.notes else 'none'}",
+        ]
+        return lines
+
+    @property
+    def primary_cause(self) -> str:
+        if self.nonfinite_deflection > 0:
+            return "(1) 挠度中存在 NaN/Inf，绘图被掩码"
+        if self.nonfinite_displacement > 0 or self.nonfinite_uv > 0:
+            return "(2) 位移向量或投影坐标含 NaN/Inf，导致三角化异常"
+        if self.coverage_ratio_envelope < 0.80:
+            return "(3) 网格覆盖率低于 80%，几何存在孔洞/稀疏大三角形"
+        if self.coverage_ratio_hull < 0.75:
+            return "(3a) 凸包覆盖率低但边界覆盖正常，几何强凹或存在合法孔洞"
+        if self.applied_subdiv < self.requested_subdiv:
+            return "(4) 细分被 refine_max_points 裁剪，采样过于稀疏"
+        if self.tri_masked > 0 or self.tri_dropped > 0:
+            return "(5) 三角化阶段被掩码/丢弃，可能存在退化或重复点"
+        return "(6) 未发现明显异常，请检查输入数据或导出文件"
+
+
+def _convex_hull_area(points: np.ndarray) -> float:
+    """Compute 2D convex hull area via monotonic chain (no extra deps)."""
+
+    pts = np.unique(points, axis=0)
+    if pts.shape[0] < 3:
+        return 0.0
+
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: List[np.ndarray] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper: List[np.ndarray] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    hull = np.array(lower[:-1] + upper[:-1])
+    if hull.shape[0] < 3:
+        return 0.0
+    area = 0.0
+    for i in range(hull.shape[0]):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % hull.shape[0]]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+
+def _triangle_area_sum(points: np.ndarray, tris: np.ndarray) -> float:
+    if tris.size == 0:
+        return 0.0
+    p = points
+    t = tris
+    v1 = p[t[:, 1]] - p[t[:, 0]]
+    v2 = p[t[:, 2]] - p[t[:, 0]]
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    return float(np.sum(np.abs(cross)) * 0.5)
+
+
+def _collect_boundary_loops(tris: np.ndarray) -> List[List[int]]:
+    """Extract boundary loops (edges used exactly once) from a triangle list."""
+
+    edge_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    for a, b, c in tris:
+        edges = [(a, b), (b, c), (c, a)]
+        for e0, e1 in edges:
+            key = (e0, e1) if e0 <= e1 else (e1, e0)
+            edge_counts[key] += 1
+
+    boundary_edges = [e for e, cnt in edge_counts.items() if cnt == 1]
+    if not boundary_edges:
+        return []
+
+    adj: Dict[int, List[int]] = defaultdict(list)
+    for e0, e1 in boundary_edges:
+        adj[e0].append(e1)
+        adj[e1].append(e0)
+
+    visited_edges = set()
+    loops: List[List[int]] = []
+
+    def next_neighbor(cur: int, prev: Optional[int]) -> Optional[int]:
+        nbrs = adj[cur]
+        if not nbrs:
+            return None
+        if prev is None:
+            return nbrs[0]
+        for n in nbrs:
+            if n != prev:
+                return n
+        return nbrs[0]
+
+    for edge in boundary_edges:
+        if edge in visited_edges or (edge[1], edge[0]) in visited_edges:
+            continue
+        loop = []
+        start, nxt = edge
+        cur, prev = start, nxt
+        loop.append(cur)
+        while True:
+            visited_edges.add((cur, prev))
+            loop.append(prev)
+            nxt2 = next_neighbor(prev, cur)
+            if nxt2 is None:
+                break
+            cur, prev = prev, nxt2
+            if prev == loop[0]:
+                break
+        loops.append(loop)
+    return loops
+
+
+def _loop_area(points: np.ndarray, loop: List[int]) -> float:
+    if len(loop) < 3:
+        return 0.0
+    pts = points[np.asarray(loop, dtype=np.int64)]
+    area = 0.0
+    for i in range(len(loop)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(loop)]
+        area += x1 * y2 - x2 * y1
+    return 0.5 * area
+
+
+def _diagnose_blank_regions(
+    requested_subdiv: int,
+    applied_subdiv: int,
+    UV_plot: np.ndarray,
+    tri_plot: np.ndarray,
+    tri: Triangulation,
+    u_plot: np.ndarray,
+    d_plot: np.ndarray,
+    tri_mask: Optional[np.ndarray],
+) -> BlankRegionDiagnostics:
+
+    nonfinite_deflection = int((~np.isfinite(d_plot)).sum())
+    nonfinite_disp = int((~np.isfinite(u_plot)).sum())
+    nonfinite_uv = int((~np.isfinite(UV_plot)).sum())
+
+    tri_masked = int(np.count_nonzero(tri_mask)) if tri_mask is not None else 0
+    tri_dropped = int(max(0, tri_plot.shape[0] - getattr(tri, "triangles", tri_plot).shape[0]))
+
+    hull_area = _convex_hull_area(UV_plot)
+    tri_area = _triangle_area_sum(UV_plot, tri_plot)
+    coverage_ratio_hull = 0.0 if hull_area <= 0 else min(1.0, tri_area / hull_area)
+
+    boundary_loops = _collect_boundary_loops(tri_plot)
+    n_loops = len(boundary_loops)
+    loop_areas = [abs(_loop_area(UV_plot, loop)) for loop in boundary_loops]
+    envelope_area = float(sum(loop_areas)) if loop_areas else hull_area
+    if loop_areas:
+        # Treat the largest loop as the outer boundary; subtract smaller loops as holes when oriented oppositely
+        max_idx = int(np.argmax(loop_areas))
+        outer_area = loop_areas[max_idx]
+        hole_area = sum(loop_areas[:max_idx] + loop_areas[max_idx + 1:])
+        envelope_area = max(outer_area - hole_area, 0.0)
+
+    coverage_ratio_env = 0.0 if envelope_area <= 0 else min(1.0, tri_area / envelope_area)
+
+    notes: List[str] = []
+    if hull_area <= 0:
+        notes.append("投影凸包面积为 0，可能所有点共线或重复")
+    if tri_area <= 0:
+        notes.append("三角面积总和为 0，可能存在退化三角形")
+    if n_loops > 1:
+        notes.append(f"检测到 {n_loops} 条边界环，可能存在孔洞/不连通的补丁")
+    if coverage_ratio_env >= 0.9 and coverage_ratio_hull < 0.75:
+        notes.append("凸包面积显著大于边界包络，几何可能强凹但覆盖良好")
+
+    return BlankRegionDiagnostics(
+        requested_subdiv=requested_subdiv,
+        applied_subdiv=applied_subdiv,
+        nonfinite_deflection=nonfinite_deflection,
+        nonfinite_displacement=nonfinite_disp,
+        nonfinite_uv=nonfinite_uv,
+        tri_masked=tri_masked,
+        tri_dropped=tri_dropped,
+        coverage_ratio_hull=coverage_ratio_hull,
+        coverage_ratio_envelope=coverage_ratio_env,
+        n_boundary_loops=n_loops,
+        envelope_area=envelope_area,
+        notes=notes,
+        boundary_loops=boundary_loops,
+    )
+
+
+def _mask_tris_with_loops(tri: Triangulation, UV: np.ndarray, loops: List[List[int]]) -> np.ndarray:
+    """Return a mask for triangles outside the outer boundary or inside holes."""
+
+    if not loops:
+        return np.zeros(tri.triangles.shape[0], dtype=bool)
+
+    from matplotlib.path import Path
+
+    areas = [abs(_loop_area(UV, loop)) for loop in loops]
+    if not areas:
+        return np.zeros(tri.triangles.shape[0], dtype=bool)
+
+    outer_idx = int(np.argmax(areas))
+    outer_loop = loops[outer_idx]
+    hole_loops = [loop for i, loop in enumerate(loops) if i != outer_idx]
+
+    centroids = UV[tri.triangles].mean(axis=1)
+    mask = ~Path(UV[outer_loop]).contains_points(centroids)
+
+    for loop in hole_loops:
+        hole_path = Path(UV[loop])
+        mask |= hole_path.contains_points(centroids)
+
+    return mask
 
 
 # -----------------------------
@@ -571,6 +825,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            full_structure_out_path: Optional[str] = "auto",
                            full_structure_data_out_path: Optional[str] = None,
                            full_structure_part: Optional[str] = None,
+                           surface_source: str = "part_top",
                            style: str = "smooth",
                            cmap: Optional[str] = None,
                            draw_wireframe: bool = False,
@@ -604,13 +859,16 @@ def plot_mirror_deflection(asm: AssemblyModel,
         plot_full_structure  : If True and assembly nodes are available, also plot
                            a displacement magnitude map for the whole assembly
                            (scatter projected to the same best-fit plane).
-        full_structure_out_path : Path to write the full-structure displacement
+                           full_structure_out_path : Path to write the full-structure displacement
                            plot. If "auto" and ``out_path`` is provided, writes
                            ``*_assembly.png`` next to the surface plot.
         full_structure_data_out_path : Optional path to write the assembly-wide
                            displacement samples (x,y,z,ux,uy,uz,|u|,u,v). If
                            None, no extra dataset is written; if "auto" and
                            ``out_path`` is provided, writes ``*_assembly.txt``.
+        surface_source      : "surface" 使用 INP 表面；"part"/"part_top" 从目标零件
+                            的外边界三角化得到表面，"part_top" 只保留主导法向一致的
+                            外表面（便于提取镜面上表面环形云图）。
         style            : "smooth" to render a Gouraud-shaded tripcolor map
                             (Abaqus-like), "flat" for flat shading, or
                             "contour" to use tricontourf as in the legacy
@@ -635,8 +893,36 @@ def plot_mirror_deflection(asm: AssemblyModel,
         (fig, ax, data_path)
     """
     # 1) Triangulate surface & collect unique nodes
-    ts = resolve_surface_to_tris(asm, surface_key)
+    ts = resolve_surface_to_tris(asm, surface_key, log_summary=False)
+    source_key = (surface_source or "surface").strip().lower()
     part = asm.parts[ts.part_name]
+
+    # 如果指定了从零件外边界重建表面，则使用覆盖更完整的三角网格（可选仅保留主导法向）
+    if source_key in {"part", "part_top", "part_boundary"}:
+        rebuilt = triangulate_part_boundary(part, ts.part_name, log_summary=False)
+        if len(rebuilt) > 0:
+            if source_key == "part_top":
+                areas, normals, _ = compute_tri_geometry(part, rebuilt)
+                if areas.size:
+                    weighted = (areas[:, None] * normals).sum(axis=0)
+                    norm = float(np.linalg.norm(weighted))
+                    if norm > 0.0:
+                        n_dom = weighted / norm
+                        keep = (normals @ n_dom) > 0.2
+                        if not np.any(keep):
+                            keep = (normals @ n_dom) >= 0.0
+                        if np.any(keep):
+                            rebuilt = TriSurface(
+                                name=rebuilt.name,
+                                part_name=rebuilt.part_name,
+                                tri_node_ids=rebuilt.tri_node_ids[np.asarray(keep)],
+                                tri_elem_ids=rebuilt.tri_elem_ids[np.asarray(keep)],
+                                tri_face_labels=list(
+                                    np.asarray(rebuilt.tri_face_labels, dtype=object)[np.asarray(keep)]
+                                ),
+                            )
+            ts = rebuilt
+            part = asm.parts[ts.part_name]
 
     nid_unique, tri_idx = _unique_nodes_from_tris(ts)
     X3D = np.stack([part.nodes_xyz[int(n)] for n in nid_unique], axis=0).astype(np.float64)  # (Nu,3)
@@ -835,88 +1121,6 @@ def plot_mirror_deflection(asm: AssemblyModel,
                 if key == "auto":
                     resolved_full_data = (
                         _with_new_stem(Path(out_path), Path(out_path).stem + "_assembly").with_suffix(".txt")
-                        if out_path
-                        else None
-                    )
-                elif key in {"", "none"}:
-                    resolved_full_data = None
-                else:
-                    resolved_full_data = Path(resolved_full_data)
-
-            uv_all = _project_to_plane(g_xyz, c, e1, e2)
-            disp_mag = np.linalg.norm(u_all, axis=1)
-            disp_max = float(np.max(disp_mag)) if disp_mag.size else 0.0
-            norm_full = colors.Normalize(vmin=0.0, vmax=disp_max + 1e-16)
-            fig_full, ax_full = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
-            sc = ax_full.scatter(
-                uv_all[:, 0], uv_all[:, 1], c=disp_mag, cmap=cmap, norm=norm_full, s=6.0, alpha=0.9
-            )
-            cbar_full = fig_full.colorbar(sc, ax=ax_full, shrink=0.92, pad=0.02)
-            cbar_full.set_label(f"Displacement magnitude [{units}]")
-            ax_full.set_aspect("equal", adjustable="box")
-            ax_full.set_xlabel("u (best-fit plane)")
-            ax_full.set_ylabel("v (best-fit plane)")
-            title_full = f"{title_prefix}  |  Assembly displacement magnitude"
-            ax_full.set_title(title_full)
-
-            if isinstance(resolved_full, Path):
-                full_plot_path.parent.mkdir(parents=True, exist_ok=True)
-                fig_full.savefig(full_plot_path, dpi=180)
-                print(f"[viz] assembly displacement -> {full_plot_path}")
-            if isinstance(resolved_full, Path) and show:
-                plt.show()
-            else:
-                plt.close(fig_full)
-
-            if isinstance(resolved_full_data, Path):
-                full_data_path = resolved_full_data
-                full_data_path.parent.mkdir(parents=True, exist_ok=True)
-                header = [
-                    "# Assembly-wide displacement samples exported by plot_mirror_deflection",
-                    f"# units={units} surface={surface_key}",
-                    f"# n_nodes={len(g_nid)}",  # type: ignore[arg-type]
-                    "# columns: node_id x y z u_x u_y u_z |u| u_plane v_plane",
-                ]
-                with full_data_path.open("w", encoding="utf-8") as fp:
-                    fp.write("\n".join(header) + "\n")
-                    for idx, nid in enumerate(g_nid):
-                        fp.write(
-                            f"{int(nid):10d} "
-                            f"{g_xyz[idx, 0]: .8f} {g_xyz[idx, 1]: .8f} {g_xyz[idx, 2]: .8f} "
-                            f"{u_all[idx, 0]: .8f} {u_all[idx, 1]: .8f} {u_all[idx, 2]: .8f} "
-                            f"{disp_mag[idx]: .8f} {uv_all[idx, 0]: .8f} {uv_all[idx, 1]: .8f}\n"
-                        )
-
-    # Optional assembly-wide displacement map (scatter)
-    full_plot_path: Optional[Path] = None
-    full_data_path: Optional[Path] = None
-    if plot_full_structure and eval_meta:
-        g_nid = eval_meta.get("global_nodes")
-        g_xyz = eval_meta.get("global_xyz")
-        u_all = eval_meta.get("u_all")
-        if g_nid is not None and g_xyz is not None and u_all is not None:
-            resolved_full = full_structure_out_path
-            if isinstance(resolved_full, str):
-                key = resolved_full.strip().lower()
-                if key == "auto":
-                    resolved_full = (
-                        Path(out_path).with_stem(Path(out_path).stem + "_assembly")
-                        if out_path
-                        else None
-                    )
-                elif key in {"", "none"}:
-                    resolved_full = None
-                else:
-                    resolved_full = Path(resolved_full)
-            if isinstance(resolved_full, Path):
-                full_plot_path = resolved_full.with_suffix(".png")
-
-            resolved_full_data = full_structure_data_out_path
-            if isinstance(resolved_full_data, str):
-                key = resolved_full_data.strip().lower()
-                if key == "auto":
-                    resolved_full_data = (
-                        Path(out_path).with_stem(Path(out_path).stem + "_assembly").with_suffix(".txt")
                         if out_path
                         else None
                     )
