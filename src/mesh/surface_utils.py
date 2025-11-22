@@ -338,9 +338,15 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str, log_summary: b
             face_map = C3D10_FACES
         if face_map is None:
             return []
+        conn_list = list(conn)
+        if len(conn_list) == 0:
+            return []
         out: List[Tuple[str, Tuple[int, ...]]] = []
         for lbl, idxs in face_map.items():
-            out.append((lbl, tuple(conn[i - 1] for i in idxs)))
+            max_idx = max(idxs)
+            if len(conn_list) < max_idx:
+                continue
+            out.append((lbl, tuple(conn_list[i - 1] for i in idxs)))
         return out
 
     def _face_area(face_nodes: Tuple[int, ...], part_or_asm) -> float:
@@ -445,9 +451,15 @@ def triangulate_part_boundary(part, part_name: str, log_summary: bool = False) -
             face_map = C3D10_FACES
         if face_map is None:
             return []
+        conn_list = list(conn)
+        if len(conn_list) == 0:
+            return []
         out: List[Tuple[str, Tuple[int, ...]]] = []
         for lbl, idxs in face_map.items():
-            out.append((lbl, tuple(conn[i - 1] for i in idxs)))
+            max_idx = max(idxs)
+            if len(conn_list) < max_idx:
+                continue
+            out.append((lbl, tuple(conn_list[i - 1] for i in idxs)))
         return out
 
     face_hits: Dict[Tuple[int, ...], int] = {}
