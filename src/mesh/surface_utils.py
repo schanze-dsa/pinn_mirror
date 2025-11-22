@@ -18,7 +18,7 @@ Key updates in this revision:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Iterable
 import numpy as np
 
 # Parsed structures
@@ -195,6 +195,7 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str) -> TriSurface:
 
     skipped_types: Dict[str, int] = {}
     added_types: Dict[str, int] = {}
+    missing_tokens: int = 0
 
     def _emit_tris_from_face(face_nodes: Tuple[int, ...]):
         """Triangulate faces with 3, 4, or 6 nodes (with mid-edge nodes)."""
@@ -258,6 +259,7 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str) -> TriSurface:
         if eid is not None:
             info = elem_index.get(eid)
             if not info:
+                missing_tokens += 1
                 continue
             etype, conn, owner = info
             _add_face_as_tris(eid, face_label, etype, conn, owner)
@@ -284,6 +286,7 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str) -> TriSurface:
         for eid2 in eids:
             info = elem_index.get(int(eid2))
             if not info:
+                missing_tokens += 1
                 continue
             etype, conn, owner = info
             _add_face_as_tris(int(eid2), face_label, etype, conn, owner)
@@ -313,6 +316,96 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str) -> TriSurface:
     if added_types:
         summary = ", ".join([f"{k}: {v} tris" for k, v in sorted(added_types.items())])
         print(f"[surface] '{sdef.name}' triangulated element faces -> {summary}")
+    if missing_tokens:
+        print(
+            f"[surface] '{sdef.name}' tokens not found in element index -> {missing_tokens} "
+            "(check surface items/ELSET scope)"
+        )
+
+    # Optional: estimate how much of the owning part's boundary this surface covers
+    def _enumerate_faces(etype: str, conn: Iterable[int]) -> List[Tuple[str, Tuple[int, ...]]]:
+        et = etype.upper()
+        face_map = None
+        if et == "C3D4":
+            face_map = C3D4_FACES
+        elif et == "C3D8":
+            face_map = C3D8_FACES
+        elif et == "C3D6":
+            face_map = C3D6_FACES
+        elif et == "C3D10":
+            face_map = C3D10_FACES
+        if face_map is None:
+            return []
+        out: List[Tuple[str, Tuple[int, ...]]] = []
+        for lbl, idxs in face_map.items():
+            out.append((lbl, tuple(conn[i - 1] for i in idxs)))
+        return out
+
+    def _face_area(face_nodes: Tuple[int, ...], part_or_asm) -> float:
+        if len(face_nodes) == 3:
+            xyz = _fetch_xyz(part_or_asm, np.asarray(face_nodes))
+            return 0.5 * np.linalg.norm(np.cross(xyz[1] - xyz[0], xyz[2] - xyz[0]))
+        if len(face_nodes) == 4:
+            a, b, c, d = face_nodes
+            xyz = _fetch_xyz(part_or_asm, np.asarray([a, b, c, d]))
+            area1 = 0.5 * np.linalg.norm(np.cross(xyz[1] - xyz[0], xyz[2] - xyz[0]))
+            area2 = 0.5 * np.linalg.norm(np.cross(xyz[2] - xyz[0], xyz[3] - xyz[0]))
+            return area1 + area2
+        if len(face_nodes) == 6:
+            a, b, c, ab, bc, ac = face_nodes
+            xyz = _fetch_xyz(part_or_asm, np.asarray([a, b, c, ab, bc, ac]))
+            # split into 4 tris consistent with _emit_tris_from_face
+            def tri(i0, i1, i2):
+                return 0.5 * np.linalg.norm(np.cross(xyz[i1] - xyz[i0], xyz[i2] - xyz[i0]))
+            return tri(0, 3, 5) + tri(3, 1, 4) + tri(5, 4, 2) + tri(3, 4, 5)
+        return 0.0
+
+    if ts_part_name != "_ASM_" and ts_part_name in asm.parts:
+        part = asm.parts[ts_part_name]
+        boundary_faces: Dict[Tuple[int, ...], Tuple[str, str]] = {}
+        face_hits: Dict[Tuple[int, ...], int] = {}
+        # gather boundary faces (only supported types) by counting shared faces
+        for blk in part.element_blocks:
+            et = (blk.elem_type or "").upper()
+            faces = []
+            for conn in blk.connectivity:
+                faces.extend(_enumerate_faces(et, conn))
+            for lbl, nodes in faces:
+                if not nodes:
+                    continue
+                key = tuple(sorted(nodes))
+                boundary_faces[key] = (et, lbl)
+                face_hits[key] = face_hits.get(key, 0) + 1
+
+        # keep only faces that are unique (on the exterior)
+        exterior_faces = {k: v for k, v in boundary_faces.items() if face_hits.get(k, 0) == 1}
+        # total boundary area using supported faces
+        boundary_area = 0.0
+        for nodes in exterior_faces:
+            boundary_area += _face_area(tuple(nodes), part)
+
+        surface_area = compute_tri_geometry(part, TriSurface(
+            name=sdef.name,
+            part_name=ts_part_name,
+            tri_node_ids=tri_node_ids,
+            tri_elem_ids=tri_elem_ids,
+            tri_face_labels=tri_labels,
+        ))[0].sum()
+
+        if boundary_area > 0:
+            coverage = 100.0 * surface_area / boundary_area
+            print(
+                f"[surface] '{sdef.name}' coverage vs outer boundary (part '{ts_part_name}', supported types): "
+                f"{coverage:.2f}% (surface area={surface_area:.3f}, boundary area={boundary_area:.3f})"
+            )
+        else:
+            print(
+                f"[surface] '{sdef.name}' boundary coverage check skipped (part '{ts_part_name}' has no supported faces)"
+            )
+    elif ts_part_name == "_ASM_":
+        print(
+            f"[surface] '{sdef.name}' boundary coverage check skipped (assembly-scope mix of parts; run per-part check if needed)"
+        )
 
     return TriSurface(
         name=sdef.name,
