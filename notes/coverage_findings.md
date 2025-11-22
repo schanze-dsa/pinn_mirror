@@ -7,6 +7,7 @@
 ## Implications
 - Because the coverage ratio is computed from the area of the triangulated faces relative to the projected surface boundary, a ~37% ratio means the surface definition delivered to the visualizer contains significantly fewer faces than the full annulus geometry.
 - Since no element types were skipped, the shortfall likely comes from the surface definition itself (e.g., the ABAQUS surface set contains only a subset of the intended faces, or only some instances), rather than from missing element-type support in the triangulation code.
+- No evidence of duplicate/overlapping elements has shown up so far (no masked/dropped triangles, no negative-area diagnostics), so current logs still point to “missing faces” rather than “faces present but hidden due to overlap/flip”.
 
 ## What to check next (no code changes)
 - Verify the ABAQUS surface definition for `MIRROR up` actually includes all top faces of the annulus and is scoped at the assembly level if multiple instances are present.
