@@ -887,6 +887,88 @@ def plot_mirror_deflection(asm: AssemblyModel,
                             f"{disp_mag[idx]: .8f} {uv_all[idx, 0]: .8f} {uv_all[idx, 1]: .8f}\n"
                         )
 
+    # Optional assembly-wide displacement map (scatter)
+    full_plot_path: Optional[Path] = None
+    full_data_path: Optional[Path] = None
+    if plot_full_structure and eval_meta:
+        g_nid = eval_meta.get("global_nodes")
+        g_xyz = eval_meta.get("global_xyz")
+        u_all = eval_meta.get("u_all")
+        if g_nid is not None and g_xyz is not None and u_all is not None:
+            resolved_full = full_structure_out_path
+            if isinstance(resolved_full, str):
+                key = resolved_full.strip().lower()
+                if key == "auto":
+                    resolved_full = (
+                        Path(out_path).with_stem(Path(out_path).stem + "_assembly")
+                        if out_path
+                        else None
+                    )
+                elif key in {"", "none"}:
+                    resolved_full = None
+                else:
+                    resolved_full = Path(resolved_full)
+            if isinstance(resolved_full, Path):
+                full_plot_path = resolved_full.with_suffix(".png")
+
+            resolved_full_data = full_structure_data_out_path
+            if isinstance(resolved_full_data, str):
+                key = resolved_full_data.strip().lower()
+                if key == "auto":
+                    resolved_full_data = (
+                        Path(out_path).with_stem(Path(out_path).stem + "_assembly").with_suffix(".txt")
+                        if out_path
+                        else None
+                    )
+                elif key in {"", "none"}:
+                    resolved_full_data = None
+                else:
+                    resolved_full_data = Path(resolved_full_data)
+
+            uv_all = _project_to_plane(g_xyz, c, e1, e2)
+            disp_mag = np.linalg.norm(u_all, axis=1)
+            disp_max = float(np.max(disp_mag)) if disp_mag.size else 0.0
+            norm_full = colors.Normalize(vmin=0.0, vmax=disp_max + 1e-16)
+            fig_full, ax_full = plt.subplots(figsize=(7.8, 6.8), constrained_layout=True)
+            sc = ax_full.scatter(
+                uv_all[:, 0], uv_all[:, 1], c=disp_mag, cmap=cmap, norm=norm_full, s=6.0, alpha=0.9
+            )
+            cbar_full = fig_full.colorbar(sc, ax=ax_full, shrink=0.92, pad=0.02)
+            cbar_full.set_label(f"Displacement magnitude [{units}]")
+            ax_full.set_aspect("equal", adjustable="box")
+            ax_full.set_xlabel("u (best-fit plane)")
+            ax_full.set_ylabel("v (best-fit plane)")
+            title_full = f"{title_prefix}  |  Assembly displacement magnitude"
+            ax_full.set_title(title_full)
+
+            if isinstance(resolved_full, Path):
+                full_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig_full.savefig(full_plot_path, dpi=180)
+                print(f"[viz] assembly displacement -> {full_plot_path}")
+            if isinstance(resolved_full, Path) and show:
+                plt.show()
+            else:
+                plt.close(fig_full)
+
+            if isinstance(resolved_full_data, Path):
+                full_data_path = resolved_full_data
+                full_data_path.parent.mkdir(parents=True, exist_ok=True)
+                header = [
+                    "# Assembly-wide displacement samples exported by plot_mirror_deflection",
+                    f"# units={units} surface={surface_key}",
+                    f"# n_nodes={len(g_nid)}",  # type: ignore[arg-type]
+                    "# columns: node_id x y z u_x u_y u_z |u| u_plane v_plane",
+                ]
+                with full_data_path.open("w", encoding="utf-8") as fp:
+                    fp.write("\n".join(header) + "\n")
+                    for idx, nid in enumerate(g_nid):
+                        fp.write(
+                            f"{int(nid):10d} "
+                            f"{g_xyz[idx, 0]: .8f} {g_xyz[idx, 1]: .8f} {g_xyz[idx, 2]: .8f} "
+                            f"{u_all[idx, 0]: .8f} {u_all[idx, 1]: .8f} {u_all[idx, 2]: .8f} "
+                            f"{disp_mag[idx]: .8f} {uv_all[idx, 0]: .8f} {uv_all[idx, 1]: .8f}\n"
+                        )
+
     # Save / show
     data_path: Optional[Path] = None
     if render_surface:
