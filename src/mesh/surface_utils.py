@@ -119,7 +119,24 @@ C3D4_FACES = {
     "S4": (1, 3, 2),
 }
 
-SUPPORTED_TYPES = {"C3D8", "C3D4"}
+# 6-node wedge
+C3D6_FACES = {
+    "S1": (1, 2, 3),          # triangular faces (bottom)
+    "S2": (4, 5, 6),          # top
+    "S3": (1, 2, 5, 4),       # quads -> split into 2 tris
+    "S4": (2, 3, 6, 5),
+    "S5": (3, 1, 4, 6),
+}
+
+# 10-node tetra (corner + mid-edge nodes). We keep mid-nodes so coverage matches curved faces.
+C3D10_FACES = {
+    "S1": (1, 2, 3, 5, 6, 7),   # face opposite node 4
+    "S2": (1, 4, 2, 8, 9, 5),
+    "S3": (2, 4, 3, 9, 10, 6),
+    "S4": (3, 4, 1, 10, 8, 7),
+}
+
+SUPPORTED_TYPES = {"C3D8", "C3D4", "C3D6", "C3D10"}
 
 
 # -----------------------------
@@ -176,28 +193,53 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str) -> TriSurface:
     tri_labels: List[str] = []
     owner_votes: Dict[str, int] = {}
 
+    skipped_types: Dict[str, int] = {}
+    added_types: Dict[str, int] = {}
+
+    def _emit_tris_from_face(face_nodes: Tuple[int, ...]):
+        """Triangulate faces with 3, 4, or 6 nodes (with mid-edge nodes)."""
+        if len(face_nodes) == 3:
+            tri_nodes.append((face_nodes[0], face_nodes[1], face_nodes[2]))
+            return 1
+        if len(face_nodes) == 4:
+            tri_nodes.append((face_nodes[0], face_nodes[1], face_nodes[2]))
+            tri_nodes.append((face_nodes[0], face_nodes[2], face_nodes[3]))
+            return 2
+        if len(face_nodes) == 6:
+            a, b, c, ab, bc, ac = face_nodes
+            tri_nodes.append((a, ab, ac))
+            tri_nodes.append((ab, b, bc))
+            tri_nodes.append((ac, bc, c))
+            tri_nodes.append((ab, bc, ac))
+            return 4
+        return 0
+
     def _add_face_as_tris(eid: int, face_label: str, etype: str, conn: List[int], owner: str):
         et = etype.upper()
         if et not in SUPPORTED_TYPES:
+            skipped_types[et] = skipped_types.get(et, 0) + 1
             return
+
+        face: Optional[Tuple[int, ...]] = None
         if et == "C3D4":
             face = C3D4_FACES.get(face_label)
-            if not face:
-                return
-            n = [conn[i - 1] for i in face]
-            tri_nodes.append((n[0], n[1], n[2]))
-            tri_eids.append(eid)
-            tri_labels.append(face_label)
         elif et == "C3D8":
             face = C3D8_FACES.get(face_label)
-            if not face:
-                return
-            q = [conn[i - 1] for i in face]
-            tri_nodes.append((q[0], q[1], q[2]))
-            tri_nodes.append((q[0], q[2], q[3]))
-            tri_eids.extend([eid, eid])
-            tri_labels.extend([face_label, face_label])
+        elif et == "C3D6":
+            face = C3D6_FACES.get(face_label)
+        elif et == "C3D10":
+            face = C3D10_FACES.get(face_label)
+
+        if not face:
+            return
+        node_ids = tuple(conn[i - 1] for i in face)
+        n_tris = _emit_tris_from_face(node_ids)
+        if n_tris == 0:
+            return
+        tri_eids.extend([eid] * n_tris)
+        tri_labels.extend([face_label] * n_tris)
         owner_votes[owner] = owner_votes.get(owner, 0) + 1
+        added_types[et] = added_types.get(et, 0) + n_tris
 
     # 3) Iterate items
     for token, face in sdef.items:
@@ -263,6 +305,14 @@ def resolve_surface_to_tris(asm: AssemblyModel, surface_key: str) -> TriSurface:
 
     tri_node_ids = np.asarray(tri_nodes, dtype=np.int64)
     tri_elem_ids = np.asarray(tri_eids, dtype=np.int64)
+
+    # emit a quick summary so users can see if unsupported element types caused coverage loss
+    if skipped_types:
+        summary = ", ".join([f"{k}: {v}" for k, v in sorted(skipped_types.items())])
+        print(f"[surface] '{sdef.name}' skipped unsupported element types -> {summary}")
+    if added_types:
+        summary = ", ".join([f"{k}: {v} tris" for k, v in sorted(added_types.items())])
+        print(f"[surface] '{sdef.name}' triangulated element faces -> {summary}")
 
     return TriSurface(
         name=sdef.name,
