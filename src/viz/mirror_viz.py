@@ -750,6 +750,11 @@ def plot_mirror_deflection(asm: AssemblyModel,
     # Detect invalid predictions that will render as holes
     nonfinite_mask = ~np.isfinite(d_plot)
     tri_mask = None
+    finite_mask = ~nonfinite_mask
+    if not np.any(finite_mask):
+        print("[viz] error: all displacement magnitudes are non-finite; skip plotting.")
+        return None, None, None
+
     if np.any(nonfinite_mask):
         bad = int(nonfinite_mask.sum())
         frac = bad / float(d_plot.size)
@@ -757,6 +762,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
             f"[viz] Warning: {bad}/{d_plot.size} displacement-magnitude samples are NaN/Inf "
             f"({frac:.2%}); affected triangles will appear blank."
         )
+
+    # Use finite values for scaling/plotting to avoid matplotlib errors
+    d_plot_clean = np.array(d_plot, copy=True)
+    d_plot_clean[nonfinite_mask] = 0.0
 
     # 4) Triangulation in 2D (optionally rebuild to close holes)
     boundary_loops = _collect_boundary_loops(tri_plot)
@@ -822,19 +831,20 @@ def plot_mirror_deflection(asm: AssemblyModel,
         default_cmap = "turbo"
         cmap = cmap or default_cmap
 
-        vmax = float(np.max(np.abs(d_plot))) + 1e-16 if symmetric else float(np.max(d_plot))
-        vmin = -vmax if symmetric else float(np.min(d_plot))
+        finite_vals = d_plot[finite_mask]
+        vmax = float(np.max(np.abs(finite_vals))) + 1e-16 if symmetric else float(np.max(finite_vals))
+        vmin = -vmax if symmetric else float(np.min(finite_vals))
 
         if style_key == "contour":
             contour_kwargs = {"levels": levels, "cmap": cmap}
             if symmetric:
                 contour_kwargs.update(vmin=vmin, vmax=vmax)
-            cs = ax.tricontourf(tri, d_plot, **contour_kwargs)
+            cs = ax.tricontourf(tri, d_plot_clean, **contour_kwargs)
         else:
             norm = colors.Normalize(vmin=vmin, vmax=vmax)
             shading = "gouraud" if style_key == "smooth" else "flat"
             cs = ax.tripcolor(
-                tri, d_plot, shading=shading, cmap=cmap, norm=norm, edgecolors="none"
+                tri, d_plot_clean, shading=shading, cmap=cmap, norm=norm, edgecolors="none"
             )
 
         if draw_wireframe:
