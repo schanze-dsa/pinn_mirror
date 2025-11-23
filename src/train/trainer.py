@@ -1334,65 +1334,20 @@ class Trainer:
         loss = Pi + reg
         return loss, Pi, parts, stats
 
-   # 请用此代码完全覆盖 src/train/trainer.py 中的 _train_step 方法
+    # 请用此代码完全覆盖 src/train/trainer.py 中的 _train_step 方法
     def _train_step(self, total, preload_case: Dict[str, np.ndarray]):
         model = self.model
         opt = self.optimizer
         train_vars = self._collect_trainable_variables()
 
         # 1. 生成完整参数 (包含 stages 字典)
-        params_full = self._make_preload_params(preload_case)
+        params = self._make_preload_params(preload_case)
 
-        # ==================== 【修复补丁】开始 ====================
-        # 逻辑：随机抽取一个阶段，并将特征 P_hat 显式注入到 params 中
-        if self.cfg.preload_use_stages and "stages" in params_full:
-            stages_dict = params_full["stages"]
-            # 获取阶段总数 (例如 3)
-            n_stages = tf.shape(stages_dict["P"])[0]
-            
-            # 随机选一个索引 (0, 1, 2 ...)
-            stage_idx = tf.random.uniform(shape=[], minval=0, maxval=n_stages, dtype=tf.int32)
-            
-            # 1. 取出对应的特征 P_hat (包含 P + Mask + Rank)
-            # 形状从 (feat_dim,) 变为 (1, feat_dim) 以适配 batch
-            current_P_hat = stages_dict["P_hat"][stage_idx]
-            current_P_hat = tf.reshape(current_P_hat, (1, -1))
-
-            # 2. 取出对应的物理力 P
-            current_P = stages_dict["P"][stage_idx]
-
-            # 3. 构造真正喂给网络的字典，【显式包含 P_hat】
-            params = {
-                "P": current_P,          # 物理计算用
-                "P_hat": current_P_hat,  # 网络输入用 (这就接通了顺序特征!)
-            }
-
-            # 4. 传递顺序相关的特征（如 rank），确保物理项也能感知阶段信息
-            # 注意：不能直接用 `or` 连接 Tensor（布尔上下文会触发 ValueError）
-            if "stage_rank" in stages_dict:
-                stage_rank_tensor = stages_dict["stage_rank"]
-            elif "stage_rank" in params_full:
-                stage_rank_tensor = params_full["stage_rank"]
-            else:
-                stage_rank_tensor = None
-            if stage_rank_tensor is not None:
-                stage_rank_tensor = tf.convert_to_tensor(stage_rank_tensor)
-                if stage_rank_tensor.shape.rank == 2:
-                    params["stage_rank"] = stage_rank_tensor[stage_idx]
-                else:
-                    params["stage_rank"] = stage_rank_tensor
-
-            # 5. 保留原有的统计上下文（顺序、阶段数），便于日志/可视化
-            if "stage_order" in params_full:
-                params["stage_order"] = params_full["stage_order"]
-            if "stage_count" in params_full:
-                params["stage_count"] = params_full["stage_count"]
-        else:
-            params = params_full
-        # ==================== 【修复补丁】结束 ====================
+        # 保持完整的阶段序列传入 total.energy，这样弹性/接触/预紧都会按 tighten 顺序逐
+        # 阶段累积，不再随机抽取单一阶段，避免顺序信息被丢弃。
 
         with tf.GradientTape() as tape:
-            # 现在 params 里有 P_hat，模型就能看到 Mask 和 Rank 了
+            # params 中保留了阶段序列（含 P_hat/顺序特征），总能量会按顺序累加
             loss, Pi, parts, stats = self._compute_total_loss(total, params, adaptive=True)
 
             use_loss_scale = hasattr(opt, "get_scaled_loss")
