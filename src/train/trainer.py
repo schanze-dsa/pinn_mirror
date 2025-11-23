@@ -190,6 +190,7 @@ class TrainerConfig:
     viz_plot_full_structure: bool = False   # 导出全装配（或指定零件）的位移云图
     viz_full_structure_part: Optional[str] = "mirror1"  # None -> 全装配
     viz_write_full_structure_data: bool = False  # 记录全装配位移数据
+    viz_retriangulate_2d: bool = False      # 兼容旧配置的占位符，不再使用
     viz_refine_subdivisions: int = 2        # 细分表面三角形以平滑云图
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
