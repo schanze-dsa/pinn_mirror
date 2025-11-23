@@ -583,7 +583,6 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            draw_wireframe: bool = False,
                            refine_subdivisions: int = 0,
                            refine_max_points: Optional[int] = None,
-                           retriangulate_2d: bool = True,
                            eval_batch_size: int = 65_536,
                            eval_scope: str = "assembly",
                            diagnose_blanks: bool = False,
@@ -750,11 +749,6 @@ def plot_mirror_deflection(asm: AssemblyModel,
     # Detect invalid predictions that will render as holes
     nonfinite_mask = ~np.isfinite(d_plot)
     tri_mask = None
-    finite_mask = ~nonfinite_mask
-    if not np.any(finite_mask):
-        print("[viz] error: all displacement magnitudes are non-finite; skip plotting.")
-        return None, None, None
-
     if np.any(nonfinite_mask):
         bad = int(nonfinite_mask.sum())
         frac = bad / float(d_plot.size)
@@ -762,37 +756,12 @@ def plot_mirror_deflection(asm: AssemblyModel,
             f"[viz] Warning: {bad}/{d_plot.size} displacement-magnitude samples are NaN/Inf "
             f"({frac:.2%}); affected triangles will appear blank."
         )
+        tri_mask = np.any(nonfinite_mask[tri_plot], axis=1)
 
-    # Use finite values for scaling/plotting to avoid matplotlib errors
-    # (Matplotlib will raise if any non-finite values remain inside the
-    # triangulation, even when a mask is provided.)
-    d_plot_clean = np.array(d_plot, copy=True)
-    if np.any(nonfinite_mask):
-        d_plot_clean[nonfinite_mask] = 0.0
-    if not np.isfinite(d_plot_clean).all():
-        bad_left = ~np.isfinite(d_plot_clean)
-        print(
-            f"[viz] Warning: sanitizing {int(bad_left.sum())} residual non-finite "
-            "magnitudes before plotting."
-        )
-        d_plot_clean = np.nan_to_num(d_plot_clean, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # 4) Triangulation in 2D (optionally rebuild to close holes)
-    boundary_loops = _collect_boundary_loops(tri_plot)
-    if retriangulate_2d:
-        tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1])
-        if boundary_loops:
-            boundary_mask = _mask_tris_with_loops(tri, UV_plot, boundary_loops)
-            if np.any(boundary_mask):
-                tri.set_mask(boundary_mask)
-        tri_plot = tri.triangles.astype(np.int32)
-    else:
-        tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1], tri_plot)
-
-    if np.any(nonfinite_mask):
-        tri_mask = np.any(nonfinite_mask[tri.triangles], axis=1)
-        if np.any(tri_mask):
-            tri.set_mask(tri_mask)
+    # 4) Triangulation in 2D
+    tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1], tri_plot)
+    if tri_mask is not None and np.any(tri_mask):
+        tri.set_mask(tri_mask)
 
     diag_result: Optional[BlankRegionDiagnostics] = None
     if render_surface and diagnose_blanks:
@@ -841,20 +810,19 @@ def plot_mirror_deflection(asm: AssemblyModel,
         default_cmap = "turbo"
         cmap = cmap or default_cmap
 
-        finite_vals = d_plot[finite_mask]
-        vmax = float(np.max(np.abs(finite_vals))) + 1e-16 if symmetric else float(np.max(finite_vals))
-        vmin = -vmax if symmetric else float(np.min(finite_vals))
+        vmax = float(np.max(np.abs(d_plot))) + 1e-16 if symmetric else float(np.max(d_plot))
+        vmin = -vmax if symmetric else float(np.min(d_plot))
 
         if style_key == "contour":
             contour_kwargs = {"levels": levels, "cmap": cmap}
             if symmetric:
                 contour_kwargs.update(vmin=vmin, vmax=vmax)
-            cs = ax.tricontourf(tri, d_plot_clean, **contour_kwargs)
+            cs = ax.tricontourf(tri, d_plot, **contour_kwargs)
         else:
             norm = colors.Normalize(vmin=vmin, vmax=vmax)
             shading = "gouraud" if style_key == "smooth" else "flat"
             cs = ax.tripcolor(
-                tri, d_plot_clean, shading=shading, cmap=cmap, norm=norm, edgecolors="none"
+                tri, d_plot, shading=shading, cmap=cmap, norm=norm, edgecolors="none"
             )
 
         if draw_wireframe:
