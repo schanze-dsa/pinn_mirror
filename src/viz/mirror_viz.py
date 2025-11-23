@@ -629,6 +629,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
         draw_wireframe   : Whether to overlay triangle edges.
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle.
         refine_max_points   : Optional guardrail limiting the total evaluation points.
+        retriangulate_2d    : If True, rebuild a Delaunay triangulation in 2D and mask it
+                            with detected boundary loops to eliminate sampling holes while
+                            keeping annular holes intact.
         eval_batch_size     : Batch size when querying ``u_fn`` for visualization.
         eval_scope          : 参数保留向后兼容；只要装配提供全局节点，就会强制对
                               全部节点求解（"assembly"），再提取对应表面节点的结果。
