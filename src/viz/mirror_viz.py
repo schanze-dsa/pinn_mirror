@@ -583,6 +583,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            draw_wireframe: bool = False,
                            refine_subdivisions: int = 0,
                            refine_max_points: Optional[int] = None,
+                           retriangulate_2d: bool = True,
                            eval_batch_size: int = 65_536,
                            eval_scope: str = "assembly",
                            diagnose_blanks: bool = False,
@@ -629,6 +630,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
         draw_wireframe   : Whether to overlay triangle edges.
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle.
         refine_max_points   : Optional guardrail limiting the total evaluation points.
+        retriangulate_2d    : If True, rebuild a Delaunay triangulation in 2D and mask it
+                            with detected boundary loops to eliminate sampling holes while
+                            keeping annular holes intact.
         eval_batch_size     : Batch size when querying ``u_fn`` for visualization.
         eval_scope          : 参数保留向后兼容；只要装配提供全局节点，就会强制对
                               全部节点求解（"assembly"），再提取对应表面节点的结果。
@@ -753,12 +757,23 @@ def plot_mirror_deflection(asm: AssemblyModel,
             f"[viz] Warning: {bad}/{d_plot.size} displacement-magnitude samples are NaN/Inf "
             f"({frac:.2%}); affected triangles will appear blank."
         )
-        tri_mask = np.any(nonfinite_mask[tri_plot], axis=1)
 
-    # 4) Triangulation in 2D
-    tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1], tri_plot)
-    if tri_mask is not None and np.any(tri_mask):
-        tri.set_mask(tri_mask)
+    # 4) Triangulation in 2D (optionally rebuild to close holes)
+    boundary_loops = _collect_boundary_loops(tri_plot)
+    if retriangulate_2d:
+        tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1])
+        if boundary_loops:
+            boundary_mask = _mask_tris_with_loops(tri, UV_plot, boundary_loops)
+            if np.any(boundary_mask):
+                tri.set_mask(boundary_mask)
+        tri_plot = tri.triangles.astype(np.int32)
+    else:
+        tri = Triangulation(UV_plot[:, 0], UV_plot[:, 1], tri_plot)
+
+    if np.any(nonfinite_mask):
+        tri_mask = np.any(nonfinite_mask[tri.triangles], axis=1)
+        if np.any(tri_mask):
+            tri.set_mask(tri_mask)
 
     diag_result: Optional[BlankRegionDiagnostics] = None
     if render_surface and diagnose_blanks:

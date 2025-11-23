@@ -185,6 +185,7 @@ class TrainerConfig:
     viz_draw_wireframe: bool = False
     viz_surface_enabled: bool = True        # 是否渲染单一镜面云图
     viz_surface_source: str = "part_top"    # "surface" 使用 INP 表面；"part_top" 优先用零件外表面上表面
+    viz_retriangulate_2d: bool = True       # 是否在UV平面重新Delaunay三角化以填补稀疏采样空洞
     viz_write_data: bool = True             # export displacement samples next to figure
     viz_write_surface_mesh: bool = False    # export reconstructed FE surface mesh next to figure
     viz_plot_full_structure: bool = False   # 导出全装配（或指定零件）的位移云图
@@ -2009,6 +2010,7 @@ class Trainer:
             draw_wireframe=self.cfg.viz_draw_wireframe,
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
+            retriangulate_2d=self.cfg.viz_retriangulate_2d,
             eval_batch_size=self.cfg.viz_eval_batch_size,
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
@@ -2070,6 +2072,7 @@ class Trainer:
             draw_wireframe=self.cfg.viz_draw_wireframe,
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
+            retriangulate_2d=self.cfg.viz_retriangulate_2d,
             eval_batch_size=self.cfg.viz_eval_batch_size,
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
