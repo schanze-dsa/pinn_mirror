@@ -74,8 +74,8 @@ class ModelConfig:
     encoder: EncoderConfig = EncoderConfig()
     field: FieldConfig = FieldConfig()
     mixed_precision: Optional[str] = None      # None|'float16'|'bfloat16'
-    preload_shift: float = 200.0               # for P normalization if only "P" is given
-    preload_scale: float = 800.0               # P_hat = (P - shift)/scale
+    preload_shift: float = 500.0               # for P normalization if only "P" is given
+    preload_scale: float = 1500.0              # P_hat = (P - shift)/scale
 
 
 # -----------------------------
