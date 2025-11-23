@@ -572,7 +572,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            symmetric: bool = True,
                            show: bool = False,
                            data_out_path: Optional[str] = "auto",
-                           surface_mesh_out_path: Optional[str] = "auto",
+                           surface_mesh_out_path: Optional[str] = None,
                            plot_full_structure: bool = False,
                            full_structure_out_path: Optional[str] = "auto",
                            full_structure_data_out_path: Optional[str] = None,
@@ -605,9 +605,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            ``out_path`` is provided, a ``.txt`` with the same
                            stem is written. Use ``None``/"none" to disable.
         surface_mesh_out_path : Path to write the reconstructed FE surface mesh
-                           (triangles only, no displacement). If "auto" and
-                           ``out_path`` is provided, a ``*_surface.ply`` next to
-                           the figure is written. Use ``None``/"none" to disable.
+                           (triangles only, no displacement). If None (default)
+                           no mesh is exported; if "auto" and ``out_path`` is
+                           provided, a ``*_surface.ply`` next to the figure is
+                           written.
         plot_full_structure  : If True and assembly nodes are available, also plot
                            a displacement magnitude map for the whole assembly
                            (scatter projected to the same best-fit plane).

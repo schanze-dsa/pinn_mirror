@@ -186,8 +186,8 @@ class TrainerConfig:
     viz_surface_enabled: bool = True        # 是否渲染单一镜面云图
     viz_surface_source: str = "part_top"    # "surface" 使用 INP 表面；"part_top" 优先用零件外表面上表面
     viz_write_data: bool = True             # export displacement samples next to figure
-    viz_write_surface_mesh: bool = True     # export reconstructed FE surface mesh next to figure
-    viz_plot_full_structure: bool = True    # 导出全装配（或指定零件）的位移云图
+    viz_write_surface_mesh: bool = False    # export reconstructed FE surface mesh next to figure
+    viz_plot_full_structure: bool = False   # 导出全装配（或指定零件）的位移云图
     viz_full_structure_part: Optional[str] = "mirror1"  # None -> 全装配
     viz_write_full_structure_data: bool = False  # 记录全装配位移数据
     viz_refine_subdivisions: int = 0        # >0 -> barycentric subdivisions per surface triangle
