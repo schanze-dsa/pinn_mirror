@@ -21,8 +21,8 @@ Public API:
     fig, ax, data_path = plot_mirror_deflection(
         asm, surface_key, u_fn, params, P_values=(P1,P2,P3),
         out_path="outputs/mirror_P1_...png", title_prefix="Mirror Total Deformation",
-        units="mm", levels=24, symmetric=False, show=False,
-        data_out_path="auto", style="smooth", cmap="turbo"
+        units="mm", levels=64, symmetric=False, show=False,
+        data_out_path="auto", style="contour", cmap="turbo"
     )
 
 Author: you
@@ -568,7 +568,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            render_surface: bool = True,
                            title_prefix: str = "Mirror Total Deformation",
                            units: str = "mm",
-                           levels: int = 24,
+                           levels: int = 64,
                            symmetric: bool = False,
                            show: bool = False,
                            data_out_path: Optional[str] = "auto",
@@ -578,7 +578,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            full_structure_data_out_path: Optional[str] = None,
                            full_structure_part: Optional[str] = None,
                            surface_source: str = "part_top",
-                           style: str = "smooth",
+                           style: str = "contour",
                            cmap: Optional[str] = None,
                            draw_wireframe: bool = False,
                            refine_subdivisions: int = 0,
@@ -622,13 +622,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
         surface_source      : "surface" 使用 INP 表面；"part"/"part_top" 从目标零件
                             的外边界三角化得到表面，"part_top" 只保留主导法向一致的
                             外表面（便于提取镜面上表面环形云图）。
-        style            : "smooth" to render a Gouraud-shaded tripcolor map
-                            (Abaqus-like), "flat" for flat shading, or
-                            "contour" to use tricontourf as in the legacy
-                           implementation.
+        style            : "contour"(默认) 使用 tricontourf 等值填充获得平滑云图；
+                            "smooth" 为 Gouraud 着色的 tripcolor；"flat" 为平面着色。
         cmap             : Optional matplotlib colormap name; defaults to
-                           ``"turbo"`` for smooth/flat styles and
-                           ``"coolwarm"`` for contour mode.
+                            ``"turbo"`` for所有样式以匹配示例中的平滑彩虹云图。
         draw_wireframe   : Whether to overlay triangle edges.
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle.
         refine_max_points   : Optional guardrail limiting the total evaluation points.
@@ -807,7 +804,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
         if style_key not in {"smooth", "flat", "contour"}:
             style_key = "smooth"
 
-        default_cmap = "turbo" if style_key in {"smooth", "flat"} else "coolwarm"
+        default_cmap = "turbo"
         cmap = cmap or default_cmap
 
         vmax = float(np.max(np.abs(d_plot))) + 1e-16 if symmetric else float(np.max(d_plot))
