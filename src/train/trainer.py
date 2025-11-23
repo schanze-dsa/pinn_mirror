@@ -176,11 +176,11 @@ class TrainerConfig:
     out_dir: str = "outputs"
     ckpt_dir: str = "checkpoints"
     viz_samples_after_train: int = 5
-    viz_title_prefix: str = "Mirror Deflection (trained PINN)"
+    viz_title_prefix: str = "Total Deformation (trained PINN)"
     viz_style: str = "smooth"              # smooth Gouraud-shaded map by default
     viz_colormap: str = "turbo"             # Abaqus-like rainbow palette
     viz_levels: int = 24                    # used when style="contour"
-    viz_symmetric: bool = True              # keep color limits symmetric around 0
+    viz_symmetric: bool = False             # displacement magnitude is nonnegative
     viz_units: str = "mm"
     viz_draw_wireframe: bool = False
     viz_surface_enabled: bool = True        # 是否渲染单一镜面云图

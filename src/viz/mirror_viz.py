@@ -3,14 +3,14 @@
 """
 mirror_viz.py
 -------------
-Visualize deflection map of a mirror surface ("MIRROR up"):
+Visualize total-displacement map of a mirror surface ("MIRROR up"):
 
 Pipeline:
   1) Triangulate the named surface via surface_utils.resolve_surface_to_tris()
   2) Fit a best-fit plane using SVD over all surface vertices to get an orthonormal basis (e1,e2,n)
   3) Project surface nodes to 2D (u,v) in that plane
   4) Evaluate displacement field u(X; P) on unique surface nodes
-  5) Take scalar deflection d = (u · n) along the global mirror normal
+  5) Take scalar displacement magnitude d = |u|
   6) Plot a smooth tripcolor (default) or tricontourf map in (u,v)-space; title includes (P1,P2,P3)
 
 Notes:
@@ -20,8 +20,8 @@ Notes:
 Public API:
     fig, ax, data_path = plot_mirror_deflection(
         asm, surface_key, u_fn, params, P_values=(P1,P2,P3),
-        out_path="outputs/mirror_P1_...png", title_prefix="Mirror Deflection",
-        units="mm", levels=24, symmetric=True, show=False,
+        out_path="outputs/mirror_P1_...png", title_prefix="Mirror Total Deformation",
+        units="mm", levels=24, symmetric=False, show=False,
         data_out_path="auto", style="smooth", cmap="turbo"
     )
 
@@ -250,7 +250,7 @@ class BlankRegionDiagnostics:
 
     def summary_lines(self) -> List[str]:
         lines = [
-            f"[1] deflection NaN/Inf: {self.nonfinite_deflection}",
+            f"[1] displacement magnitude NaN/Inf: {self.nonfinite_deflection}",
             f"[2] displacement/UV NaN/Inf: disp={self.nonfinite_displacement}, uv={self.nonfinite_uv}",
             f"[3] coverage (triangles / convex hull): {self.coverage_ratio_hull:.2%}",
             f"[3b] coverage (triangles / boundary envelope): {self.coverage_ratio_envelope:.2%}  loops={self.n_boundary_loops}",
@@ -263,7 +263,7 @@ class BlankRegionDiagnostics:
     @property
     def primary_cause(self) -> str:
         if self.nonfinite_deflection > 0:
-            return "(1) 挠度中存在 NaN/Inf，绘图被掩码"
+            return "(1) 位移模长中存在 NaN/Inf，绘图被掩码"
         if self.nonfinite_displacement > 0 or self.nonfinite_uv > 0:
             return "(2) 位移向量或投影坐标含 NaN/Inf，导致三角化异常"
         if self.coverage_ratio_envelope < 0.80:
@@ -566,10 +566,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            P_values: Optional[Tuple[float, float, float]] = None,
                            out_path: Optional[str] = None,
                            render_surface: bool = True,
-                           title_prefix: str = "Mirror Deflection",
+                           title_prefix: str = "Mirror Total Deformation",
                            units: str = "mm",
                            levels: int = 24,
-                           symmetric: bool = True,
+                           symmetric: bool = False,
                            show: bool = False,
                            data_out_path: Optional[str] = "auto",
                            surface_mesh_out_path: Optional[str] = None,
@@ -589,7 +589,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            auto_fill_blanks: bool = False,
                            diag_out: Optional[Dict[str, BlankRegionDiagnostics]] = None):
     """
-    Visualize deflection along the global mirror normal of the given surface.
+    Visualize total displacement magnitude of the given mirror surface.
 
     Args:
         asm, surface_key : AssemblyModel and key in asm.surfaces (e.g., 'MIRROR_up' exact key)
@@ -599,7 +599,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
         title_prefix     : string prefix for the figure title
         units            : colorbar label for displacement units (e.g., "mm")
         levels           : number of contour levels
-        symmetric        : if True, make color limits symmetric about 0 for diverging colormap
+        symmetric        : if True, make color limits symmetric about 0 (usually False for |u|)
         show             : if True, call plt.show()
         data_out_path    : Path to write displacement samples. If "auto" and
                            ``out_path`` is provided, a ``.txt`` with the same
@@ -684,7 +684,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
     c, e1, e2, n = _fit_plane_basis(X3D)
     UV = _project_to_plane(X3D, c, e1, e2)  # (Nu,2)
 
-    # 3) Evaluate displacement and take scalar deflection along normal
+    # 3) Evaluate displacement and take scalar magnitude
     eval_scope_key = (eval_scope or "surface").strip().lower()
 
     eval_subset = None
@@ -718,7 +718,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
             "requested": eval_meta.get("requested_scope", eval_scope_key),
             "global_node_count": int(eval_meta.get("global_nodes", np.array([])).shape[0]),
         }
-    d_base = u_base @ n  # (Nu,) scalar deflection along global mirror normal
+    # Displacement magnitude on original surface nodes
+    d_base = np.linalg.norm(u_base, axis=1)
 
     # Optional barycentric refinement for smoother visualization
     applied_subdiv = max(0, int(refine_subdivisions or 0))
@@ -740,7 +741,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
     if applied_subdiv > 0:
         X_plot, UV_plot, tri_plot = _refine_surface_samples(X3D, UV, tri_idx, applied_subdiv)
         u_plot = _eval_displacement_batched(u_fn, params, X_plot, eval_batch_size)
-        d_plot = u_plot @ n
+        d_plot = np.linalg.norm(u_plot, axis=1)
     else:
         X_plot, UV_plot, tri_plot = X3D, UV, tri_idx
         u_plot, d_plot = u_base, d_base
@@ -752,7 +753,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
         bad = int(nonfinite_mask.sum())
         frac = bad / float(d_plot.size)
         print(
-            f"[viz] Warning: {bad}/{d_plot.size} deflection samples are NaN/Inf "
+            f"[viz] Warning: {bad}/{d_plot.size} displacement-magnitude samples are NaN/Inf "
             f"({frac:.2%}); affected triangles will appear blank."
         )
         tri_mask = np.any(nonfinite_mask[tri_plot], axis=1)
@@ -828,7 +829,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
             ax.triplot(tri, lw=0.35, color="#444444", alpha=0.45)
 
         cbar = fig.colorbar(cs, ax=ax, shrink=0.92, pad=0.02)
-        cbar.set_label(f"Deflection along normal [{units}]")
+        cbar.set_label(f"Total displacement magnitude [{units}]")
 
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("u (best-fit plane)")
@@ -943,7 +944,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
             data_path = resolved_data
             data_path.parent.mkdir(parents=True, exist_ok=True)
             header = [
-                "# Mirror deflection samples exported by plot_mirror_deflection",
+                "# Mirror displacement magnitude samples exported by plot_mirror_deflection",
                 f"# surface={surface_key} units={units}",
             ]
             if eval_scope_info is not None:
@@ -957,7 +958,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
             header.append(f"# refine_subdivisions_applied={applied_subdiv}")
             header.append("# note: exported samples correspond to original FE nodes.")
             header.append(
-                "# columns: node_id x y z u_x u_y u_z deflection_normal u_plane v_plane"
+                "# columns: node_id x y z u_x u_y u_z |u| u_plane v_plane"
             )
             with data_path.open("w", encoding="utf-8") as fp:
                 fp.write("\n".join(header) + "\n")
