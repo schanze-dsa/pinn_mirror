@@ -72,6 +72,7 @@ class FieldConfig:
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
+    graph_residual: bool = True  # 是否在图卷积层之间加入恒等残差以稳定深层训练
 
 @dataclass
 class ModelConfig:
@@ -501,6 +502,7 @@ class DisplacementNet(tf.keras.Model):
             )
             for _ in range(cfg.graph_layers)
         ]
+        self.graph_residual = bool(cfg.graph_residual)
         self.graph_norm = tf.keras.layers.LayerNormalization(axis=-1)
         self.graph_out = tf.keras.layers.Dense(
             cfg.out_dim,
@@ -563,7 +565,10 @@ class DisplacementNet(tf.keras.Model):
             knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
             hcur = self.graph_proj(h)
             for layer in self.graph_layers:
-                hcur = layer(hcur, coords, knn_idx, training=training)
+                hnext = layer(hcur, coords, knn_idx, training=training)
+                if self.graph_residual:
+                    hnext = hcur + hnext
+                hcur = hnext
             hcur = self.graph_norm(hcur)
             return self.graph_out(hcur)
 
