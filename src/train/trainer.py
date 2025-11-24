@@ -151,7 +151,7 @@ class TrainerConfig:
     ))
 
     # 损失加权（自适应）
-    loss_adaptive_enabled: bool = False
+    loss_adaptive_enabled: bool = True
     loss_update_every: int = 1
     loss_ema_decay: float = 0.95
     loss_min_factor: float = 0.25
