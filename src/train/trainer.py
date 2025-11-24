@@ -108,6 +108,13 @@ class TrainerConfig:
     contact_rar_fric_mix: float = 0.4          # 穿透 vs 摩擦残差的混合系数
     contact_rar_balance_pairs: bool = True     # 是否保持各接触对的样本占比
 
+    # 体积分点（弹性能量）RAR
+    volume_rar_enabled: bool = True            # 是否启用体积分点基于应变能密度的 RAR
+    volume_rar_fraction: float = 0.5           # 每步 DFEM 子单元子采样中，多少比例来自 RAR
+    volume_rar_temperature: float = 1.0        # >1 平滑、<1 更尖锐
+    volume_rar_uniform_ratio: float = 0.2      # 保底均匀抽样比例
+    volume_rar_floor: float = 1e-8             # 基础重要性，避免全零
+
     # 预紧
     preload_specs: List[Dict[str, str]] = field(default_factory=list)
     preload_n_points_each: int = 800
@@ -231,6 +238,7 @@ class Trainer:
         self._last_preload_case: Optional[Dict[str, np.ndarray]] = None
         self._train_vars: List[tf.Variable] = []
         self._contact_rar_cache: Optional[Dict[str, Any]] = None
+        self._volume_rar_cache: Optional[Dict[str, Any]] = None
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
 
         if cfg.preload_specs:
@@ -1360,6 +1368,92 @@ class Trainer:
         note = f"RAR {len(rar_indices)}/{total_n}"
         return cat_new, note
 
+    # ----------------- Volume (strain energy) RAR -----------------
+
+    def _update_volume_rar_cache(self):
+        """基于上一批次的应变能密度，构造体积分点的重要性分布。"""
+
+        if not self.cfg.volume_rar_enabled:
+            self._volume_rar_cache = None
+            return
+        if self.elasticity is None:
+            self._volume_rar_cache = None
+            return
+        if not hasattr(self.elasticity, "last_sample_metrics"):
+            self._volume_rar_cache = None
+            return
+
+        metrics = self.elasticity.last_sample_metrics() or {}
+        psi = metrics.get("psi")
+        idx = metrics.get("idx")
+        total_cells = int(getattr(self.elasticity, "n_cells", 0) or 0)
+        if psi is None or idx is None or total_cells <= 0:
+            self._volume_rar_cache = None
+            return
+
+        psi = np.asarray(psi, dtype=np.float64).reshape(-1)
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        if psi.size == 0 or idx.size == 0 or psi.shape[0] != idx.shape[0]:
+            self._volume_rar_cache = None
+            return
+
+        imp = np.full((total_cells,), float(self.cfg.volume_rar_floor), dtype=np.float32)
+        valid = (idx >= 0) & (idx < total_cells) & np.isfinite(psi)
+        if not np.any(valid):
+            self._volume_rar_cache = None
+            return
+        np.add.at(imp, idx[valid], np.abs(psi[valid]).astype(np.float32))
+        imp = np.where(np.isfinite(imp), imp, float(self.cfg.volume_rar_floor))
+        self._volume_rar_cache = {"importance": imp}
+
+    def _maybe_apply_volume_rar(self, step_index: int) -> Tuple[Optional[np.ndarray], str]:
+        """返回一组 DFEM 子单元索引，按应变能密度进行重采样。"""
+
+        if (
+            not self.cfg.volume_rar_enabled
+            or self._volume_rar_cache is None
+            or self.elasticity is None
+        ):
+            return None, ""
+
+        total_cells = int(getattr(self.elasticity, "n_cells", 0) or 0)
+        target_n = getattr(getattr(self.elasticity, "cfg", None), "n_points_per_step", None)
+        if total_cells <= 0 or target_n is None or target_n <= 0:
+            return None, ""
+
+        m = min(int(target_n), total_cells)
+        importance = self._volume_rar_cache.get("importance")
+        if importance is None or importance.shape[0] != total_cells:
+            return None, ""
+
+        rar_frac = float(np.clip(self.cfg.volume_rar_fraction, 0.0, 1.0))
+        min_uniform = int(np.round(m * np.clip(self.cfg.volume_rar_uniform_ratio, 0.0, 1.0)))
+        n_rar = int(np.round(m * rar_frac))
+        if n_rar + min_uniform > m:
+            n_rar = max(0, m - min_uniform)
+        n_uniform = max(0, m - n_rar)
+        if n_rar <= 0:
+            return None, ""
+
+        temp = max(self.cfg.volume_rar_temperature, 1e-6)
+        weights = np.power(importance + float(self.cfg.volume_rar_floor), 1.0 / temp)
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        if float(weights.sum()) <= 0.0:
+            return None, ""
+
+        rng = np.random.default_rng(self.cfg.seed + step_index * 23)
+        probs = weights / (weights.sum() + 1e-12)
+        rar_indices = np.array(rng.choice(total_cells, size=n_rar, replace=True, p=probs), dtype=np.int64)
+
+        if n_uniform > 0:
+            uni_indices = rng.choice(total_cells, size=n_uniform, replace=False)
+            combined = np.concatenate([rar_indices, uni_indices], axis=0)
+        else:
+            combined = rar_indices
+
+        note = f"volRAR {len(rar_indices)}/{m}"
+        return combined, note
+
     # 在 Trainer 类里新增/覆盖这个方法
     def _collect_trainable_variables(self):
         m = self.model
@@ -1717,11 +1811,16 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: 前向/反传")
                     t0 = time.perf_counter()
                     preload_case = self._sample_preload_case()
+                    vol_note = ""
+                    if self.elasticity is not None and hasattr(self.elasticity, "set_sample_indices"):
+                        vol_indices, vol_note = self._maybe_apply_volume_rar(step)
+                        self.elasticity.set_sample_indices(vol_indices)
                     Pi, parts, stats, grad_norm = self._train_step(total, preload_case)
                     P_np = preload_case["P"]
                     order_np = preload_case.get("order")
                     self._last_preload_case = copy.deepcopy(preload_case)
                     self._update_contact_rar_cache()
+                    self._update_volume_rar_cache()
                     pi_val = float(Pi.numpy())
                     if self._pi_baseline is None:
                         self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
@@ -1754,6 +1853,8 @@ class Trainer:
                         order_txt = " order=" + "-".join(str(int(x) + 1) for x in order_np)
                     energy_summary = self._format_energy_summary(parts)
                     energy_txt = f" | {energy_summary}" if energy_summary else ""
+                    if vol_note:
+                        energy_txt += f" | {vol_note}"
                     train_note = (
                         f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}]"
                         f"{order_txt}{energy_txt} | Π={pi_val:.2e} {rel_txt} {d_txt} "

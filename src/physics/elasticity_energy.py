@@ -155,6 +155,30 @@ class ElasticityEnergy:
         self.n_nodes: int = int(X_nodes.shape[0])
         self.n_cells: int = int(B.shape[0])
         self.w_total_tf = tf.reduce_sum(self.w_tf)
+        self._forced_indices: Optional[tf.Tensor] = None
+        self._last_sample_metrics: Dict[str, Any] = {}
+
+    # -------------------------------------------------------------------- #
+    # RAR 支持接口
+    # -------------------------------------------------------------------- #
+    def set_sample_indices(self, indices: Optional[np.ndarray | tf.Tensor]):
+        """指定下一步积分所使用的 DFEM 子单元索引，用于 RAR。"""
+
+        if indices is None:
+            self._forced_indices = None
+            return
+        try:
+            arr = np.asarray(indices, dtype=np.int32).reshape(-1)
+        except Exception:
+            self._forced_indices = None
+            return
+        if arr.size == 0:
+            self._forced_indices = None
+            return
+        self._forced_indices = tf.convert_to_tensor(arr, dtype=tf.int32)
+
+    def last_sample_metrics(self) -> Dict[str, Any]:
+        return dict(self._last_sample_metrics) if self._last_sample_metrics else {}
 
     # ------------------------------------------------------------------------ #
     # 顶层接口：计算内能
@@ -180,14 +204,27 @@ class ElasticityEnergy:
         # 展平成一维：全局 DOF 向量 u_d，约定 DOF 排布为 [ux0,uy0,uz0, ux1,uy1,uz1, ...]
         u_flat = tf.reshape(tf.cast(u_nodes, tf.float32), (-1,))  # (3N,)
 
-        # 2) 选择本步参与积分的 DFEM 子单元（无偏子采样）
+        # 2) 选择本步参与积分的 DFEM 子单元（支持 RAR 强制索引）
         K = self.n_cells
         if self.cfg.n_points_per_step and self.cfg.n_points_per_step > 0:
             m = min(int(self.cfg.n_points_per_step), K)
-            idx = tf.random.shuffle(tf.range(K, dtype=tf.int32))[:m]
         else:
             m = K
-            idx = tf.range(K, dtype=tf.int32)
+
+        forced_idx = self._forced_indices
+        self._forced_indices = None
+        if forced_idx is not None:
+            idx = tf.reshape(tf.cast(forced_idx, tf.int32), (-1,))
+            idx = tf.clip_by_value(idx, 0, max(K - 1, 0))
+            if tf.shape(idx)[0] < m:
+                pad = tf.random.shuffle(tf.range(K, dtype=tf.int32))
+                idx = tf.concat([idx, pad], axis=0)
+            idx = idx[:m]
+        else:
+            base_idx = tf.range(K, dtype=tf.int32)
+            if m < K:
+                base_idx = tf.random.shuffle(base_idx)
+            idx = base_idx[:m]
 
         B_sel = tf.gather(self.B_tf, idx)         # (M,6,12)
         w_sel = tf.gather(self.w_tf, idx)         # (M,)
@@ -221,6 +258,14 @@ class ElasticityEnergy:
         # 若做子采样，则乘以 (总权重 / 本次样本权重) 作无偏估计
         scale = tf.math.divide_no_nan(self.w_total_tf, w_used_sum)
         E_int = E_used * scale
+
+        try:
+            self._last_sample_metrics = {
+                "psi": psi.numpy(),
+                "idx": tf.reshape(idx, (-1,)).numpy(),
+            }
+        except Exception:
+            self._last_sample_metrics = {}
 
         if self.cfg.check_nan:
             tf.debugging.check_numerics(E_int, "[ElasticityEnergy] E_int has NaN/Inf")
