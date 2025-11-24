@@ -256,11 +256,14 @@ class TotalEnergy:
         )
 
     def _energy_staged(self, u_fn, stages, root_params, tape=None):
-        """Accumulate energy across staged preload applications."""
+        """Accumulate energy across staged preload applications.
+
+        与先前的“望向最终态”做差不同，这里直接累加每个阶段的能量/功，
+        使得不同的加载顺序在无数据训练时也能对总损失产生影响。
+        """
         dtype = self.dtype
         keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
-        prev: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
 
         if isinstance(stages, dict):
@@ -314,12 +317,9 @@ class TotalEnergy:
                 stats_all[f"s{idx+1}_{k}"] = v
             for key in keys:
                 cur = tf.cast(stage_parts.get(key, tf.cast(0.0, dtype)), dtype)
-                prev_val = prev.get(key, tf.cast(0.0, dtype))
-                inc = cur - prev_val
-                totals[key] = totals[key] + inc
-                stats_all[f"s{idx+1}_d{key}"] = inc
+                totals[key] = totals[key] + cur
                 stats_all[f"s{idx+1}_{key}"] = cur
-                prev[key] = cur
+                stats_all[f"s{idx+1}_cum{key}"] = totals[key]
 
         if isinstance(root_params, dict):
             if "stage_order" in root_params:
