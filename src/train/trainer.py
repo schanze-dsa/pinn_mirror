@@ -117,12 +117,16 @@ class TrainerConfig:
     bcs: List[Dict[str, Any]] = field(default_factory=list)
 
     # 预紧力范围（N）
-    preload_min: float = 500.0
+    preload_min: float = 0.0
     preload_max: float = 2000.0
     preload_sequence: List[Any] = field(default_factory=list)
     preload_sequence_repeat: int = 1
     preload_sequence_shuffle: bool = False
     preload_sequence_jitter: float = 0.0
+
+    # 预紧采样方式
+    preload_sampling: str = "lhs"            # "lhs" | "uniform"
+    preload_lhs_size: int = 64               # 每批次的拉丁超立方样本数量
 
     # 预紧顺序（分步加载）
     preload_use_stages: bool = False
@@ -175,7 +179,7 @@ class TrainerConfig:
     # 输出
     out_dir: str = "outputs"
     ckpt_dir: str = "checkpoints"
-    viz_samples_after_train: int = 5
+    viz_samples_after_train: int = 6
     viz_title_prefix: str = "Total Deformation (trained PINN)"
     viz_style: str = "contour"             # 默认采用等值填充以获得平滑云图
     viz_colormap: str = "turbo"             # Abaqus-like rainbow palette
@@ -206,6 +210,11 @@ class Trainer:
         np.random.seed(cfg.seed)
         tf.random.set_seed(cfg.seed)
 
+        self._preload_dim: int = 3
+        self._preload_lhs_rng = np.random.default_rng(cfg.seed + 11)
+        self._preload_lhs_points: np.ndarray = np.zeros((0, self._preload_dim), dtype=np.float32)
+        self._preload_lhs_index: int = 0
+
         # 默认设备描述，避免后续日志访问属性时出错
         self.device_summary = "Unknown"
         self._step_stage_times: List[Tuple[str, float]] = []
@@ -223,6 +232,9 @@ class Trainer:
         self._train_vars: List[tf.Variable] = []
         self._contact_rar_cache: Optional[Dict[str, Any]] = None
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
+
+        if cfg.preload_specs:
+            self._set_preload_dim(len(cfg.preload_specs))
 
         if cfg.preload_sequence:
             sanitized: List[np.ndarray] = []
@@ -309,6 +321,7 @@ class Trainer:
                     print(
                         f"[preload] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
                     )
+                self._set_preload_dim(self._preload_sequence[0].size)
             else:
                 print("[preload] preload_sequence 中有效条目为空，改为随机采样。")
         if cfg.model_cfg.preload_scale:
@@ -383,6 +396,41 @@ class Trainer:
 
 
     # ----------------- 辅助工具 -----------------
+
+    def _set_preload_dim(self, nb: int):
+        nb_int = int(nb)
+        if nb_int <= 0:
+            nb_int = 3
+        if nb_int != getattr(self, "_preload_dim", None):
+            self._preload_dim = nb_int
+            self._preload_lhs_points = np.zeros((0, nb_int), dtype=np.float32)
+            self._preload_lhs_index = 0
+
+    def _generate_lhs_points(self, n_samples: int, n_dim: int, lo: float, hi: float) -> np.ndarray:
+        """简单的拉丁超立方采样生成器，返回 (n_samples, n_dim)."""
+
+        if n_samples <= 0:
+            return np.zeros((0, n_dim), dtype=np.float32)
+        unit = np.zeros((n_samples, n_dim), dtype=np.float32)
+        for j in range(n_dim):
+            seg = (np.arange(n_samples, dtype=np.float32) + self._preload_lhs_rng.random(n_samples)) / float(n_samples)
+            self._preload_lhs_rng.shuffle(seg)
+            unit[:, j] = seg
+        scale = hi - lo
+        return (lo + unit * scale).astype(np.float32)
+
+    def _next_lhs_preload(self, n_dim: int, lo: float, hi: float) -> np.ndarray:
+        batch = max(1, int(self.cfg.preload_lhs_size))
+        if self._preload_lhs_points.shape[1] != n_dim or len(self._preload_lhs_points) == 0:
+            self._preload_lhs_points = self._generate_lhs_points(batch, n_dim, lo, hi)
+            self._preload_lhs_index = 0
+        if self._preload_lhs_index >= len(self._preload_lhs_points):
+            self._preload_lhs_points = self._generate_lhs_points(batch, n_dim, lo, hi)
+            self._preload_lhs_index = 0
+        out = self._preload_lhs_points[self._preload_lhs_index].copy()
+        self._preload_lhs_index += 1
+        return out
+
     @staticmethod
     def _format_seconds(seconds: float) -> str:
         if seconds < 1e-3:
@@ -644,9 +692,14 @@ class Trainer:
             return target.astype(np.float32)
 
         lo, hi = self.cfg.preload_min, self.cfg.preload_max
-        out = np.random.uniform(lo, hi, size=(3,)).astype(np.float32)
+        nb = int(self._preload_dim)
+        sampling = (self.cfg.preload_sampling or "uniform").lower()
+        if sampling == "lhs":
+            out = self._next_lhs_preload(nb, lo, hi)
+        else:
+            out = np.random.uniform(lo, hi, size=(nb,)).astype(np.float32)
         self._last_preload_order = None
-        return out
+        return out.astype(np.float32)
 
     def _normalize_order(self, order: Optional[Any], nb: int) -> Optional[np.ndarray]:
         if order is None:
@@ -799,6 +852,37 @@ class Trainer:
             params["stage_rank"] = rank_tf
         params["stage_count"] = tf.constant(stage_count, dtype=tf.int32)
         return params
+
+    @staticmethod
+    def _static_last_dim(arr: Any) -> Optional[int]:
+        try:
+            dim = getattr(arr, "shape", None)
+            if dim is None:
+                return None
+            last = dim[-1]
+            return None if last is None else int(last)
+        except Exception:
+            return None
+
+    def _infer_preload_feat_dim(self, params: Dict[str, Any]) -> Optional[int]:
+        """静态推断 P_hat 的长度；优先 staged 特征，其次单步 P_hat/P。"""
+
+        if not isinstance(params, dict):
+            return None
+
+        stages = params.get("stages")
+        if isinstance(stages, dict):
+            feat = stages.get("P_hat")
+            dim = self._static_last_dim(feat)
+            if dim:
+                return dim
+
+        if "P_hat" in params:
+            dim = self._static_last_dim(params.get("P_hat"))
+            if dim:
+                return dim
+
+        return self._static_last_dim(params.get("P"))
 
     def _extract_final_stage_params(
         self, params: Dict[str, Any], keep_context: bool = False
@@ -1072,6 +1156,18 @@ class Trainer:
             self.ties_ops, self.bcs_ops = [], []
             pb.update(1)
 
+            # 6.5) 根据预紧特征维度统一 ParamEncoder 输入形状，避免 staged 特征长度变化
+            self._warmup_case = self._make_warmup_case()
+            self._warmup_params = self._make_preload_params(self._warmup_case)
+            feat_dim = self._infer_preload_feat_dim(self._warmup_params)
+            if feat_dim:
+                old_dim = getattr(cfg.model_cfg.encoder, "in_dim", None)
+                if old_dim != feat_dim:
+                    print(
+                        f"[model] 预紧特征维度 {old_dim} -> {feat_dim}，统一 ParamEncoder 输入。"
+                    )
+                    cfg.model_cfg.encoder.in_dim = feat_dim
+
             # 7) 模型 & 优化器
             if cfg.mixed_precision:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
@@ -1096,9 +1192,7 @@ class Trainer:
             warmup_n = 0
         if warmup_n > 0:
             X_sample = tf.convert_to_tensor(self.X_vol[:warmup_n], dtype=tf.float32)
-            mid = 0.5 * (float(cfg.preload_min) + float(cfg.preload_max))
-            warmup_case = self._make_warmup_case()
-            params = self._make_preload_params(warmup_case)
+            params = self._warmup_params or self._make_preload_params(self._make_warmup_case())
             eval_params = self._extract_final_stage_params(params)
             # 调用一次前向以创建所有变量；忽略实际输出
             _ = self.model.u_fn(X_sample, eval_params)
@@ -2039,13 +2133,48 @@ class Trainer:
             self.last_viz_diag = diag_out.get("blank_check")
         return result
 
+    def _fixed_viz_preload_cases(self) -> List[Dict[str, np.ndarray]]:
+        """生成固定的 6 组预紧案例以避免可视化阶段的随机性."""
+
+        nb = 3  # 现有镜面配置假定三颗螺栓
+
+        def _make_case(P_list: Sequence[float], order: Sequence[int]) -> Dict[str, np.ndarray]:
+            P_arr = np.asarray(P_list, dtype=np.float32).reshape(-1)
+            if P_arr.size != nb:
+                raise ValueError(f"固定可视化仅支持 {nb} 颗螺栓，收到 {P_arr.size} 维载荷。")
+            case: Dict[str, np.ndarray] = {"P": P_arr}
+            if not self.cfg.preload_use_stages:
+                return case
+            order_norm = self._normalize_order(order, nb)
+            if order_norm is None:
+                return case
+            case["order"] = order_norm
+            case.update(self._build_stage_case(P_arr, order_norm))
+            return case
+
+        cases: List[Dict[str, np.ndarray]] = []
+
+        # 三组单螺栓 2000N，顺序固定为 1-2-3
+        for P_single in ([2000.0, 0.0, 0.0], [0.0, 2000.0, 0.0], [0.0, 0.0, 2000.0]):
+            cases.append(_make_case(P_single, order=[0, 1, 2]))
+
+        # 三组 1500N 等幅，采用不同拧紧顺序
+        for order in ([0, 1, 2], [0, 2, 1], [2, 1, 0]):
+            cases.append(_make_case([1500.0, 1500.0, 1500.0], order=order))
+
+        return cases
+
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
             return
         os.makedirs(self.cfg.out_dir, exist_ok=True)
-        print(f"[trainer] Generating {n_samples} deflection maps for '{self.cfg.mirror_surface_name}' ...")
-        for i in range(n_samples):
-            preload_case = self._sample_preload_case()
+        cases = self._fixed_viz_preload_cases()
+        n_total = len(cases) if cases else n_samples
+        print(
+            f"[trainer] Generating {n_total} deflection maps for '{self.cfg.mirror_surface_name}' ..."
+        )
+        iter_cases = cases if cases else [self._sample_preload_case() for _ in range(n_samples)]
+        for i, preload_case in enumerate(iter_cases):
             P = preload_case["P"]
             order_display = None
             if self.cfg.preload_use_stages and "order" in preload_case:

@@ -204,6 +204,37 @@ class FrictionContactALM:
         self._last_tau = None
         self._last_r_norm = None
 
+    # ---------- stage state helpers ----------
+
+    def snapshot_state(self) -> Dict[str, tf.Tensor]:
+        """Take a lightweight snapshot of stateful friction variables for staged loading."""
+        if self.lmbda_t is None:
+            return {"lmbda_t": None}
+
+        return {
+            "lmbda_t": tf.identity(self.lmbda_t),
+            "_last_st": None if self._last_st is None else tf.identity(self._last_st),
+        }
+
+    def restore_state(self, state: Dict[str, tf.Tensor]):
+        """Restore tangential multipliers/cache from :meth:`snapshot_state`."""
+        if not state:
+            return
+
+        lmbda_t = state.get("lmbda_t", None)
+        if lmbda_t is not None and self.lmbda_t is not None:
+            self.lmbda_t.assign(tf.cast(lmbda_t, self.dtype))
+
+        st = state.get("_last_st", None)
+        if st is None:
+            self._last_st = None
+        else:
+            self._last_st = tf.cast(st, self.dtype)
+
+    def last_slip(self) -> Optional[tf.Tensor]:
+        """Return cached tangential slip (N,2) from the last energy call, if any."""
+        return self._last_st
+
     def build_from_cat(
         self,
         cat: Dict[str, np.ndarray],
