@@ -800,6 +800,37 @@ class Trainer:
         params["stage_count"] = tf.constant(stage_count, dtype=tf.int32)
         return params
 
+    @staticmethod
+    def _static_last_dim(arr: Any) -> Optional[int]:
+        try:
+            dim = getattr(arr, "shape", None)
+            if dim is None:
+                return None
+            last = dim[-1]
+            return None if last is None else int(last)
+        except Exception:
+            return None
+
+    def _infer_preload_feat_dim(self, params: Dict[str, Any]) -> Optional[int]:
+        """静态推断 P_hat 的长度；优先 staged 特征，其次单步 P_hat/P。"""
+
+        if not isinstance(params, dict):
+            return None
+
+        stages = params.get("stages")
+        if isinstance(stages, dict):
+            feat = stages.get("P_hat")
+            dim = self._static_last_dim(feat)
+            if dim:
+                return dim
+
+        if "P_hat" in params:
+            dim = self._static_last_dim(params.get("P_hat"))
+            if dim:
+                return dim
+
+        return self._static_last_dim(params.get("P"))
+
     def _extract_final_stage_params(
         self, params: Dict[str, Any], keep_context: bool = False
     ) -> Dict[str, Any]:
@@ -1072,6 +1103,18 @@ class Trainer:
             self.ties_ops, self.bcs_ops = [], []
             pb.update(1)
 
+            # 6.5) 根据预紧特征维度统一 ParamEncoder 输入形状，避免 staged 特征长度变化
+            self._warmup_case = self._make_warmup_case()
+            self._warmup_params = self._make_preload_params(self._warmup_case)
+            feat_dim = self._infer_preload_feat_dim(self._warmup_params)
+            if feat_dim:
+                old_dim = getattr(cfg.model_cfg.encoder, "in_dim", None)
+                if old_dim != feat_dim:
+                    print(
+                        f"[model] 预紧特征维度 {old_dim} -> {feat_dim}，统一 ParamEncoder 输入。"
+                    )
+                    cfg.model_cfg.encoder.in_dim = feat_dim
+
             # 7) 模型 & 优化器
             if cfg.mixed_precision:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
@@ -1096,9 +1139,7 @@ class Trainer:
             warmup_n = 0
         if warmup_n > 0:
             X_sample = tf.convert_to_tensor(self.X_vol[:warmup_n], dtype=tf.float32)
-            mid = 0.5 * (float(cfg.preload_min) + float(cfg.preload_max))
-            warmup_case = self._make_warmup_case()
-            params = self._make_preload_params(warmup_case)
+            params = self._warmup_params or self._make_preload_params(self._make_warmup_case())
             eval_params = self._extract_final_stage_params(params)
             # 调用一次前向以创建所有变量；忽略实际输出
             _ = self.model.u_fn(X_sample, eval_params)
