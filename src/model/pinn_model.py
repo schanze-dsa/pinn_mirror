@@ -6,15 +6,17 @@ pinn_model.py
 Displacement field network for DFEM/PINN with preload conditioning.
 
 Components:
-- ParamEncoder: encodes normalized preload vector (P1,P2,P3) -> condition z
-- GaussianFourierFeatures: optional positional encoding for coordinates
-- DisplacementNet: Graph neural network (GCN) backbone; inputs [x_feat, z] -> u(x; P)
+- ParamEncoder: encodes normalized preload features -> condition z
+  - GaussianFourierFeatures: optional positional encoding for coordinates
+  - DisplacementNet: Graph neural network (GCN) backbone; inputs [x_feat, z] -> u(x; P)
 
 Public factory:
     model = create_displacement_model(cfg)      # returns DisplacementModel
     u = model.u_fn(X, params)                   # X: (N,3) mm (normalized outside if needed)
                                                # params: dict; must contain either:
-                                               #   "P_hat": (3,) or (N,3) normalized preload
+                                               #   "P_hat": preload feature vector; staged 情况下
+                                               #           包含 [P_hat, mask, last, rank]，长度
+                                               #           为 4*n_bolts
                                                # or "P": (3,) with "preload_shift/scale" in cfg
 
 Notes:
@@ -393,6 +395,7 @@ class ParamEncoder(tf.keras.layers.Layer):
     def __init__(self, cfg: EncoderConfig):
         super().__init__()
         self.cfg = cfg
+        self.in_dim = int(getattr(cfg, "in_dim", 0) or 0)
         self.mlp = MLP(
             width=cfg.width,
             depth=cfg.depth,
@@ -404,7 +407,35 @@ class ParamEncoder(tf.keras.layers.Layer):
         # Ensure 2D: (B,3)
         if P_hat.shape.rank == 1:
             P_hat = tf.reshape(P_hat, (1, -1))
+        P_hat = self._normalize_dim(P_hat)
         return self.mlp(P_hat)  # (B, out_dim)
+
+    def _normalize_dim(self, P_hat: tf.Tensor) -> tf.Tensor:
+        """Pad/trim P_hat to the configured input dim so encoder weight shapes一致。"""
+
+        target = self.in_dim
+        if target <= 0:
+            return P_hat
+
+        # 静态形状已匹配则直接返回
+        if P_hat.shape.rank is not None and P_hat.shape[-1] == target:
+            P_hat.set_shape((None, target))
+            return P_hat
+
+        cur = tf.shape(P_hat)[-1]
+        target_tf = tf.cast(target, tf.int32)
+
+        def _pad():
+            pad_width = target_tf - cur
+            pad_zeros = tf.zeros((tf.shape(P_hat)[0], pad_width), dtype=P_hat.dtype)
+            return tf.concat([P_hat, pad_zeros], axis=-1)
+
+        def _trim():
+            return P_hat[:, :target_tf]
+
+        adjusted = tf.cond(cur < target_tf, _pad, _trim)
+        adjusted.set_shape((None, target))
+        return adjusted
 
 
 class DisplacementNet(tf.keras.Model):
