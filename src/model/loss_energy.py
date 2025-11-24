@@ -311,15 +311,26 @@ class TotalEnergy:
         if not stage_seq:
             return self._combine_parts(totals), totals, stats_all
 
+        prev_parts: Optional[Dict[str, tf.Tensor]] = None
         for idx, stage_params in enumerate(stage_seq):
             stage_parts, stage_stats = self._compute_parts(u_fn, stage_params, tape)
             for k, v in stage_stats.items():
                 stats_all[f"s{idx+1}_{k}"] = v
+
             for key in keys:
                 cur = tf.cast(stage_parts.get(key, tf.cast(0.0, dtype)), dtype)
-                totals[key] = totals[key] + cur
+                prev = (
+                    tf.cast(prev_parts.get(key, tf.cast(0.0, dtype)), dtype)
+                    if prev_parts is not None
+                    else tf.cast(0.0, dtype)
+                )
+                delta = cur - prev if prev_parts is not None else cur
+                totals[key] = totals[key] + delta
                 stats_all[f"s{idx+1}_{key}"] = cur
+                stats_all[f"s{idx+1}_delta{key}"] = delta
                 stats_all[f"s{idx+1}_cum{key}"] = totals[key]
+
+            prev_parts = stage_parts
 
         if isinstance(root_params, dict):
             if "stage_order" in root_params:
