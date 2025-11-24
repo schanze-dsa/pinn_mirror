@@ -256,12 +256,17 @@ class TotalEnergy:
         )
 
     def _energy_staged(self, u_fn, stages, root_params, tape=None):
-        """Accumulate energy across staged preload applications."""
+        """Accumulate energy across staged preload applications.
+
+        与先前的“望向最终态”做差不同，这里直接累加每个阶段的能量/功，
+        同时为相邻阶段的开口量变化乘以载荷变化添加一项耗散式惩罚，
+        使得不同的加载顺序在无数据训练时也能对总损失产生影响。
+        """
         dtype = self.dtype
         keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
-        prev: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
+        path_penalty = tf.cast(0.0, dtype)
 
         if isinstance(stages, dict):
             stage_tensor_P = stages.get("P")
@@ -308,18 +313,40 @@ class TotalEnergy:
         if not stage_seq:
             return self._combine_parts(totals), totals, stats_all
 
+        prev_parts: Optional[Dict[str, tf.Tensor]] = None
+        prev_bolt_deltas: Optional[tf.Tensor] = None
+        prev_P: Optional[tf.Tensor] = None
         for idx, stage_params in enumerate(stage_seq):
             stage_parts, stage_stats = self._compute_parts(u_fn, stage_params, tape)
             for k, v in stage_stats.items():
                 stats_all[f"s{idx+1}_{k}"] = v
+
             for key in keys:
                 cur = tf.cast(stage_parts.get(key, tf.cast(0.0, dtype)), dtype)
-                prev_val = prev.get(key, tf.cast(0.0, dtype))
-                inc = cur - prev_val
-                totals[key] = totals[key] + inc
-                stats_all[f"s{idx+1}_d{key}"] = inc
+                totals[key] = totals[key] + cur
                 stats_all[f"s{idx+1}_{key}"] = cur
-                prev[key] = cur
+                stats_all[f"s{idx+1}_cum{key}"] = totals[key]
+
+            bolt_deltas = None
+            pre_entry = stage_stats.get("pre_preload")
+            if isinstance(pre_entry, dict) and "bolt_deltas" in pre_entry:
+                bolt_deltas = tf.cast(pre_entry["bolt_deltas"], dtype)
+
+            P_vec = tf.cast(tf.convert_to_tensor(stage_params.get("P", [])), dtype)
+
+            if idx > 0 and bolt_deltas is not None and prev_bolt_deltas is not None:
+                disp_jump = tf.reduce_sum(tf.abs(bolt_deltas - prev_bolt_deltas))
+                load_jump = tf.reduce_sum(tf.abs(P_vec - prev_P)) if prev_P is not None else tf.cast(0.0, dtype)
+                stage_path = disp_jump * load_jump
+                path_penalty = path_penalty + stage_path
+                stats_all[f"s{idx+1}_path_penalty"] = stage_path
+
+            if bolt_deltas is not None:
+                prev_bolt_deltas = bolt_deltas
+            if tf.size(P_vec) > 0:
+                prev_P = P_vec
+
+            prev_parts = stage_parts
 
         if isinstance(root_params, dict):
             if "stage_order" in root_params:
@@ -329,7 +356,9 @@ class TotalEnergy:
             if "stage_count" in root_params:
                 stats_all["stage_count"] = root_params["stage_count"]
 
-        Pi = self._combine_parts(totals)
+        stats_all["path_penalty_total"] = path_penalty
+
+        Pi = self._combine_parts(totals) + path_penalty
         return Pi, totals, stats_all
 
     # ---------- outer updates ----------
