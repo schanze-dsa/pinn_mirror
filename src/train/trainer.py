@@ -124,6 +124,10 @@ class TrainerConfig:
     preload_sequence_shuffle: bool = False
     preload_sequence_jitter: float = 0.0
 
+    # 预紧采样方式
+    preload_sampling: str = "lhs"            # "lhs" | "uniform"
+    preload_lhs_size: int = 64               # 每批次的拉丁超立方样本数量
+
     # 预紧顺序（分步加载）
     preload_use_stages: bool = False
     preload_randomize_order: bool = True
@@ -206,6 +210,11 @@ class Trainer:
         np.random.seed(cfg.seed)
         tf.random.set_seed(cfg.seed)
 
+        self._preload_dim: int = 3
+        self._preload_lhs_rng = np.random.default_rng(cfg.seed + 11)
+        self._preload_lhs_points: np.ndarray = np.zeros((0, self._preload_dim), dtype=np.float32)
+        self._preload_lhs_index: int = 0
+
         # 默认设备描述，避免后续日志访问属性时出错
         self.device_summary = "Unknown"
         self._step_stage_times: List[Tuple[str, float]] = []
@@ -223,6 +232,9 @@ class Trainer:
         self._train_vars: List[tf.Variable] = []
         self._contact_rar_cache: Optional[Dict[str, Any]] = None
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
+
+        if cfg.preload_specs:
+            self._set_preload_dim(len(cfg.preload_specs))
 
         if cfg.preload_sequence:
             sanitized: List[np.ndarray] = []
@@ -309,6 +321,7 @@ class Trainer:
                     print(
                         f"[preload] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
                     )
+                self._set_preload_dim(self._preload_sequence[0].size)
             else:
                 print("[preload] preload_sequence 中有效条目为空，改为随机采样。")
         if cfg.model_cfg.preload_scale:
@@ -383,6 +396,41 @@ class Trainer:
 
 
     # ----------------- 辅助工具 -----------------
+
+    def _set_preload_dim(self, nb: int):
+        nb_int = int(nb)
+        if nb_int <= 0:
+            nb_int = 3
+        if nb_int != getattr(self, "_preload_dim", None):
+            self._preload_dim = nb_int
+            self._preload_lhs_points = np.zeros((0, nb_int), dtype=np.float32)
+            self._preload_lhs_index = 0
+
+    def _generate_lhs_points(self, n_samples: int, n_dim: int, lo: float, hi: float) -> np.ndarray:
+        """简单的拉丁超立方采样生成器，返回 (n_samples, n_dim)."""
+
+        if n_samples <= 0:
+            return np.zeros((0, n_dim), dtype=np.float32)
+        unit = np.zeros((n_samples, n_dim), dtype=np.float32)
+        for j in range(n_dim):
+            seg = (np.arange(n_samples, dtype=np.float32) + self._preload_lhs_rng.random(n_samples)) / float(n_samples)
+            self._preload_lhs_rng.shuffle(seg)
+            unit[:, j] = seg
+        scale = hi - lo
+        return (lo + unit * scale).astype(np.float32)
+
+    def _next_lhs_preload(self, n_dim: int, lo: float, hi: float) -> np.ndarray:
+        batch = max(1, int(self.cfg.preload_lhs_size))
+        if self._preload_lhs_points.shape[1] != n_dim or len(self._preload_lhs_points) == 0:
+            self._preload_lhs_points = self._generate_lhs_points(batch, n_dim, lo, hi)
+            self._preload_lhs_index = 0
+        if self._preload_lhs_index >= len(self._preload_lhs_points):
+            self._preload_lhs_points = self._generate_lhs_points(batch, n_dim, lo, hi)
+            self._preload_lhs_index = 0
+        out = self._preload_lhs_points[self._preload_lhs_index].copy()
+        self._preload_lhs_index += 1
+        return out
+
     @staticmethod
     def _format_seconds(seconds: float) -> str:
         if seconds < 1e-3:
@@ -644,9 +692,14 @@ class Trainer:
             return target.astype(np.float32)
 
         lo, hi = self.cfg.preload_min, self.cfg.preload_max
-        out = np.random.uniform(lo, hi, size=(3,)).astype(np.float32)
+        nb = int(self._preload_dim)
+        sampling = (self.cfg.preload_sampling or "uniform").lower()
+        if sampling == "lhs":
+            out = self._next_lhs_preload(nb, lo, hi)
+        else:
+            out = np.random.uniform(lo, hi, size=(nb,)).astype(np.float32)
         self._last_preload_order = None
-        return out
+        return out.astype(np.float32)
 
     def _normalize_order(self, order: Optional[Any], nb: int) -> Optional[np.ndarray]:
         if order is None:
