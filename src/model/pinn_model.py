@@ -6,15 +6,17 @@ pinn_model.py
 Displacement field network for DFEM/PINN with preload conditioning.
 
 Components:
-- ParamEncoder: encodes normalized preload vector (P1,P2,P3) -> condition z
-- GaussianFourierFeatures: optional positional encoding for coordinates
-- DisplacementNet: Graph neural network (GCN) backbone; inputs [x_feat, z] -> u(x; P)
+- ParamEncoder: encodes normalized preload features -> condition z
+  - GaussianFourierFeatures: optional positional encoding for coordinates
+  - DisplacementNet: Graph neural network (GCN) backbone; inputs [x_feat, z] -> u(x; P)
 
 Public factory:
     model = create_displacement_model(cfg)      # returns DisplacementModel
     u = model.u_fn(X, params)                   # X: (N,3) mm (normalized outside if needed)
                                                # params: dict; must contain either:
-                                               #   "P_hat": (3,) or (N,3) normalized preload
+                                               #   "P_hat": preload feature vector; staged 情况下
+                                               #           包含 [P_hat, mask, last, rank]，长度
+                                               #           为 4*n_bolts
                                                # or "P": (3,) with "preload_shift/scale" in cfg
 
 Notes:
@@ -41,6 +43,8 @@ import tensorflow as tf
 class FourierConfig:
     num: int = 8              # number of Gaussian frequencies per axis; 0 -> disable
     sigma: float = 3.0        # std for frequency sampling (larger -> higher freq coverage)
+    sigmas: Optional[Tuple[float, ...]] = (1.0, 10.0, 50.0)  # multi-scale sigmas; if set, overrides sigma
+    trainable: bool = False    # whether to learn B instead of keeping it frozen
 
 @dataclass
 class EncoderConfig:
@@ -114,40 +118,61 @@ def _maybe_mixed_precision(policy: Optional[str]):
 
 class GaussianFourierFeatures(tf.keras.layers.Layer):
     """
-    Map 3D coordinates x -> [sin(Bx), cos(Bx), x] with B ~ N(0, sigma^2).
+    Map 3D coordinates x -> concat_k [sin(B_k x), cos(B_k x)] with B_k ~ N(0, sigma_k^2).
+    - 支持多尺度 sigma_k（例如 [1,10,50]），每个尺度采样 num 个频率后拼接。
+    - 可选让 B_k 变为 trainable，以便网络自适应频段。默认保持冻结。
     Mixed precision 兼容策略：
     - 统一在 float32 中进行 matmul/sin/cos/concat，再 cast 回输入 dtype（通常是 float16）。
     """
-    def __init__(self, in_dim: int, num: int, sigma: float, **kwargs):
+
+    def __init__(
+        self,
+        in_dim: int,
+        num: int,
+        sigma: float,
+        sigmas: Optional[Tuple[float, ...]] = None,
+        trainable: bool = False,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.in_dim = in_dim
         self.num = int(num)
         self.sigma = float(sigma)
-        self.B: Optional[tf.Variable] = None  # (in_dim, num)
+        self.sigmas = tuple(sigmas) if sigmas is not None else None
+        self.trainable_B = bool(trainable)
+        self.B_list: list[tf.Variable] = []
 
     def build(self, input_shape):
         if self.num <= 0:
             return
-        # fixed random matrix (not trainable)
         rng = tf.random.Generator.from_non_deterministic_state()
-        B_np = rng.normal(shape=(self.in_dim, self.num), dtype=tf.float32) * self.sigma
-        self.B = tf.Variable(B_np, trainable=False, name="B_fourier")
+        sigmas = self.sigmas if self.sigmas else (self.sigma,)
+        for idx, sig in enumerate(sigmas):
+            B_np = rng.normal(shape=(self.in_dim, self.num), dtype=tf.float32) * float(sig)
+            self.B_list.append(
+                tf.Variable(B_np, trainable=self.trainable_B, name=f"B_fourier_{idx}")
+            )
 
     def call(self, x: tf.Tensor) -> tf.Tensor:
-        if self.num <= 0 or self.B is None:
+        if self.num <= 0 or not self.B_list:
             return x
         # ---- 修复 dtype 不匹配：在 float32 里计算，最后再 cast 回来 ----
         x32 = tf.cast(x, tf.float32)      # (N, in_dim)
-        B32 = tf.cast(self.B, tf.float32) # (in_dim, num)
-        xb32 = tf.matmul(x32, B32)        # (N, num) float32
-        s32 = tf.sin(xb32)
-        c32 = tf.cos(xb32)
-        feat32 = tf.concat([s32, c32, x32], axis=-1)  # (N, 2*num + in_dim) float32
+        feat_bands = []
+        for B in self.B_list:
+            B32 = tf.cast(B, tf.float32)  # (in_dim, num)
+            xb32 = tf.matmul(x32, B32)    # (N, num) float32
+            feat_bands.append(tf.sin(xb32))
+            feat_bands.append(tf.cos(xb32))
+        feat32 = tf.concat(feat_bands + [x32], axis=-1)
         return tf.cast(feat32, x.dtype)   # 回到与输入一致的 dtype（mixed_float16 下为 float16）
 
     @property
     def out_dim(self) -> int:
-        return (0 if self.num <= 0 else self.num * 2) + self.in_dim
+        if self.num <= 0:
+            return self.in_dim
+        n_bands = len(self.sigmas) if self.sigmas else 1
+        return n_bands * self.num * 2 + self.in_dim
 
 
 class MLP(tf.keras.layers.Layer):
@@ -393,6 +418,7 @@ class ParamEncoder(tf.keras.layers.Layer):
     def __init__(self, cfg: EncoderConfig):
         super().__init__()
         self.cfg = cfg
+        self.in_dim = int(getattr(cfg, "in_dim", 0) or 0)
         self.mlp = MLP(
             width=cfg.width,
             depth=cfg.depth,
@@ -404,7 +430,35 @@ class ParamEncoder(tf.keras.layers.Layer):
         # Ensure 2D: (B,3)
         if P_hat.shape.rank == 1:
             P_hat = tf.reshape(P_hat, (1, -1))
+        P_hat = self._normalize_dim(P_hat)
         return self.mlp(P_hat)  # (B, out_dim)
+
+    def _normalize_dim(self, P_hat: tf.Tensor) -> tf.Tensor:
+        """Pad/trim P_hat to the configured input dim so encoder weight shapes一致。"""
+
+        target = self.in_dim
+        if target <= 0:
+            return P_hat
+
+        # 静态形状已匹配则直接返回
+        if P_hat.shape.rank is not None and P_hat.shape[-1] == target:
+            P_hat.set_shape((None, target))
+            return P_hat
+
+        cur = tf.shape(P_hat)[-1]
+        target_tf = tf.cast(target, tf.int32)
+
+        def _pad():
+            pad_width = target_tf - cur
+            pad_zeros = tf.zeros((tf.shape(P_hat)[0], pad_width), dtype=P_hat.dtype)
+            return tf.concat([P_hat, pad_zeros], axis=-1)
+
+        def _trim():
+            return P_hat[:, :target_tf]
+
+        adjusted = tf.cond(cur < target_tf, _pad, _trim)
+        adjusted.set_shape((None, target))
+        return adjusted
 
 
 class DisplacementNet(tf.keras.Model):
@@ -420,7 +474,11 @@ class DisplacementNet(tf.keras.Model):
 
         # Fourier PE
         self.pe = GaussianFourierFeatures(
-            in_dim=cfg.in_dim_coord, num=cfg.fourier.num, sigma=cfg.fourier.sigma
+            in_dim=cfg.in_dim_coord,
+            num=cfg.fourier.num,
+            sigma=cfg.fourier.sigma,
+            sigmas=cfg.fourier.sigmas,
+            trainable=cfg.fourier.trainable,
         )
 
         in_dim_total = self.pe.out_dim + cfg.cond_dim
