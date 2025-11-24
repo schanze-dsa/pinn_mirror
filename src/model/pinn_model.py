@@ -43,6 +43,8 @@ import tensorflow as tf
 class FourierConfig:
     num: int = 8              # number of Gaussian frequencies per axis; 0 -> disable
     sigma: float = 3.0        # std for frequency sampling (larger -> higher freq coverage)
+    sigmas: Optional[Tuple[float, ...]] = (1.0, 10.0, 50.0)  # multi-scale sigmas; if set, overrides sigma
+    trainable: bool = False    # whether to learn B instead of keeping it frozen
 
 @dataclass
 class EncoderConfig:
@@ -116,40 +118,61 @@ def _maybe_mixed_precision(policy: Optional[str]):
 
 class GaussianFourierFeatures(tf.keras.layers.Layer):
     """
-    Map 3D coordinates x -> [sin(Bx), cos(Bx), x] with B ~ N(0, sigma^2).
+    Map 3D coordinates x -> concat_k [sin(B_k x), cos(B_k x)] with B_k ~ N(0, sigma_k^2).
+    - 支持多尺度 sigma_k（例如 [1,10,50]），每个尺度采样 num 个频率后拼接。
+    - 可选让 B_k 变为 trainable，以便网络自适应频段。默认保持冻结。
     Mixed precision 兼容策略：
     - 统一在 float32 中进行 matmul/sin/cos/concat，再 cast 回输入 dtype（通常是 float16）。
     """
-    def __init__(self, in_dim: int, num: int, sigma: float, **kwargs):
+
+    def __init__(
+        self,
+        in_dim: int,
+        num: int,
+        sigma: float,
+        sigmas: Optional[Tuple[float, ...]] = None,
+        trainable: bool = False,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.in_dim = in_dim
         self.num = int(num)
         self.sigma = float(sigma)
-        self.B: Optional[tf.Variable] = None  # (in_dim, num)
+        self.sigmas = tuple(sigmas) if sigmas is not None else None
+        self.trainable_B = bool(trainable)
+        self.B_list: list[tf.Variable] = []
 
     def build(self, input_shape):
         if self.num <= 0:
             return
-        # fixed random matrix (not trainable)
         rng = tf.random.Generator.from_non_deterministic_state()
-        B_np = rng.normal(shape=(self.in_dim, self.num), dtype=tf.float32) * self.sigma
-        self.B = tf.Variable(B_np, trainable=False, name="B_fourier")
+        sigmas = self.sigmas if self.sigmas else (self.sigma,)
+        for idx, sig in enumerate(sigmas):
+            B_np = rng.normal(shape=(self.in_dim, self.num), dtype=tf.float32) * float(sig)
+            self.B_list.append(
+                tf.Variable(B_np, trainable=self.trainable_B, name=f"B_fourier_{idx}")
+            )
 
     def call(self, x: tf.Tensor) -> tf.Tensor:
-        if self.num <= 0 or self.B is None:
+        if self.num <= 0 or not self.B_list:
             return x
         # ---- 修复 dtype 不匹配：在 float32 里计算，最后再 cast 回来 ----
         x32 = tf.cast(x, tf.float32)      # (N, in_dim)
-        B32 = tf.cast(self.B, tf.float32) # (in_dim, num)
-        xb32 = tf.matmul(x32, B32)        # (N, num) float32
-        s32 = tf.sin(xb32)
-        c32 = tf.cos(xb32)
-        feat32 = tf.concat([s32, c32, x32], axis=-1)  # (N, 2*num + in_dim) float32
+        feat_bands = []
+        for B in self.B_list:
+            B32 = tf.cast(B, tf.float32)  # (in_dim, num)
+            xb32 = tf.matmul(x32, B32)    # (N, num) float32
+            feat_bands.append(tf.sin(xb32))
+            feat_bands.append(tf.cos(xb32))
+        feat32 = tf.concat(feat_bands + [x32], axis=-1)
         return tf.cast(feat32, x.dtype)   # 回到与输入一致的 dtype（mixed_float16 下为 float16）
 
     @property
     def out_dim(self) -> int:
-        return (0 if self.num <= 0 else self.num * 2) + self.in_dim
+        if self.num <= 0:
+            return self.in_dim
+        n_bands = len(self.sigmas) if self.sigmas else 1
+        return n_bands * self.num * 2 + self.in_dim
 
 
 class MLP(tf.keras.layers.Layer):
@@ -451,7 +474,11 @@ class DisplacementNet(tf.keras.Model):
 
         # Fourier PE
         self.pe = GaussianFourierFeatures(
-            in_dim=cfg.in_dim_coord, num=cfg.fourier.num, sigma=cfg.fourier.sigma
+            in_dim=cfg.in_dim_coord,
+            num=cfg.fourier.num,
+            sigma=cfg.fourier.sigma,
+            sigmas=cfg.fourier.sigmas,
+            trainable=cfg.fourier.trainable,
         )
 
         in_dim_total = self.pe.out_dim + cfg.cond_dim
