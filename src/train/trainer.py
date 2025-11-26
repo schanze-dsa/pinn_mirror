@@ -147,7 +147,7 @@ class TrainerConfig:
     contact_cfg: ContactOperatorConfig = field(default_factory=ContactOperatorConfig)
     preload_cfg: PreloadConfig = field(default_factory=PreloadConfig)
     total_cfg: TotalConfig = field(default_factory=lambda: TotalConfig(
-        w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_bc=1.0, w_pre=1.0
+        w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_pre=1.0, w_sigma=1.0
     ))
 
     # 损失加权（自适应）
@@ -480,8 +480,8 @@ class Trainer:
             "E_cn": getattr(self.cfg.total_cfg, "w_cn", 1.0),
             "E_ct": getattr(self.cfg.total_cfg, "w_ct", 1.0),
             "E_tie": getattr(self.cfg.total_cfg, "w_tie", 1.0),
-            "E_bc": getattr(self.cfg.total_cfg, "w_bc", 1.0),
             "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
+            "E_sigma": getattr(self.cfg.total_cfg, "w_sigma", 1.0),
         }
         if self.loss_state is not None:
             for key, value in self.loss_state.current.items():
@@ -513,8 +513,8 @@ class Trainer:
             ("E_cn", "Ecn"),
             ("E_ct", "Ect"),
             ("E_tie", "Etie"),
-            ("E_bc", "Ebc"),
             ("W_pre", "Wpre"),
+            ("E_sigma", "Esig"),
         ]
         aliases = {
             "E_cn": ("E_cn", "E_n"),
@@ -1723,8 +1723,8 @@ class Trainer:
             "E_cn": self.cfg.total_cfg.w_cn,
             "E_ct": self.cfg.total_cfg.w_ct,
             "E_tie": self.cfg.total_cfg.w_tie,
-            "E_bc": self.cfg.total_cfg.w_bc,
             "W_pre": self.cfg.total_cfg.w_pre,
+            "E_sigma": self.cfg.total_cfg.w_sigma,
             # 残差项默认权重为 0，需要的话再在 config 里改
             "R_fric_comp": 0.0,
             "R_contact_comp": 0.0,

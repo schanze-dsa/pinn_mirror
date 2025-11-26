@@ -10,15 +10,16 @@ Composition (默认的线性组合形式，可以在外部被 loss_weights 覆�
         + w_cn * E_cn
         + w_ct * E_ct
         + w_tie * E_tie
-        + w_bc  * E_bc
         - w_pre * W_pre
+        + w_sigma * E_sigma
 
 Public usage (typical):
     # 1) Build sub-operators per batch
     elas.build_from_numpy(...) / build_dfem_subcells(...)
     contact.build_from_cat(cat_dict, extra_weights=..., auto_orient=True)
     tie.build_from_numpy(xs, xm, w_area, dof_mask=None)
-    bc.build_from_numpy(X_bc, dof_mask, u_target, w_bc)
+    # (可选) 若需要监控边界残差，可构建 BoundaryPenalty 并传入 bcs；
+    # 硬约束模式下其能量不再计入损失。
 
     # 2) Assemble total energy
     total = TotalEnergy()
@@ -34,7 +35,7 @@ Weighted PINN:
     - You can multiply extra per-sample weights into components:
         contact.multiply_weights(w_contact)
         for t in ties: t.multiply_weights(w_tie)
-        for b in bcs:  b.multiply_weights(w_bc)
+        # 若仍需对边界残差加权，可自行在 BoundaryPenalty 内处理；默认不计入损失
     - If you need to reweight volume points, see TotalEnergy.scale_volume_weights().
 """
 
@@ -64,7 +65,6 @@ class TotalConfig:
     w_cn: float = 1.0            # normal contact  -> E_cn
     w_ct: float = 1.0            # frictional      -> E_ct
     w_tie: float = 1.0
-    w_bc: float = 1.0
     w_pre: float = 1.0           # multiplies the subtracted W_pre
     w_sigma: float = 1.0         # stress supervision term (σ_pred vs σ_phys)
 
@@ -108,7 +108,6 @@ class TotalEnergy:
         self.w_cn  = tf.Variable(self.cfg.w_cn,  dtype=self.dtype, trainable=False, name="w_cn")
         self.w_ct  = tf.Variable(self.cfg.w_ct,  dtype=self.dtype, trainable=False, name="w_ct")
         self.w_tie = tf.Variable(self.cfg.w_tie, dtype=self.dtype, trainable=False, name="w_tie")
-        self.w_bc  = tf.Variable(self.cfg.w_bc,  dtype=self.dtype, trainable=False, name="w_bc")
         self.w_pre = tf.Variable(self.cfg.w_pre, dtype=self.dtype, trainable=False, name="w_pre")
         self.w_sigma = tf.Variable(self.cfg.w_sigma, dtype=self.dtype, trainable=False, name="w_sigma")
 
@@ -194,7 +193,6 @@ class TotalEnergy:
             "E_cn": zero,
             "E_ct": zero,
             "E_tie": zero,
-            "E_bc": zero,
             "W_pre": zero,
         }
         stats: Dict[str, tf.Tensor] = {}
@@ -241,13 +239,9 @@ class TotalEnergy:
                 parts["E_tie"] = tf.add_n(tie_terms)
 
         if self.bcs:
-            bc_terms = []
             for i, b in enumerate(self.bcs):
-                Ei, si = b.energy(u_fn, params)
-                bc_terms.append(tf.cast(Ei, dtype))
+                _, si = b.energy(u_fn, params)
                 stats.update({f"bc{i+1}_{k}": v for k, v in si.items()})
-            if bc_terms:
-                parts["E_bc"] = tf.add_n(bc_terms)
 
         if self.preload is not None:
             W_pre, pstats = self.preload.energy(u_fn, params)
@@ -301,7 +295,6 @@ class TotalEnergy:
             + self.w_cn * parts.get("E_cn", tf.cast(0.0, self.dtype))
             + self.w_ct * parts.get("E_ct", tf.cast(0.0, self.dtype))
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
-            + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
             - self.w_pre * parts.get("W_pre", tf.cast(0.0, self.dtype))
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
         )
@@ -314,7 +307,6 @@ class TotalEnergy:
             + self.w_cn * parts.get("E_cn", tf.cast(0.0, self.dtype))
             + self.w_ct * parts.get("E_ct", tf.cast(0.0, self.dtype))
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
-            + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
         )
 
@@ -322,12 +314,12 @@ class TotalEnergy:
         """Accumulate energy across staged preload applications.
 
         与先前的“望向最终态”做差不同，这里以增量势能形式逐步累加：
-        Π_step,i = (E_int + E_cn + E_ct + E_tie + E_bc)_i - ΔW_pre,i
+        Π_step,i = (E_int + E_cn + E_ct + E_tie)_i - ΔW_pre,i
         并为相邻阶段的开口/滑移跳变乘以载荷跳变添加耗散式惩罚，使不同加载顺序
         能够影响无数据训练，同时保留 ALM 乘子在阶段间的自然演化。
         """
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_sigma"]
+        keys = ["E_int", "E_cn", "E_ct", "E_tie", "W_pre", "E_sigma"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty = tf.cast(0.0, dtype)
@@ -527,7 +519,6 @@ class TotalEnergy:
         w_cn: Optional[float] = None,
         w_ct: Optional[float] = None,
         w_tie: Optional[float] = None,
-        w_bc: Optional[float] = None,
         w_pre: Optional[float] = None,
     ):
         """Set any subset of coefficients on the fly (e.g., curriculum)."""
@@ -539,8 +530,6 @@ class TotalEnergy:
             self.w_ct.assign(tf.cast(w_ct, self.dtype))
         if w_tie is not None:
             self.w_tie.assign(tf.cast(w_tie, self.dtype))
-        if w_bc is not None:
-            self.w_bc.assign(tf.cast(w_bc, self.dtype))
         if w_pre is not None:
             self.w_pre.assign(tf.cast(w_pre, self.dtype))
 
@@ -600,7 +589,7 @@ if __name__ == "__main__":
     bc = BoundaryPenalty(BoundaryConfig())
     X_bc = np.random.randn(4, 3)
     mask = np.ones((4, 3))
-    bc.build_from_numpy(X_bc, mask, u_target=None, w_bc=None)
+    bc.build_from_numpy(X_bc, mask, None, None)
     pl = PreloadWork()
 
     # 4) Dummy u_fn
