@@ -79,7 +79,8 @@ def softplus_neg(x: tf.Tensor, beta: tf.Tensor) -> tf.Tensor:
 @dataclass
 class NormalALMConfig:
     """Hyperparameters for the normal-contact ALM operator."""
-    beta: float = 50.0          # softplus steepness
+    mode: str = "penalty"          # "penalty" (softplus) or "alm"
+    beta: float = 100.0         # softplus steepness (增大默认值以逼近硬接触)
     mu_n: float = 1.0e3         # ALM coefficient (normal penalty)
     enforce_nonneg_lambda: bool = True
     dtype: str = "float32"
@@ -256,7 +257,10 @@ class NormalContactALM:
         """
         Compute ALM normal-contact energy (scalar) and stats (dict):
 
-            En = Σ w_eff · [ λ · φ(g) + 0.5 · μ_n · φ(g)^2 ]
+        - 若 mode="alm":
+              En = Σ w_eff · [ λ · φ(g) + 0.5 · μ_n · φ(g)^2 ]
+        - 若 mode="penalty":
+              En = Σ w_eff · 0.5 · μ_n · φ(g)^2
 
         其中：
             - w_eff = w * extra_weights（若 extra_weights 为 None，则 w_eff = w）；
@@ -281,7 +285,12 @@ class NormalContactALM:
         if extra_weights is not None:
             w_eff = w_eff * tf.cast(extra_weights, self.dtype)
 
-        En = tf.reduce_sum(w_eff * (self.lmbda * phi + 0.5 * self.mu_n * phi * phi))
+        p_eff = self._compute_effective_pressure(phi)
+
+        if self.cfg.mode.lower() == "alm":
+            En = tf.reduce_sum(w_eff * (self.lmbda * phi + 0.5 * self.mu_n * phi * phi))
+        else:
+            En = tf.reduce_sum(w_eff * (0.5 * self.mu_n * phi * phi))
 
         # Stats for logging
         stats = {
@@ -290,6 +299,7 @@ class NormalContactALM:
             "cn_pen_ratio": tf.reduce_mean(tf.cast(phi > 0.0, self.dtype)),  # fraction with penetration (phi>0)
             "cn_phi_mean": tf.reduce_mean(phi),
             "cn_mean_weight": tf.reduce_mean(w_eff),
+            "cn_mean_pressure": tf.reduce_mean(p_eff),
         }
         return En, stats
 
@@ -311,6 +321,11 @@ class NormalContactALM:
         step_scale : float
             增强型拉格朗日的步长因子；可以在 Trainer 中根据步数递增/递减。
         """
+        if self.cfg.mode.lower() != "alm":
+            # 纯软化罚函数模式下不需要更新乘子，但仍刷新 gap 统计
+            self._gap(u_fn, params)
+            return
+
         g = self._gap(u_fn, params)
         phi = softplus_neg(g, self.beta)
 
@@ -342,6 +357,23 @@ class NormalContactALM:
         """
         ew = _to_tf(extra_w, self.dtype)
         self.w.assign(self.w * ew)
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+
+    def _compute_effective_pressure(self, phi: tf.Tensor) -> tf.Tensor:
+        """p_eff = max(0, λ + μ_n φ)（ALM）或 μ_n φ（softplus penalty）。"""
+        p = self.mu_n * phi
+        if self.cfg.mode.lower() == "alm":
+            p = self.lmbda + p
+        return tf.maximum(p, tf.cast(0.0, self.dtype))
+
+    def effective_normal_pressure(self, u_fn, params=None) -> tf.Tensor:
+        """Expose effective compressive pressure for friction算子复用。"""
+        g = self._gap(u_fn, params)
+        phi = softplus_neg(g, self.beta)
+        return self._compute_effective_pressure(phi)
 
     def reset_for_new_batch(self):
         """

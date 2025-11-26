@@ -241,6 +241,25 @@ class ContactOperator:
 
         return dict(self._meta)
 
+    # ---------- staged-loading helpers ----------
+
+    def snapshot_stage_state(self) -> Dict[str, np.ndarray]:
+        """Snapshot frictional state so staged preload can carry order-dependent stick/slip."""
+        if hasattr(self.friction, "snapshot_state"):
+            return self.friction.snapshot_state()
+        return {}
+
+    def restore_stage_state(self, state: Dict[str, np.ndarray]):
+        """Restore frictional state from :meth:`snapshot_stage_state`."""
+        if hasattr(self.friction, "restore_state"):
+            self.friction.restore_state(state)
+
+    def last_friction_slip(self):
+        """Expose cached tangential slip for staged path-penalty construction."""
+        if hasattr(self.friction, "last_slip"):
+            return self.friction.last_slip()
+        return None
+
     # ---------- schedules / setters ----------
 
     def set_beta(self, beta: float):
