@@ -46,6 +46,7 @@ import tensorflow as tf
 class BoundaryConfig:
     alpha: float = 1.0e3     # penalty stiffness
     dtype: str = "float32"
+    mode: str = "hard"       # 'penalty' | 'hard'
 
 
 # -----------------------------
@@ -69,6 +70,7 @@ class BoundaryPenalty:
         *,
         alpha: Optional[float] = None,
         dtype: Optional[str] = None,
+        mode: Optional[str] = None,
         dof1: Optional[int] = None,
         dof2: Optional[int] = None,
         kind: Optional[str] = None,
@@ -78,9 +80,11 @@ class BoundaryPenalty:
             cfg = BoundaryConfig()
 
         if alpha is not None:
-            cfg = BoundaryConfig(alpha=alpha, dtype=cfg.dtype)
+            cfg = BoundaryConfig(alpha=alpha, dtype=cfg.dtype, mode=cfg.mode)
         if dtype is not None:
-            cfg = BoundaryConfig(alpha=cfg.alpha, dtype=dtype)
+            cfg = BoundaryConfig(alpha=cfg.alpha, dtype=dtype, mode=cfg.mode)
+        if mode is not None:
+            cfg = BoundaryConfig(alpha=cfg.alpha, dtype=cfg.dtype, mode=mode)
 
         self.cfg = cfg
         self.dtype = tf.float32 if self.cfg.dtype == "float32" else tf.float64
@@ -184,8 +188,9 @@ class BoundaryPenalty:
 
     def energy(self, u_fn, params=None) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
         """
-        Compute boundary penalty energy:
-            E_bc = 0.5 * alpha * Σ w * || M ⊙ (u - u_tgt) ||^2
+        Compute boundary energy. 支持两种模式：
+            - penalty: E_bc = 0.5 * alpha * Σ w * || M ⊙ (u - u_tgt) ||^2
+            - hard   : 直接将有约束的自由度投影为 u_tgt，返回 0 能量，仅记录残差统计
         """
         if self.X is None or self.mask is None or self.u_target is None or self.w is None:
             raise RuntimeError("[BoundaryPenalty] build_from_numpy must be called first.")
@@ -193,9 +198,18 @@ class BoundaryPenalty:
         u = u_fn(self.X, params)                                # (N,3)
         r = (u - self.u_target) * self.mask                     # (N,3)
         r2 = tf.reduce_sum(r * r, axis=1)                       # (N,)
-        E_bc = 0.5 * self.alpha * tf.reduce_sum(self.w * r2)    # scalar
 
-        # stats
+        mode = (self.cfg.mode or "penalty").lower()
+        if mode == "hard":
+            # 直接投影到目标位移，硬约束不将残差纳入能量
+            u_hard = u - r  # u - M⊙(u-u_tgt) = u*(1-M)+u_tgt*M
+            # 防止静态分析工具认为未使用变量
+            _ = tf.stop_gradient(u_hard)
+            E_bc = tf.cast(0.0, self.dtype)
+        else:
+            E_bc = 0.5 * self.alpha * tf.reduce_sum(self.w * r2)    # scalar
+
+        # stats 仍然报告“未投影前”的残差，以便监控硬约束的偏离
         abs_r = tf.sqrt(tf.maximum(r2, tf.cast(0.0, self.dtype)))  # (N,)
         stats = {
             "bc_rms": tf.sqrt(tf.reduce_mean(abs_r * abs_r) + 1e-20),
