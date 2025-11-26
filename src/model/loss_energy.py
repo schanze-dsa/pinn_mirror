@@ -66,6 +66,7 @@ class TotalConfig:
     w_tie: float = 1.0
     w_bc: float = 1.0
     w_pre: float = 1.0           # multiplies the subtracted W_pre
+    w_sigma: float = 1.0         # stress supervision term (σ_pred vs σ_phys)
 
     adaptive_scheme: str = "contact_only"
 
@@ -109,6 +110,7 @@ class TotalEnergy:
         self.w_tie = tf.Variable(self.cfg.w_tie, dtype=self.dtype, trainable=False, name="w_tie")
         self.w_bc  = tf.Variable(self.cfg.w_bc,  dtype=self.dtype, trainable=False, name="w_bc")
         self.w_pre = tf.Variable(self.cfg.w_pre, dtype=self.dtype, trainable=False, name="w_pre")
+        self.w_sigma = tf.Variable(self.cfg.w_sigma, dtype=self.dtype, trainable=False, name="w_sigma")
 
         self._built = False
 
@@ -161,7 +163,7 @@ class TotalEnergy:
 
     # ---------- energy ----------
 
-    def energy(self, u_fn, params=None, tape=None):
+    def energy(self, u_fn, params=None, tape=None, stress_fn=None):
         """
         Compute total potential and return:
             Π_total, parts_dict, stats_dict
@@ -174,14 +176,16 @@ class TotalEnergy:
             raise RuntimeError("[TotalEnergy] attach(...) must be called before energy().")
 
         if isinstance(params, dict) and params.get("stages"):
-            Pi, parts, stats = self._energy_staged(u_fn, params["stages"], params, tape)
+            Pi, parts, stats = self._energy_staged(
+                u_fn, params["stages"], params, tape, stress_fn=stress_fn
+            )
             return Pi, parts, stats
 
-        parts, stats = self._compute_parts(u_fn, params or {}, tape)
+        parts, stats = self._compute_parts(u_fn, params or {}, tape, stress_fn=stress_fn)
         Pi = self._combine_parts(parts)
         return Pi, parts, stats
 
-    def _compute_parts(self, u_fn, params, tape=None):
+    def _compute_parts(self, u_fn, params, tape=None, stress_fn=None):
         """Evaluate all energy components for a given parameter dictionary."""
         dtype = self.dtype
         zero = tf.cast(0.0, dtype)
@@ -195,8 +199,15 @@ class TotalEnergy:
         }
         stats: Dict[str, tf.Tensor] = {}
 
+        elastic_cache = None
         if self.elasticity is not None:
-            E_int, estates = self.elasticity.energy(u_fn, params, tape=tape)
+            E_int_res = self.elasticity.energy(
+                u_fn, params, tape=tape, return_cache=bool(stress_fn)
+            )
+            if bool(stress_fn):
+                E_int, estates, elastic_cache = E_int_res  # type: ignore[misc]
+            else:
+                E_int, estates = E_int_res  # type: ignore[misc]
             parts["E_int"] = tf.cast(E_int, dtype)
             stats.update({f"el_{k}": v for k, v in estates.items()})
 
@@ -243,6 +254,45 @@ class TotalEnergy:
             parts["W_pre"] = tf.cast(W_pre, dtype)
             stats.update({f"pre_{k}": v for k, v in pstats.items()})
 
+        # 应力监督：需要应力头、弹性算子缓存以及配置中开启权重
+        if (
+            stress_fn is not None
+            and elastic_cache is not None
+            and getattr(self.elasticity.cfg, "stress_loss_weight", 0.0) > 0.0
+        ):
+            eps_vec = tf.cast(elastic_cache["eps_vec"], dtype)
+            lam = tf.cast(elastic_cache["lam"], dtype)
+            mu = tf.cast(elastic_cache["mu"], dtype)
+            dof_idx = tf.cast(elastic_cache["dof_idx"], tf.int32)
+
+            # 物理应力（Voigt）σ = λ tr(ε) I + 2 μ ε
+            tr_eps = eps_vec[:, 0] + eps_vec[:, 1] + eps_vec[:, 2]
+            eye_vec = tf.constant([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=dtype)
+            sigma_phys = lam[:, None] * tr_eps[:, None] * eye_vec + 2.0 * mu[:, None] * eps_vec
+
+            # 仅取最前面的 6 个分量进行监督
+            sigma_phys = sigma_phys[:, :6]
+
+            # 将采样到的单元节点去重，评估应力头
+            node_ids = tf.reshape(dof_idx // 3, (-1,))  # (M*4,)
+            unique_nodes, rev = tf.unique(node_ids)
+            X_nodes = tf.cast(tf.gather(self.elasticity.X_nodes_tf, unique_nodes), dtype)
+            _, sigma_pred_nodes = stress_fn(X_nodes, params)
+            sigma_pred_nodes = tf.cast(sigma_pred_nodes, dtype)
+
+            # 恢复到单元级：根据 rev 映射回每个单元的 4 个节点并取均值
+            sigma_nodes_full = tf.gather(sigma_pred_nodes, rev)
+            sigma_cells = tf.reshape(sigma_nodes_full, (tf.shape(dof_idx)[0], 4, -1))
+            sigma_cells = tf.reduce_mean(sigma_cells, axis=1)
+            sigma_cells = sigma_cells[:, : tf.shape(sigma_phys)[1]]
+
+            diff = sigma_cells - sigma_phys
+            loss_sigma = tf.reduce_mean(diff * diff)
+            parts["E_sigma"] = loss_sigma * tf.cast(
+                getattr(self.elasticity.cfg, "stress_loss_weight", 1.0), dtype
+            )
+            stats["stress_rms"] = tf.sqrt(tf.reduce_mean(sigma_cells * sigma_cells) + 1e-20)
+
         return parts, stats
 
     def _combine_parts(self, parts: Dict[str, tf.Tensor]) -> tf.Tensor:
@@ -253,6 +303,7 @@ class TotalEnergy:
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
             + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
             - self.w_pre * parts.get("W_pre", tf.cast(0.0, self.dtype))
+            + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
         )
 
     def _combine_parts_without_preload(self, parts: Dict[str, tf.Tensor]) -> tf.Tensor:
@@ -264,9 +315,10 @@ class TotalEnergy:
             + self.w_ct * parts.get("E_ct", tf.cast(0.0, self.dtype))
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
             + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
+            + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
         )
 
-    def _energy_staged(self, u_fn, stages, root_params, tape=None):
+    def _energy_staged(self, u_fn, stages, root_params, tape=None, stress_fn=None):
         """Accumulate energy across staged preload applications.
 
         与先前的“望向最终态”做差不同，这里以增量势能形式逐步累加：
@@ -275,7 +327,7 @@ class TotalEnergy:
         能够影响无数据训练，同时保留 ALM 乘子在阶段间的自然演化。
         """
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre"]
+        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_sigma"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty = tf.cast(0.0, dtype)
@@ -343,7 +395,9 @@ class TotalEnergy:
             stage_params.setdefault("stage_index", stage_idx)
             stage_params.setdefault("stage_fraction", stage_frac)
 
-            stage_parts, stage_stats = self._compute_parts(u_fn, stage_params, tape)
+            stage_parts, stage_stats = self._compute_parts(
+                u_fn, stage_params, tape, stress_fn=stress_fn
+            )
             for k, v in stage_stats.items():
                 stats_all[f"s{idx+1}_{k}"] = v
 

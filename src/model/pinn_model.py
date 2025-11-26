@@ -73,7 +73,10 @@ class FieldConfig:
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
-    graph_residual: bool = True  # 是否在图卷积层之间加入恒等残差以稳定深层训练
+    # 简单硬约束掩码：以圆孔为例，半径内强制位移为 0，可选开启
+    hard_bc_radius: Optional[float] = None
+    hard_bc_center: Tuple[float, float] = (0.0, 0.0)
+    hard_bc_dims: Tuple[bool, bool, bool] = (True, True, True)
 
 @dataclass
 class ModelConfig:
@@ -585,6 +588,16 @@ class DisplacementNet(tf.keras.Model):
                 hcur = hnext
             hcur = self.graph_norm(hcur)
             u_out = self.graph_out(hcur)
+
+            # 可选硬约束：以圆孔为例，在半径内直接将位移投影为 0，减少软约束漏出
+            if self.cfg.hard_bc_radius is not None and float(self.cfg.hard_bc_radius) > 0.0:
+                cx, cy = self.cfg.hard_bc_center
+                dx = coords[:, 0] - tf.cast(cx, coords.dtype)
+                dy = coords[:, 1] - tf.cast(cy, coords.dtype)
+                r2 = dx * dx + dy * dy
+                mask = tf.cast(r2 > tf.cast(self.cfg.hard_bc_radius, coords.dtype) ** 2, u_out.dtype)
+                dof_mask = tf.convert_to_tensor(self.cfg.hard_bc_dims, dtype=u_out.dtype)
+                u_out = u_out * mask[:, None] * dof_mask
             if return_stress:
                 if self.stress_out is None:
                     raise ValueError("stress head disabled (stress_out_dim<=0)")

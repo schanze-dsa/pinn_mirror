@@ -1512,7 +1512,17 @@ class Trainer:
         *,
         adaptive: bool = True,
     ):
-        Pi_raw, parts, stats = total.energy(self.model.u_fn, params=params, tape=None)
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        Pi_raw, parts, stats = total.energy(
+            self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+        )
         Pi = Pi_raw
         if self.loss_state is not None:
             if adaptive:

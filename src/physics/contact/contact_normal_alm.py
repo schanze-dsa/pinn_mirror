@@ -80,7 +80,7 @@ def softplus_neg(x: tf.Tensor, beta: tf.Tensor) -> tf.Tensor:
 class NormalALMConfig:
     """Hyperparameters for the normal-contact ALM operator."""
     mode: str = "penalty"          # "penalty" (softplus) or "alm"
-    beta: float = 50.0          # softplus steepness
+    beta: float = 100.0         # softplus steepness (增大默认值以逼近硬接触)
     mu_n: float = 1.0e3         # ALM coefficient (normal penalty)
     enforce_nonneg_lambda: bool = True
     dtype: str = "float32"

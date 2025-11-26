@@ -38,6 +38,8 @@ class ElasticityConfig:
     use_pfor: bool = False
     check_nan: bool = False
     n_points_per_step: Optional[int] = None
+    # 应力监督：若模型提供应力输出头，可用线弹性理论应力指导，0 表示关闭
+    stress_loss_weight: float = 1.0
 
 
 class ElasticityEnergy:
@@ -188,6 +190,7 @@ class ElasticityEnergy:
         u_fn,
         params: Optional[Dict[str, tf.Tensor]] = None,
         tape: Optional[tf.GradientTape] = None,  # 为兼容旧签名，此处不再使用
+        return_cache: bool = False,
     ):
         """
         计算 DFEM 弹性内能 E_int 以及一些统计信息 stats。
@@ -279,7 +282,17 @@ class ElasticityEnergy:
             "use_pfor": bool(self.cfg.use_pfor),
             "coord_scale": float(self._scale),
         }
-        return E_int, stats
+        if not return_cache:
+            return E_int, stats
+
+        cache = {
+            "eps_vec": eps_vec,
+            "lam": lam_sel,
+            "mu": mu_sel,
+            "dof_idx": dof_idx_sel,
+            "sample_idx": idx,
+        }
+        return E_int, stats, cache
 
     # ------------------------------------------------------------------------ #
     # 工具：按节点分块评估位移场
