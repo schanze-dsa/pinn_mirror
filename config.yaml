@@ -215,8 +215,8 @@ loss_config:
     w_cn: 1.0e-7      # 法向接触能量
     w_ct: 1.0e-7      # 摩擦能量/摩擦残差
     w_tie: 1.0e-7     # 绑定/多体约束
-    w_bc: 1.0e-7      # 边界条件
     w_pre: 1.0e-7     # 预紧功（乘在 -W_pre 上）
+    w_sigma: 1.0e-7   # 应力监督
 
   adaptive:
     enabled: true           # 是否启用自适应加权（weighted PINN）
