@@ -352,7 +352,9 @@ def _prepare_config_with_autoguess():
             setattr(cfg.total_cfg, attr, float(base_weights_yaml[yaml_key]))
 
     adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
-    cfg.loss_adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
+    cfg.loss_adaptive_enabled = bool(
+        adaptive_cfg.get("enabled", cfg.loss_adaptive_enabled)
+    )
     cfg.loss_update_every = int(adaptive_cfg.get("update_every", cfg.loss_update_every))
     cfg.loss_ema_decay = float(adaptive_cfg.get("ema_decay", cfg.loss_ema_decay))
     if "min_weight" in adaptive_cfg:

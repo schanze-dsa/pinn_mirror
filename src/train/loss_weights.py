@@ -17,9 +17,9 @@ Loss-weight scheduler for TotalEnergy / Trainer.
         "E_int": E_int,
         "E_cn":  E_cn,
         "E_ct":  E_ct,
-        "E_bc":  E_bc,
         "E_tie": E_tie,
         "W_pre": W_pre,
+        "E_sigma": E_sigma,
         "R_fric_comp":  R_fric,      # 可选
         "R_contact_comp": R_cont,    # 可选
         ...
@@ -63,9 +63,9 @@ class LossWeightState:
               "E_int": 1.0,
               "E_cn":  1.0,
               "E_ct":  1.0,
-              "E_bc":  1.0,
               "E_tie": 1.0,
               "W_pre": 1.0,
+              "E_sigma": 1.0,
               "R_fric_comp": 0.0,
               "R_contact_comp": 0.0,
             }
