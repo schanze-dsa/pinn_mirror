@@ -196,21 +196,24 @@ class BoundaryPenalty:
             raise RuntimeError("[BoundaryPenalty] build_from_numpy must be called first.")
 
         u = u_fn(self.X, params)                                # (N,3)
-        r = (u - self.u_target) * self.mask                     # (N,3)
-        r2 = tf.reduce_sum(r * r, axis=1)                       # (N,)
+        r_raw = (u - self.u_target) * self.mask                # (N,3)
+        r_raw2 = tf.reduce_sum(r_raw * r_raw, axis=1)          # (N,)
 
         mode = (self.cfg.mode or "penalty").lower()
         if mode == "hard":
-            # 直接投影到目标位移，硬约束不将残差纳入能量
-            u_hard = u - r  # u - M⊙(u-u_tgt) = u*(1-M)+u_tgt*M
-            # 防止静态分析工具认为未使用变量
-            _ = tf.stop_gradient(u_hard)
+            # 直接投影到目标位移：u_proj = u - stop_grad(r_raw)
+            # 这样受限自由度被强制为 u_target，且梯度对未约束自由度仍然透明。
+            u = u - tf.stop_gradient(r_raw)
+            r = (u - self.u_target) * self.mask  # (N,3) -> 理论上全为 0
+            r2 = tf.reduce_sum(r * r, axis=1)
             E_bc = tf.cast(0.0, self.dtype)
         else:
+            r = r_raw
+            r2 = r_raw2
             E_bc = 0.5 * self.alpha * tf.reduce_sum(self.w * r2)    # scalar
 
-        # stats 仍然报告“未投影前”的残差，以便监控硬约束的偏离
-        abs_r = tf.sqrt(tf.maximum(r2, tf.cast(0.0, self.dtype)))  # (N,)
+        # stats 仍然报告“投影前”的残差，以便监控硬约束的偏离
+        abs_r = tf.sqrt(tf.maximum(r_raw2, tf.cast(0.0, self.dtype)))  # (N,)
         stats = {
             "bc_rms": tf.sqrt(tf.reduce_mean(abs_r * abs_r) + 1e-20),
             "bc_max": tf.reduce_max(abs_r),
