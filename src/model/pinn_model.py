@@ -65,6 +65,7 @@ class FieldConfig:
     act: str = "silu"
     residual_skips: Tuple[int, int] = (3, 6)
     out_dim: int = 3          # displacement ux,uy,uz
+    stress_out_dim: int = 6   # 应力分量输出维度（默认 6: σxx,σyy,σzz,σxy,σyz,σxz）；<=0 关闭应力头
     w0: float = 30.0
     use_graph: bool = True    # 是否启用 GCN 主干；若为 False 将报错
     graph_k: int = 12         # kNN 图中的邻居数量
@@ -508,8 +509,21 @@ class DisplacementNet(tf.keras.Model):
             cfg.out_dim,
             kernel_initializer="glorot_uniform",
         )
+        self.stress_out = None
+        if cfg.stress_out_dim > 0:
+            self.stress_out = tf.keras.layers.Dense(
+                cfg.stress_out_dim,
+                kernel_initializer="glorot_uniform",
+                name="stress_head",
+            )
 
-    def call(self, x: tf.Tensor, z: tf.Tensor, training: bool | None = False) -> tf.Tensor:
+    def call(
+        self,
+        x: tf.Tensor,
+        z: tf.Tensor,
+        training: bool | None = False,
+        return_stress: bool = False,
+    ) -> tf.Tensor | Tuple[tf.Tensor, tf.Tensor]:
         """
         x : (N,3) coordinates (already normalized if you采用归一化)
         z : (B,cond_dim) or (cond_dim,)
@@ -570,7 +584,13 @@ class DisplacementNet(tf.keras.Model):
                     hnext = hcur + hnext
                 hcur = hnext
             hcur = self.graph_norm(hcur)
-            return self.graph_out(hcur)
+            u_out = self.graph_out(hcur)
+            if return_stress:
+                if self.stress_out is None:
+                    raise ValueError("stress head disabled (stress_out_dim<=0)")
+                sigma_out = self.stress_out(hcur)
+                return u_out, sigma_out
+            return u_out
 
         return graph_forward()
 
@@ -627,6 +647,29 @@ class DisplacementModel:
         # 网络内部会在 float16/bfloat16 下计算，此处统一 cast 回 float32，
         # 以避免如 tie/boundary 约束中出现 "expected float but got half" 的报错。
         return tf.cast(u, tf.float32)
+
+    @tf.function(jit_compile=False)
+    def us_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        带应力头的前向：返回位移 u 和预测的应力分量 sigma。
+        sigma 的维度由 cfg.field.stress_out_dim 决定（默认 6）。
+        """
+        if params is None:
+            raise ValueError("params must contain 'P_hat' or 'P'.")
+
+        if "P_hat" in params:
+            P_hat = params["P_hat"]
+        elif "P" in params:
+            shift = tf.cast(self.cfg.preload_shift, tf.float32)
+            scale = tf.cast(self.cfg.preload_scale, tf.float32)
+            P_hat = (tf.convert_to_tensor(params["P"], dtype=tf.float32) - shift) / scale
+        else:
+            raise ValueError("params must have 'P_hat' or 'P'.")
+
+        P_hat = tf.convert_to_tensor(P_hat, dtype=tf.float32)
+        z = self.encoder(P_hat)          # (B, cond_dim)
+        u, sigma = self.field(tf.convert_to_tensor(X), z, return_stress=True)
+        return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
 
 
 def create_displacement_model(cfg: Optional[ModelConfig] = None) -> DisplacementModel:
