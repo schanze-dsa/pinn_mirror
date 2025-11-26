@@ -73,6 +73,8 @@ class FieldConfig:
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
+    # 仅为兼容旧版残差开关（已移除残差实现）；保留字段避免加载旧配置时报错
+    graph_residual: bool = False
     # 简单硬约束掩码：以圆孔为例，半径内强制位移为 0，可选开启
     hard_bc_radius: Optional[float] = None
     hard_bc_center: Tuple[float, float] = (0.0, 0.0)
