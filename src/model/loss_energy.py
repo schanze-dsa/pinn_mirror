@@ -65,6 +65,7 @@ class TotalConfig:
     w_cn: float = 1.0            # normal contact  -> E_cn
     w_ct: float = 1.0            # frictional      -> E_ct
     w_tie: float = 1.0
+    w_bc: float = 1.0            # boundary penalty -> E_bc
     w_pre: float = 1.0           # multiplies the subtracted W_pre
     w_sigma: float = 1.0         # stress supervision term (σ_pred vs σ_phys)
 
@@ -307,6 +308,7 @@ class TotalEnergy:
             + self.w_cn * parts.get("E_cn", tf.cast(0.0, self.dtype))
             + self.w_ct * parts.get("E_ct", tf.cast(0.0, self.dtype))
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
+            + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
         )
 
@@ -319,7 +321,7 @@ class TotalEnergy:
         能够影响无数据训练，同时保留 ALM 乘子在阶段间的自然演化。
         """
         dtype = self.dtype
-        keys = ["E_int", "E_cn", "E_ct", "E_tie", "W_pre", "E_sigma"]
+        keys = ["E_int", "E_cn", "E_ct", "E_tie", "E_bc", "W_pre", "E_sigma"]
         totals: Dict[str, tf.Tensor] = {k: tf.cast(0.0, dtype) for k in keys}
         stats_all: Dict[str, tf.Tensor] = {}
         path_penalty = tf.cast(0.0, dtype)

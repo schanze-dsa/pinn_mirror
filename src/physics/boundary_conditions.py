@@ -46,7 +46,7 @@ import tensorflow as tf
 class BoundaryConfig:
     alpha: float = 1.0e3     # penalty stiffness
     dtype: str = "float32"
-    mode: str = "hard"       # 'penalty' | 'hard'
+    mode: str = "penalty"    # 'penalty' | 'hard'
 
 
 # -----------------------------
