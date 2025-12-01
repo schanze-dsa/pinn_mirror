@@ -46,7 +46,8 @@ import tensorflow as tf
 class BoundaryConfig:
     alpha: float = 1.0e3     # penalty stiffness
     dtype: str = "float32"
-    mode: str = "penalty"    # 'penalty' | 'hard'
+    mode: str = "penalty"    # 'penalty' | 'hard' | 'alm'
+    mu: float = 1.0e3        # ALM 增广系数（mode='alm' 时生效）
 
 
 # -----------------------------
@@ -101,6 +102,8 @@ class BoundaryPenalty:
         self.u_target: Optional[tf.Tensor] = None   # (N,3)
         self.w: Optional[tf.Tensor] = None          # (N,)
         self.alpha = tf.Variable(self.cfg.alpha, dtype=self.dtype, trainable=False, name="alpha_bc")
+        self.mu = tf.Variable(self.cfg.mu, dtype=self.dtype, trainable=False, name="mu_bc")
+        self.lmbda: Optional[tf.Variable] = None     # (N,3) ALM 乘子
 
         self._N = 0
 
@@ -143,6 +146,12 @@ class BoundaryPenalty:
             self.w = self.w * ew
 
         self._N = N
+
+        # 初始化或调整 ALM 乘子形状
+        if self.lmbda is None or tuple(self.lmbda.shape) != (N, 3):
+            self.lmbda = tf.Variable(
+                tf.zeros((N, 3), dtype=self.dtype), trainable=False, name="lambda_bc"
+            )
 
     def reset_for_new_batch(self):
         self.X = self.mask = self.u_target = self.w = None
@@ -207,6 +216,16 @@ class BoundaryPenalty:
             r = (u - self.u_target) * self.mask  # (N,3) -> 理论上全为 0
             r2 = tf.reduce_sum(r * r, axis=1)
             E_bc = tf.cast(0.0, self.dtype)
+        elif mode == "alm":
+            if self.lmbda is None:
+                self.lmbda = tf.Variable(
+                    tf.zeros_like(self.mask), trainable=False, name="lambda_bc"
+                )
+            lmbda = tf.cast(self.lmbda, self.dtype)
+            mu = tf.cast(self.mu, self.dtype)
+            r = r_raw
+            r2 = r_raw2
+            E_bc = tf.reduce_sum(self.w[:, None] * (lmbda * r + 0.5 * mu * r * r))
         else:
             r = r_raw
             r2 = r_raw2
@@ -219,6 +238,21 @@ class BoundaryPenalty:
             "bc_max": tf.reduce_max(abs_r),
         }
         return E_bc, stats
+
+    def update_multipliers(self, u_fn, params=None):
+        """ALM 外层更新：λ ← λ + μ r，仅在 mode='alm' 时启用。"""
+        if (self.cfg.mode or "penalty").lower() != "alm":
+            return
+        if self.X is None or self.mask is None or self.u_target is None:
+            return
+        if self.lmbda is None:
+            self.lmbda = tf.Variable(
+                tf.zeros_like(self.mask), trainable=False, name="lambda_bc"
+            )
+        u = u_fn(self.X, params)
+        r = (u - self.u_target) * self.mask
+        mu = tf.cast(self.mu, r.dtype)
+        self.lmbda.assign_add(mu * r)
 
     # ---------- setters ----------
 

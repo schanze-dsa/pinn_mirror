@@ -470,6 +470,12 @@ class TotalEnergy:
                     self.contact.update_multipliers(u_fn, stage_params_detached)
                 except Exception:
                     pass
+            if self.bcs:
+                for bc in self.bcs:
+                    try:
+                        bc.update_multipliers(u_fn, stage_params)
+                    except Exception:
+                        pass
 
         if isinstance(root_params, dict):
             if "stage_order" in root_params:
@@ -527,6 +533,14 @@ class TotalEnergy:
                     self.contact.update_multipliers(u_fn, st_params)
             else:
                 self.contact.update_multipliers(u_fn, target_params)
+        if self.bcs:
+            if staged_updates:
+                for st_params in staged_updates:
+                    for bc in self.bcs:
+                        bc.update_multipliers(u_fn, st_params)
+            else:
+                for bc in self.bcs:
+                    bc.update_multipliers(u_fn, target_params)
 
     # ---------- setters / schedules ----------
 

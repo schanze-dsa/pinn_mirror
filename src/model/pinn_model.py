@@ -74,12 +74,17 @@ class FieldConfig:
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
+    # 基于条件向量的 FiLM 调制
+    use_film: bool = True
     # 仅为兼容旧版残差开关（已移除残差实现）；保留字段避免加载旧配置时报错
     graph_residual: bool = False
     # 简单硬约束掩码：以圆孔为例，半径内强制位移为 0，可选开启
     hard_bc_radius: Optional[float] = None
     hard_bc_center: Tuple[float, float] = (0.0, 0.0)
     hard_bc_dims: Tuple[bool, bool, bool] = (True, True, True)
+    # 输出缩放：网络预测无量纲位移后再乘以该尺度，便于微小量级的数值稳定
+    output_scale: float = 1.0e-2
+    output_scale_trainable: bool = False
 
 @dataclass
 class ModelConfig:
@@ -479,6 +484,7 @@ class DisplacementNet(tf.keras.Model):
         super().__init__()
         self.cfg = cfg
         self.use_graph = bool(cfg.use_graph)
+        self.use_film = bool(getattr(cfg, "use_film", False))
 
         # Fourier PE
         self.pe = GaussianFourierFeatures(
@@ -509,7 +515,27 @@ class DisplacementNet(tf.keras.Model):
             )
             for _ in range(cfg.graph_layers)
         ]
-        self.graph_residual = bool(cfg.graph_residual)
+        # FiLM 调制：为每层准备 γ/β，初始为恒等（γ=1, β=0）
+        self.film_gamma: list[tf.keras.layers.Layer] = []
+        self.film_beta: list[tf.keras.layers.Layer] = []
+        if self.use_film:
+            for li in range(cfg.graph_layers):
+                self.film_gamma.append(
+                    tf.keras.layers.Dense(
+                        cfg.graph_width,
+                        kernel_initializer="zeros",
+                        bias_initializer="ones",
+                        name=f"film_gamma_{li}",
+                    )
+                )
+                self.film_beta.append(
+                    tf.keras.layers.Dense(
+                        cfg.graph_width,
+                        kernel_initializer="zeros",
+                        bias_initializer="zeros",
+                        name=f"film_beta_{li}",
+                    )
+                )
         self.graph_norm = tf.keras.layers.LayerNormalization(axis=-1)
         self.graph_out = tf.keras.layers.Dense(
             cfg.out_dim,
@@ -525,6 +551,13 @@ class DisplacementNet(tf.keras.Model):
         # 全局邻接缓存（可选）
         self._global_knn_idx: Optional[tf.Tensor] = None
         self._global_knn_n: Optional[int] = None
+
+        # 输出缩放（可选可训练），便于微小位移量级的数值稳定
+        scale_init = tf.constant(getattr(cfg, "output_scale", 1.0), dtype=tf.float32)
+        if getattr(cfg, "output_scale_trainable", False):
+            self.output_scale = tf.Variable(scale_init, trainable=True, name="output_scale")
+        else:
+            self.output_scale = tf.cast(scale_init, tf.float32)
 
     def call(
         self,
@@ -595,13 +628,22 @@ class DisplacementNet(tf.keras.Model):
             else:
                 knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
             hcur = self.graph_proj(h)
-            for layer in self.graph_layers:
-                hnext = layer(hcur, coords, knn_idx, training=training)
-                if self.graph_residual:
-                    hnext = hcur + hnext
-                hcur = hnext
+            film_gamma = self.film_gamma if self.use_film else None
+            film_beta = self.film_beta if self.use_film else None
+            for li, layer in enumerate(self.graph_layers):
+                hcur = layer(hcur, coords, knn_idx, training=training)
+                if film_gamma is not None and film_beta is not None:
+                    gamma = film_gamma[li](zb)
+                    beta = film_beta[li](zb)
+                    gamma = tf.cast(gamma, hcur.dtype)
+                    beta = tf.cast(beta, hcur.dtype)
+                    hcur = gamma * hcur + beta
             hcur = self.graph_norm(hcur)
             u_out = self.graph_out(hcur)
+
+            # 输出缩放：网络预测无量纲位移，再映射到物理量级
+            scale = tf.cast(self.output_scale, u_out.dtype)
+            u_out = u_out * scale
 
             # 可选硬约束：以圆孔为例，在半径内直接将位移投影为 0，减少软约束漏出
             if self.cfg.hard_bc_radius is not None and float(self.cfg.hard_bc_radius) > 0.0:
