@@ -2176,7 +2176,8 @@ class Trainer:
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
-            remove_rigid=self.cfg.viz_remove_rigid,
+            # 强制启用可视化去除刚体位移，避免沿用 mirror_viz 的默认 False
+            remove_rigid=True,
             diag_out=diag_out,
         )
 
@@ -2239,7 +2240,8 @@ class Trainer:
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
-            remove_rigid=self.cfg.viz_remove_rigid,
+            # 强制启用可视化去除刚体位移，避免沿用 mirror_viz 的默认 False
+            remove_rigid=True,
             diag_out=diag_out,
         )
 
