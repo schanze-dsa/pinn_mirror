@@ -509,6 +509,7 @@ class DisplacementNet(tf.keras.Model):
             )
             for _ in range(cfg.graph_layers)
         ]
+        self.graph_residual = bool(cfg.graph_residual)
         self.graph_norm = tf.keras.layers.LayerNormalization(axis=-1)
         self.graph_out = tf.keras.layers.Dense(
             cfg.out_dim,
@@ -595,7 +596,10 @@ class DisplacementNet(tf.keras.Model):
                 knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
             hcur = self.graph_proj(h)
             for layer in self.graph_layers:
-                hcur = layer(hcur, coords, knn_idx, training=training)
+                hnext = layer(hcur, coords, knn_idx, training=training)
+                if self.graph_residual:
+                    hnext = hcur + hnext
+                hcur = hnext
             hcur = self.graph_norm(hcur)
             u_out = self.graph_out(hcur)
 

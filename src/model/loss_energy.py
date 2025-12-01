@@ -209,7 +209,6 @@ class TotalEnergy:
             "E_cn": zero,
             "E_ct": zero,
             "E_tie": zero,
-            "E_bc": zero,
             "W_pre": zero,
         }
         stats: Dict[str, tf.Tensor] = {}
@@ -256,13 +255,9 @@ class TotalEnergy:
                 parts["E_tie"] = tf.add_n(tie_terms)
 
         if self.bcs:
-            bc_terms = []
             for i, b in enumerate(self.bcs):
-                Ei, si = b.energy(u_fn, params)
-                bc_terms.append(tf.cast(Ei, dtype))
+                _, si = b.energy(u_fn, params)
                 stats.update({f"bc{i+1}_{k}": v for k, v in si.items()})
-            if bc_terms:
-                parts["E_bc"] = tf.add_n(bc_terms)
 
         if self.preload is not None:
             W_pre, pstats = self.preload.energy(u_fn, params)
@@ -316,7 +311,6 @@ class TotalEnergy:
             + self.w_cn * parts.get("E_cn", tf.cast(0.0, self.dtype))
             + self.w_ct * parts.get("E_ct", tf.cast(0.0, self.dtype))
             + self.w_tie * parts.get("E_tie", tf.cast(0.0, self.dtype))
-            + self.w_bc * parts.get("E_bc", tf.cast(0.0, self.dtype))
             - self.w_pre * parts.get("W_pre", tf.cast(0.0, self.dtype))
             + self.w_sigma * parts.get("E_sigma", tf.cast(0.0, self.dtype))
         )
@@ -542,7 +536,6 @@ class TotalEnergy:
         w_cn: Optional[float] = None,
         w_ct: Optional[float] = None,
         w_tie: Optional[float] = None,
-        w_bc: Optional[float] = None,
         w_pre: Optional[float] = None,
     ):
         """Set any subset of coefficients on the fly (e.g., curriculum)."""
@@ -554,8 +547,6 @@ class TotalEnergy:
             self.w_ct.assign(tf.cast(w_ct, self.dtype))
         if w_tie is not None:
             self.w_tie.assign(tf.cast(w_tie, self.dtype))
-        if w_bc is not None:
-            self.w_bc.assign(tf.cast(w_bc, self.dtype))
         if w_pre is not None:
             self.w_pre.assign(tf.cast(w_pre, self.dtype))
 
