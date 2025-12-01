@@ -346,13 +346,16 @@ def _prepare_config_with_autoguess():
         "w_tie": ("w_tie", "E_tie"),
         "w_bc": ("w_bc", "E_bc"),
         "w_pre": ("w_pre", "W_pre"),
+        "w_sigma": ("w_sigma", "E_sigma"),
     }
     for yaml_key, (attr, _) in weight_key_map.items():
         if yaml_key in base_weights_yaml:
             setattr(cfg.total_cfg, attr, float(base_weights_yaml[yaml_key]))
 
     adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
-    cfg.loss_adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
+    cfg.loss_adaptive_enabled = bool(
+        adaptive_cfg.get("enabled", cfg.loss_adaptive_enabled)
+    )
     cfg.loss_update_every = int(adaptive_cfg.get("update_every", cfg.loss_update_every))
     cfg.loss_ema_decay = float(adaptive_cfg.get("ema_decay", cfg.loss_ema_decay))
     if "min_weight" in adaptive_cfg:
@@ -379,6 +382,15 @@ def _prepare_config_with_autoguess():
     # 若启用分阶段加载但 focus_terms 未包含 W_pre，则自动加入以增强预紧信号
     if cfg.preload_use_stages and "W_pre" not in cfg.loss_focus_terms:
         cfg.loss_focus_terms = tuple(list(cfg.loss_focus_terms) + ["W_pre"])
+
+    # 启用应力头时默认也纳入自适应关注项，避免固定权重过大导致梯度爆炸
+    has_stress_head = getattr(cfg.model_cfg.field, "stress_out_dim", 0) > 0
+    if has_stress_head and "E_sigma" not in cfg.loss_focus_terms:
+        cfg.loss_focus_terms = tuple(list(cfg.loss_focus_terms) + ["E_sigma"])
+
+    # 只要存在任意关注项，就切换为 focus 策略
+    if cfg.loss_focus_terms:
+        cfg.total_cfg.adaptive_scheme = "focus"
 
     cfg.resample_contact_every = int(
         cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
