@@ -29,9 +29,10 @@ except Exception:
     TiePenalty = None  # type: ignore
 
 try:
-    from physics.boundary_conditions import BoundaryPenalty  # type: ignore
+    from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig  # type: ignore
 except Exception:
     BoundaryPenalty = None  # type: ignore
+    BoundaryConfig = None  # type: ignore
 
 
 # ============================================================
@@ -597,6 +598,8 @@ def attach_ties_and_bcs_from_inp(total, asm, inp_path: str, cfg) -> None:
     n_tie_points = int(getattr(cfg, "n_tie_points", 2000))
     tie_alpha = float(getattr(cfg, "tie_alpha", 1.0e3))
     bc_alpha = float(getattr(cfg, "bc_alpha", 1.0e4))
+    bc_mu = float(getattr(cfg, "bc_mu", 1.0e3))
+    bc_mode = str(getattr(cfg, "bc_mode", "penalty")).lower()
 
     ties_out: List[Any] = []
     bcs_out: List[Any] = []
@@ -639,7 +642,8 @@ def attach_ties_and_bcs_from_inp(total, asm, inp_path: str, cfg) -> None:
 
         if BoundaryPenalty is not None and isinstance(X, np.ndarray) and X.shape[0] > 0:
             try:
-                bc = BoundaryPenalty(alpha=bc_alpha, dof1=d1, dof2=d2, kind=typ)
+                bc_cfg = BoundaryConfig(alpha=bc_alpha, mode=bc_mode, mu=bc_mu)
+                bc = BoundaryPenalty(cfg=bc_cfg, dof1=d1, dof2=d2, kind=typ)
                 if hasattr(bc, "build"):
                     bc.build(X)
                 else:

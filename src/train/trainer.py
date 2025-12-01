@@ -122,6 +122,9 @@ class TrainerConfig:
     # tie / 边界（如需）
     ties: List[Dict[str, Any]] = field(default_factory=list)
     bcs: List[Dict[str, Any]] = field(default_factory=list)
+    bc_mode: str = "alm"                    # penalty | hard | alm
+    bc_mu: float = 1.0e3                    # ALM 增广系数
+    bc_alpha: float = 1.0e4                 # 罚函数/ALM 基础刚度
 
     # 预紧力范围（N）
     preload_min: float = 0.0
