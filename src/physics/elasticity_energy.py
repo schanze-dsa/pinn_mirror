@@ -307,6 +307,14 @@ class ElasticityEnergy:
         X = self.X_nodes_tf  # (N,3)
         N = self.n_nodes
         chunk = max(1, int(self.cfg.chunk_size))
+        # 若使用 GCN 主干，则必须整图前向以保持全局邻接；忽略分块避免断图
+        try:
+            bound_model = getattr(u_fn, "__self__", None)
+            field = getattr(bound_model, "field", None)
+            if getattr(field, "use_graph", False):
+                chunk = N
+        except Exception:
+            pass
 
         outs = []
         for s in range(0, N, chunk):

@@ -1181,6 +1181,14 @@ class Trainer:
             if cfg.mixed_precision:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
             self.model = create_displacement_model(cfg.model_cfg)
+            if getattr(cfg.model_cfg.field, "graph_precompute", False) and getattr(self, "elasticity", None):
+                try:
+                    self.model.field.set_global_graph(self.elasticity.X_nodes_tf)
+                    print(
+                        f"[graph] 已预计算全局 kNN 邻接: N={getattr(self.elasticity, 'n_nodes', '?')} k={cfg.model_cfg.field.graph_k}"
+                    )
+                except Exception as exc:
+                    print(f"[graph] 预计算全局邻接失败，将退回动态构图：{exc}")
             base_optimizer = tf.keras.optimizers.Adam(cfg.lr)
             if cfg.mixed_precision:
                 base_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
