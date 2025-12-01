@@ -208,6 +208,7 @@ class TrainerConfig:
     viz_eval_scope: str = "assembly"        # "surface" or "assembly"/"all"
     viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
     viz_auto_fill_blanks: bool = False      # 覆盖率低时自动用 2D 重新三角化填补留白（默认关闭以保留真实孔洞）
+    viz_remove_rigid: bool = True           # 可视化时默认去除刚体平移/转动分量
     save_best_on: str = "Pi"   # or "E_int"
 
 
@@ -2175,6 +2176,8 @@ class Trainer:
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
+            # 强制启用可视化去除刚体位移，避免沿用 mirror_viz 的默认 False
+            remove_rigid=True,
             diag_out=diag_out,
         )
 
@@ -2237,6 +2240,8 @@ class Trainer:
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
+            # 强制启用可视化去除刚体位移，避免沿用 mirror_viz 的默认 False
+            remove_rigid=True,
             diag_out=diag_out,
         )
 
