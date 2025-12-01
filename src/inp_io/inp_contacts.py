@@ -320,7 +320,7 @@ def discover_contact_pairs(inppath: str) -> List[Dict[str, Any]]:
 
 def quick_summary(inppath: str) -> str:
     """
-    生成一段可打印的摘要，便于 sanity_check 输出。
+    生成一段可打印的摘要，便于快速检查接触/绑定配置。
     """
     info = parse_inp_contacts(inppath)
 

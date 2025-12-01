@@ -1042,7 +1042,7 @@ class Trainer:
                 "      * INP 中的零件名与 part2mat 的键不一致（大小写/空格）。\n"
                 "      * 材料名不在 materials 字典里。\n"
                 "      * 网格上没有体积分点（或被过滤为空）。\n"
-                "  - 建议：运行 sanity_check.py，确认第二步“体积分点 + 材料映射”为非 None。\n"
+                "  - 建议：检查 INP 的 part2mat 配置与网格数据，确保体积分点和材料映射正确生成。\n"
             )
             raise RuntimeError(msg)
 
