@@ -410,7 +410,7 @@ def _prepare_config_with_autoguess():
     # 2) DFEM 采样配置（不再设置 Jacobian 相关字段）
     #    - chunk_size: 节点前向/能量评估的分块大小（防止一次性吃满显存）
     #    - n_points_per_step: 每一步参与 DFEM 积分的子单元/积分点个数上限
-    cfg.elas_cfg.chunk_size = int(elas_cfg_yaml.get("chunk_size", 128))
+    cfg.elas_cfg.chunk_size = int(elas_cfg_yaml.get("chunk_size", 0))
     cfg.elas_cfg.n_points_per_step = int(elas_cfg_yaml.get("n_points_per_step", 4096))
     cfg.elas_cfg.coord_scale = float(elas_cfg_yaml.get("coord_scale", 1.0))
 

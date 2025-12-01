@@ -201,7 +201,7 @@ optimizer_config:
 # ------------------------------------------------------------
 elasticity_config:
   coord_scale: 1.0          # 坐标缩放系数
-  chunk_size: 128           # 节点前向微批大小（DFEM：u_fn(X_nodes) 分块）
+  chunk_size: 0             # 节点前向微批大小；≤0 表示整图前向，不再分块
   use_pfor: false           # 保留字段，可忽略
   check_nan: true           # 是否进行数值 NaN 检查
   n_points_per_step: 4096   # 每步用于 DFEM 积分的子单元/积分点上限；None 表示全量

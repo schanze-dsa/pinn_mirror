@@ -70,6 +70,7 @@ class FieldConfig:
     use_graph: bool = True    # 是否启用 GCN 主干；若为 False 将报错
     graph_k: int = 12         # kNN 图中的邻居数量
     graph_knn_chunk: int = 1024  # 构建 kNN/图卷积时每批处理的节点数量
+    graph_precompute: bool = False  # 是否在构建阶段预计算全局邻接并缓存
     graph_layers: int = 4     # 图卷积层数
     graph_width: int = 192    # 每层的隐藏特征维度
     graph_dropout: float = 0.0
@@ -521,6 +522,9 @@ class DisplacementNet(tf.keras.Model):
                 kernel_initializer="glorot_uniform",
                 name="stress_head",
             )
+        # 全局邻接缓存（可选）
+        self._global_knn_idx: Optional[tf.Tensor] = None
+        self._global_knn_n: Optional[int] = None
 
     def call(
         self,
@@ -581,7 +585,15 @@ class DisplacementNet(tf.keras.Model):
 
         def graph_forward():
             coords = x
-            knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
+            use_cached = (
+                self._global_knn_idx is not None
+                and self._global_knn_n is not None
+                and tf.shape(coords)[0] == self._global_knn_idx.shape[0]
+            )
+            if use_cached:
+                knn_idx = tf.cast(self._global_knn_idx, tf.int32)
+            else:
+                knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
             hcur = self.graph_proj(h)
             for layer in self.graph_layers:
                 hnext = layer(hcur, coords, knn_idx, training=training)
@@ -608,6 +620,13 @@ class DisplacementNet(tf.keras.Model):
             return u_out
 
         return graph_forward()
+
+    def set_global_graph(self, coords: tf.Tensor):
+        """预计算并缓存全局 kNN 邻接，用于整图前向以避免分块断图。"""
+
+        coords = tf.convert_to_tensor(coords, dtype=tf.float32)
+        self._global_knn_idx = _build_knn_graph(coords, self.cfg.graph_k, self.cfg.graph_knn_chunk)
+        self._global_knn_n = int(coords.shape[0]) if coords.shape.rank else None
 
 
 # -----------------------------
