@@ -480,6 +480,73 @@ def _mask_tris_with_loops(tri: Triangulation, UV: np.ndarray, loops: List[List[i
 # Core helpers
 # -----------------------------
 
+
+def _fit_rigid_transform(src: np.ndarray, dst: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Fit a least-squares rigid transform (R, t) such that R@src + t ≈ dst.
+
+    Uses the Kabsch algorithm with determinant correction to ensure ``det(R)=+1``.
+    Returns a tuple (R, t) where ``R`` is (3,3) rotation and ``t`` is (3,).
+    """
+
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    if src.shape != dst.shape:
+        raise ValueError(f"shape mismatch: src {src.shape} vs dst {dst.shape}")
+    if src.ndim != 2 or src.shape[1] != 3:
+        raise ValueError("src/dst must be (N,3) arrays")
+
+    c_src = src.mean(axis=0)
+    c_dst = dst.mean(axis=0)
+    A = src - c_src
+    B = dst - c_dst
+    H = A.T @ B
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+    t = c_dst - R @ c_src
+    return R, t
+
+
+def _remove_rigid_body_motion(X: np.ndarray, u: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Remove best-fit rigid motion from displacement field.
+
+    Args:
+        X: (N,3) undeformed coordinates.
+        u: (N,3) displacement vectors.
+
+    Returns:
+        (u_relaxed, info) where ``u_relaxed`` subtracts the fitted rigid component and
+        ``info`` contains rotation/translation used.
+    """
+
+    X = np.asarray(X, dtype=np.float64)
+    u = np.asarray(u, dtype=np.float64)
+    if X.shape != u.shape:
+        raise ValueError(f"shape mismatch: X {X.shape} vs u {u.shape}")
+
+    X_def = X + u
+    R, t = _fit_rigid_transform(X, X_def)
+    rigid_disp = (X @ R.T + t) - X
+    return u - rigid_disp, {"R": R, "t": t}
+
+
+def _apply_rigid_correction(X: np.ndarray, u: np.ndarray, info: Dict[str, np.ndarray]) -> np.ndarray:
+    """Apply a previously fitted rigid transform to an arbitrary point set."""
+
+    if not info:
+        return u
+    R = info.get("R")
+    t = info.get("t")
+    if R is None or t is None:
+        return u
+    X = np.asarray(X, dtype=np.float64)
+    u = np.asarray(u, dtype=np.float64)
+    rigid_disp = (X @ np.asarray(R, dtype=np.float64).T + np.asarray(t, dtype=np.float64)) - X
+    return u - rigid_disp
+
+
 def _fit_plane_basis(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Fit a best-fit plane to 3D points X (N,3) by SVD.
@@ -587,7 +654,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            eval_scope: str = "assembly",
                            diagnose_blanks: bool = False,
                            auto_fill_blanks: bool = False,
-                           diag_out: Optional[Dict[str, BlankRegionDiagnostics]] = None):
+                           diag_out: Optional[Dict[str, BlankRegionDiagnostics]] = None,
+                           remove_rigid: bool = False):
     """
     Visualize total displacement magnitude of the given mirror surface.
 
@@ -641,6 +709,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
                               based on boundary loops (keeps NaN/Inf masking).
         diag_out            : Optional dict to receive ``{"blank_check": BlankRegionDiagnostics}``
                               for downstream logging.
+        remove_rigid        : If True, fit a best-fit rigid transform (translation + rotation) between
+                              undeformed and deformed coordinates, then subtract it so the plotted
+                              displacement仅反映弹性/形变部分（剔除整体刚体运动）。
 
     Returns:
         (fig, ax, data_path)
@@ -718,9 +789,6 @@ def plot_mirror_deflection(asm: AssemblyModel,
             "requested": eval_meta.get("requested_scope", eval_scope_key),
             "global_node_count": int(eval_meta.get("global_nodes", np.array([])).shape[0]),
         }
-    # Displacement magnitude on original surface nodes
-    d_base = np.linalg.norm(u_base, axis=1)
-
     # Optional barycentric refinement for smoother visualization
     applied_subdiv = max(0, int(refine_subdivisions or 0))
     max_pts = None if refine_max_points is None else int(refine_max_points)
@@ -741,10 +809,45 @@ def plot_mirror_deflection(asm: AssemblyModel,
     if applied_subdiv > 0:
         X_plot, UV_plot, tri_plot = _refine_surface_samples(X3D, UV, tri_idx, applied_subdiv)
         u_plot = _eval_displacement_batched(u_fn, params, X_plot, eval_batch_size)
-        d_plot = np.linalg.norm(u_plot, axis=1)
     else:
         X_plot, UV_plot, tri_plot = X3D, UV, tri_idx
-        u_plot, d_plot = u_base, d_base
+        u_plot = u_base
+
+    rigid_info: Dict[str, np.ndarray] = {}
+    if remove_rigid:
+        try:
+            ref_X = None
+            ref_u = None
+            if eval_meta and all(k in eval_meta for k in ("global_xyz", "u_all", "global_nodes")):
+                ref_X = np.asarray(eval_meta.get("global_xyz"))
+                ref_u = np.asarray(eval_meta.get("u_all"))
+            if ref_X is None or ref_u is None:
+                ref_X, ref_u = X3D, u_base
+
+            u_ref_relaxed, rigid_info = _remove_rigid_body_motion(ref_X, ref_u)
+
+            if eval_meta and ref_X is eval_meta.get("global_xyz"):
+                eval_meta["u_all"] = u_ref_relaxed
+                lookup = {int(n): u_ref_relaxed[i] for i, n in enumerate(eval_meta.get("global_nodes", []))}
+                u_base = np.stack([lookup[int(n)] for n in nid_unique], axis=0)
+            else:
+                u_base = u_ref_relaxed
+
+            u_plot = _apply_rigid_correction(X_plot, u_plot, rigid_info)
+            rot_trace = float(np.trace(rigid_info["R"])) if "R" in rigid_info else 3.0
+            angle = float(np.arccos(max(min((rot_trace - 1.0) / 2.0, 1.0), -1.0))) if rot_trace is not None else 0.0
+            trans_norm = float(np.linalg.norm(rigid_info.get("t", 0.0)))
+            print(
+                f"[viz] remove_rigid applied: |t|={trans_norm:.4e}, rotation={np.degrees(angle):.4e} deg"
+            )
+            if diag_out is not None:
+                diag_out["rigid_removal"] = {"translation_norm": trans_norm, "rotation_rad": angle}
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            print(f"[viz] remove_rigid failed, falling back to raw displacements: {exc}")
+
+    # Displacement magnitude on original and refined nodes
+    d_base = np.linalg.norm(u_base, axis=1)
+    d_plot = np.linalg.norm(u_plot, axis=1)
 
     # Detect invalid predictions that will render as holes
     nonfinite_mask = ~np.isfinite(d_plot)
@@ -956,6 +1059,13 @@ def plot_mirror_deflection(asm: AssemblyModel,
                     "# preload=[" + ", ".join(f"{float(p):.6f}" for p in P_values[:3]) + "] N"
                 )
             header.append(f"# refine_subdivisions_applied={applied_subdiv}")
+            if remove_rigid and rigid_info:
+                rot_trace = float(np.trace(rigid_info["R"])) if "R" in rigid_info else 3.0
+                angle_deg = float(np.degrees(np.arccos(max(min((rot_trace - 1.0) / 2.0, 1.0), -1.0))))
+                trans_norm = float(np.linalg.norm(rigid_info.get("t", 0.0)))
+                header.append(
+                    f"# rigid_body_removed=1 |t|={trans_norm:.6e} rotation_deg={angle_deg:.6e}"
+                )
             header.append("# note: exported samples correspond to original FE nodes.")
             header.append(
                 "# columns: node_id x y z u_x u_y u_z |u| u_plane v_plane"

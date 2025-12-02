@@ -108,6 +108,13 @@ class TrainerConfig:
     contact_rar_fric_mix: float = 0.4          # 穿透 vs 摩擦残差的混合系数
     contact_rar_balance_pairs: bool = True     # 是否保持各接触对的样本占比
 
+    # 体积分点（弹性能量）RAR
+    volume_rar_enabled: bool = True            # 是否启用体积分点基于应变能密度的 RAR
+    volume_rar_fraction: float = 0.5           # 每步 DFEM 子单元子采样中，多少比例来自 RAR
+    volume_rar_temperature: float = 1.0        # >1 平滑、<1 更尖锐
+    volume_rar_uniform_ratio: float = 0.2      # 保底均匀抽样比例
+    volume_rar_floor: float = 1e-8             # 基础重要性，避免全零
+
     # 预紧
     preload_specs: List[Dict[str, str]] = field(default_factory=list)
     preload_n_points_each: int = 800
@@ -115,14 +122,21 @@ class TrainerConfig:
     # tie / 边界（如需）
     ties: List[Dict[str, Any]] = field(default_factory=list)
     bcs: List[Dict[str, Any]] = field(default_factory=list)
+    bc_mode: str = "alm"                    # penalty | hard | alm
+    bc_mu: float = 1.0e3                    # ALM 增广系数
+    bc_alpha: float = 1.0e4                 # 罚函数/ALM 基础刚度
 
     # 预紧力范围（N）
-    preload_min: float = 500.0
+    preload_min: float = 0.0
     preload_max: float = 2000.0
     preload_sequence: List[Any] = field(default_factory=list)
     preload_sequence_repeat: int = 1
     preload_sequence_shuffle: bool = False
     preload_sequence_jitter: float = 0.0
+
+    # 预紧采样方式
+    preload_sampling: str = "lhs"            # "lhs" | "uniform"
+    preload_lhs_size: int = 64               # 每批次的拉丁超立方样本数量
 
     # 预紧顺序（分步加载）
     preload_use_stages: bool = False
@@ -131,16 +145,16 @@ class TrainerConfig:
     # 物理项/模型配置
     model_cfg: ModelConfig = field(default_factory=ModelConfig)
     elas_cfg: ElasticityConfig = field(
-        default_factory=lambda: ElasticityConfig(coord_scale=1.0, chunk_size=1024, use_pfor=False)
+        default_factory=lambda: ElasticityConfig(coord_scale=1.0, chunk_size=0, use_pfor=False)
     )
     contact_cfg: ContactOperatorConfig = field(default_factory=ContactOperatorConfig)
     preload_cfg: PreloadConfig = field(default_factory=PreloadConfig)
     total_cfg: TotalConfig = field(default_factory=lambda: TotalConfig(
-        w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_bc=1.0, w_pre=1.0
+        w_int=1.0, w_cn=1.0, w_ct=1.0, w_tie=1.0, w_pre=1.0, w_sigma=1.0
     ))
 
     # 损失加权（自适应）
-    loss_adaptive_enabled: bool = False
+    loss_adaptive_enabled: bool = True
     loss_update_every: int = 1
     loss_ema_decay: float = 0.95
     loss_min_factor: float = 0.25
@@ -175,7 +189,7 @@ class TrainerConfig:
     # 输出
     out_dir: str = "outputs"
     ckpt_dir: str = "checkpoints"
-    viz_samples_after_train: int = 5
+    viz_samples_after_train: int = 6
     viz_title_prefix: str = "Total Deformation (trained PINN)"
     viz_style: str = "contour"             # 默认采用等值填充以获得平滑云图
     viz_colormap: str = "turbo"             # Abaqus-like rainbow palette
@@ -197,6 +211,7 @@ class TrainerConfig:
     viz_eval_scope: str = "assembly"        # "surface" or "assembly"/"all"
     viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
     viz_auto_fill_blanks: bool = False      # 覆盖率低时自动用 2D 重新三角化填补留白（默认关闭以保留真实孔洞）
+    viz_remove_rigid: bool = True           # 可视化时默认去除刚体平移/转动分量
     save_best_on: str = "Pi"   # or "E_int"
 
 
@@ -205,6 +220,11 @@ class Trainer:
         self.cfg = cfg
         np.random.seed(cfg.seed)
         tf.random.set_seed(cfg.seed)
+
+        self._preload_dim: int = 3
+        self._preload_lhs_rng = np.random.default_rng(cfg.seed + 11)
+        self._preload_lhs_points: np.ndarray = np.zeros((0, self._preload_dim), dtype=np.float32)
+        self._preload_lhs_index: int = 0
 
         # 默认设备描述，避免后续日志访问属性时出错
         self.device_summary = "Unknown"
@@ -222,7 +242,11 @@ class Trainer:
         self._last_preload_case: Optional[Dict[str, np.ndarray]] = None
         self._train_vars: List[tf.Variable] = []
         self._contact_rar_cache: Optional[Dict[str, Any]] = None
+        self._volume_rar_cache: Optional[Dict[str, Any]] = None
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
+
+        if cfg.preload_specs:
+            self._set_preload_dim(len(cfg.preload_specs))
 
         if cfg.preload_sequence:
             sanitized: List[np.ndarray] = []
@@ -309,6 +333,7 @@ class Trainer:
                     print(
                         f"[preload] 顺序载荷将叠加 ±{cfg.preload_sequence_jitter}N 的均匀扰动。"
                     )
+                self._set_preload_dim(self._preload_sequence[0].size)
             else:
                 print("[preload] preload_sequence 中有效条目为空，改为随机采样。")
         if cfg.model_cfg.preload_scale:
@@ -383,6 +408,41 @@ class Trainer:
 
 
     # ----------------- 辅助工具 -----------------
+
+    def _set_preload_dim(self, nb: int):
+        nb_int = int(nb)
+        if nb_int <= 0:
+            nb_int = 3
+        if nb_int != getattr(self, "_preload_dim", None):
+            self._preload_dim = nb_int
+            self._preload_lhs_points = np.zeros((0, nb_int), dtype=np.float32)
+            self._preload_lhs_index = 0
+
+    def _generate_lhs_points(self, n_samples: int, n_dim: int, lo: float, hi: float) -> np.ndarray:
+        """简单的拉丁超立方采样生成器，返回 (n_samples, n_dim)."""
+
+        if n_samples <= 0:
+            return np.zeros((0, n_dim), dtype=np.float32)
+        unit = np.zeros((n_samples, n_dim), dtype=np.float32)
+        for j in range(n_dim):
+            seg = (np.arange(n_samples, dtype=np.float32) + self._preload_lhs_rng.random(n_samples)) / float(n_samples)
+            self._preload_lhs_rng.shuffle(seg)
+            unit[:, j] = seg
+        scale = hi - lo
+        return (lo + unit * scale).astype(np.float32)
+
+    def _next_lhs_preload(self, n_dim: int, lo: float, hi: float) -> np.ndarray:
+        batch = max(1, int(self.cfg.preload_lhs_size))
+        if self._preload_lhs_points.shape[1] != n_dim or len(self._preload_lhs_points) == 0:
+            self._preload_lhs_points = self._generate_lhs_points(batch, n_dim, lo, hi)
+            self._preload_lhs_index = 0
+        if self._preload_lhs_index >= len(self._preload_lhs_points):
+            self._preload_lhs_points = self._generate_lhs_points(batch, n_dim, lo, hi)
+            self._preload_lhs_index = 0
+        out = self._preload_lhs_points[self._preload_lhs_index].copy()
+        self._preload_lhs_index += 1
+        return out
+
     @staticmethod
     def _format_seconds(seconds: float) -> str:
         if seconds < 1e-3:
@@ -424,8 +484,8 @@ class Trainer:
             "E_cn": getattr(self.cfg.total_cfg, "w_cn", 1.0),
             "E_ct": getattr(self.cfg.total_cfg, "w_ct", 1.0),
             "E_tie": getattr(self.cfg.total_cfg, "w_tie", 1.0),
-            "E_bc": getattr(self.cfg.total_cfg, "w_bc", 1.0),
             "W_pre": getattr(self.cfg.total_cfg, "w_pre", 1.0),
+            "E_sigma": getattr(self.cfg.total_cfg, "w_sigma", 1.0),
         }
         if self.loss_state is not None:
             for key, value in self.loss_state.current.items():
@@ -457,8 +517,8 @@ class Trainer:
             ("E_cn", "Ecn"),
             ("E_ct", "Ect"),
             ("E_tie", "Etie"),
-            ("E_bc", "Ebc"),
             ("W_pre", "Wpre"),
+            ("E_sigma", "Esig"),
         ]
         aliases = {
             "E_cn": ("E_cn", "E_n"),
@@ -644,9 +704,14 @@ class Trainer:
             return target.astype(np.float32)
 
         lo, hi = self.cfg.preload_min, self.cfg.preload_max
-        out = np.random.uniform(lo, hi, size=(3,)).astype(np.float32)
+        nb = int(self._preload_dim)
+        sampling = (self.cfg.preload_sampling or "uniform").lower()
+        if sampling == "lhs":
+            out = self._next_lhs_preload(nb, lo, hi)
+        else:
+            out = np.random.uniform(lo, hi, size=(nb,)).astype(np.float32)
         self._last_preload_order = None
-        return out
+        return out.astype(np.float32)
 
     def _normalize_order(self, order: Optional[Any], nb: int) -> Optional[np.ndarray]:
         if order is None:
@@ -800,6 +865,37 @@ class Trainer:
         params["stage_count"] = tf.constant(stage_count, dtype=tf.int32)
         return params
 
+    @staticmethod
+    def _static_last_dim(arr: Any) -> Optional[int]:
+        try:
+            dim = getattr(arr, "shape", None)
+            if dim is None:
+                return None
+            last = dim[-1]
+            return None if last is None else int(last)
+        except Exception:
+            return None
+
+    def _infer_preload_feat_dim(self, params: Dict[str, Any]) -> Optional[int]:
+        """静态推断 P_hat 的长度；优先 staged 特征，其次单步 P_hat/P。"""
+
+        if not isinstance(params, dict):
+            return None
+
+        stages = params.get("stages")
+        if isinstance(stages, dict):
+            feat = stages.get("P_hat")
+            dim = self._static_last_dim(feat)
+            if dim:
+                return dim
+
+        if "P_hat" in params:
+            dim = self._static_last_dim(params.get("P_hat"))
+            if dim:
+                return dim
+
+        return self._static_last_dim(params.get("P"))
+
     def _extract_final_stage_params(
         self, params: Dict[str, Any], keep_context: bool = False
     ) -> Dict[str, Any]:
@@ -946,7 +1042,7 @@ class Trainer:
                 "      * INP 中的零件名与 part2mat 的键不一致（大小写/空格）。\n"
                 "      * 材料名不在 materials 字典里。\n"
                 "      * 网格上没有体积分点（或被过滤为空）。\n"
-                "  - 建议：运行 sanity_check.py，确认第二步“体积分点 + 材料映射”为非 None。\n"
+                "  - 建议：检查 INP 的 part2mat 配置与网格数据，确保体积分点和材料映射正确生成。\n"
             )
             raise RuntimeError(msg)
 
@@ -1072,10 +1168,30 @@ class Trainer:
             self.ties_ops, self.bcs_ops = [], []
             pb.update(1)
 
+            # 6.5) 根据预紧特征维度统一 ParamEncoder 输入形状，避免 staged 特征长度变化
+            self._warmup_case = self._make_warmup_case()
+            self._warmup_params = self._make_preload_params(self._warmup_case)
+            feat_dim = self._infer_preload_feat_dim(self._warmup_params)
+            if feat_dim:
+                old_dim = getattr(cfg.model_cfg.encoder, "in_dim", None)
+                if old_dim != feat_dim:
+                    print(
+                        f"[model] 预紧特征维度 {old_dim} -> {feat_dim}，统一 ParamEncoder 输入。"
+                    )
+                    cfg.model_cfg.encoder.in_dim = feat_dim
+
             # 7) 模型 & 优化器
             if cfg.mixed_precision:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
             self.model = create_displacement_model(cfg.model_cfg)
+            if getattr(cfg.model_cfg.field, "graph_precompute", False) and getattr(self, "elasticity", None):
+                try:
+                    self.model.field.set_global_graph(self.elasticity.X_nodes_tf)
+                    print(
+                        f"[graph] 已预计算全局 kNN 邻接: N={getattr(self.elasticity, 'n_nodes', '?')} k={cfg.model_cfg.field.graph_k}"
+                    )
+                except Exception as exc:
+                    print(f"[graph] 预计算全局邻接失败，将退回动态构图：{exc}")
             base_optimizer = tf.keras.optimizers.Adam(cfg.lr)
             if cfg.mixed_precision:
                 base_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
@@ -1096,9 +1212,7 @@ class Trainer:
             warmup_n = 0
         if warmup_n > 0:
             X_sample = tf.convert_to_tensor(self.X_vol[:warmup_n], dtype=tf.float32)
-            mid = 0.5 * (float(cfg.preload_min) + float(cfg.preload_max))
-            warmup_case = self._make_warmup_case()
-            params = self._make_preload_params(warmup_case)
+            params = self._warmup_params or self._make_preload_params(self._make_warmup_case())
             eval_params = self._extract_final_stage_params(params)
             # 调用一次前向以创建所有变量；忽略实际输出
             _ = self.model.u_fn(X_sample, eval_params)
@@ -1266,6 +1380,92 @@ class Trainer:
         note = f"RAR {len(rar_indices)}/{total_n}"
         return cat_new, note
 
+    # ----------------- Volume (strain energy) RAR -----------------
+
+    def _update_volume_rar_cache(self):
+        """基于上一批次的应变能密度，构造体积分点的重要性分布。"""
+
+        if not self.cfg.volume_rar_enabled:
+            self._volume_rar_cache = None
+            return
+        if self.elasticity is None:
+            self._volume_rar_cache = None
+            return
+        if not hasattr(self.elasticity, "last_sample_metrics"):
+            self._volume_rar_cache = None
+            return
+
+        metrics = self.elasticity.last_sample_metrics() or {}
+        psi = metrics.get("psi")
+        idx = metrics.get("idx")
+        total_cells = int(getattr(self.elasticity, "n_cells", 0) or 0)
+        if psi is None or idx is None or total_cells <= 0:
+            self._volume_rar_cache = None
+            return
+
+        psi = np.asarray(psi, dtype=np.float64).reshape(-1)
+        idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+        if psi.size == 0 or idx.size == 0 or psi.shape[0] != idx.shape[0]:
+            self._volume_rar_cache = None
+            return
+
+        imp = np.full((total_cells,), float(self.cfg.volume_rar_floor), dtype=np.float32)
+        valid = (idx >= 0) & (idx < total_cells) & np.isfinite(psi)
+        if not np.any(valid):
+            self._volume_rar_cache = None
+            return
+        np.add.at(imp, idx[valid], np.abs(psi[valid]).astype(np.float32))
+        imp = np.where(np.isfinite(imp), imp, float(self.cfg.volume_rar_floor))
+        self._volume_rar_cache = {"importance": imp}
+
+    def _maybe_apply_volume_rar(self, step_index: int) -> Tuple[Optional[np.ndarray], str]:
+        """返回一组 DFEM 子单元索引，按应变能密度进行重采样。"""
+
+        if (
+            not self.cfg.volume_rar_enabled
+            or self._volume_rar_cache is None
+            or self.elasticity is None
+        ):
+            return None, ""
+
+        total_cells = int(getattr(self.elasticity, "n_cells", 0) or 0)
+        target_n = getattr(getattr(self.elasticity, "cfg", None), "n_points_per_step", None)
+        if total_cells <= 0 or target_n is None or target_n <= 0:
+            return None, ""
+
+        m = min(int(target_n), total_cells)
+        importance = self._volume_rar_cache.get("importance")
+        if importance is None or importance.shape[0] != total_cells:
+            return None, ""
+
+        rar_frac = float(np.clip(self.cfg.volume_rar_fraction, 0.0, 1.0))
+        min_uniform = int(np.round(m * np.clip(self.cfg.volume_rar_uniform_ratio, 0.0, 1.0)))
+        n_rar = int(np.round(m * rar_frac))
+        if n_rar + min_uniform > m:
+            n_rar = max(0, m - min_uniform)
+        n_uniform = max(0, m - n_rar)
+        if n_rar <= 0:
+            return None, ""
+
+        temp = max(self.cfg.volume_rar_temperature, 1e-6)
+        weights = np.power(importance + float(self.cfg.volume_rar_floor), 1.0 / temp)
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        if float(weights.sum()) <= 0.0:
+            return None, ""
+
+        rng = np.random.default_rng(self.cfg.seed + step_index * 23)
+        probs = weights / (weights.sum() + 1e-12)
+        rar_indices = np.array(rng.choice(total_cells, size=n_rar, replace=True, p=probs), dtype=np.int64)
+
+        if n_uniform > 0:
+            uni_indices = rng.choice(total_cells, size=n_uniform, replace=False)
+            combined = np.concatenate([rar_indices, uni_indices], axis=0)
+        else:
+            combined = rar_indices
+
+        note = f"volRAR {len(rar_indices)}/{m}"
+        return combined, note
+
     # 在 Trainer 类里新增/覆盖这个方法
     def _collect_trainable_variables(self):
         m = self.model
@@ -1324,7 +1524,17 @@ class Trainer:
         *,
         adaptive: bool = True,
     ):
-        Pi_raw, parts, stats = total.energy(self.model.u_fn, params=params, tape=None)
+        stress_head_enabled = False
+        try:
+            stress_head_enabled = getattr(self.model.field.cfg, "stress_out_dim", 0) > 0
+        except Exception:
+            stress_head_enabled = False
+
+        stress_fn = self.model.us_fn if stress_head_enabled and hasattr(self.model, "us_fn") else None
+
+        Pi_raw, parts, stats = total.energy(
+            self.model.u_fn, params=params, tape=None, stress_fn=stress_fn
+        )
         Pi = Pi_raw
         if self.loss_state is not None:
             if adaptive:
@@ -1525,8 +1735,8 @@ class Trainer:
             "E_cn": self.cfg.total_cfg.w_cn,
             "E_ct": self.cfg.total_cfg.w_ct,
             "E_tie": self.cfg.total_cfg.w_tie,
-            "E_bc": self.cfg.total_cfg.w_bc,
             "W_pre": self.cfg.total_cfg.w_pre,
+            "E_sigma": self.cfg.total_cfg.w_sigma,
             # 残差项默认权重为 0，需要的话再在 config 里改
             "R_fric_comp": 0.0,
             "R_contact_comp": 0.0,
@@ -1623,11 +1833,16 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: 前向/反传")
                     t0 = time.perf_counter()
                     preload_case = self._sample_preload_case()
+                    vol_note = ""
+                    if self.elasticity is not None and hasattr(self.elasticity, "set_sample_indices"):
+                        vol_indices, vol_note = self._maybe_apply_volume_rar(step)
+                        self.elasticity.set_sample_indices(vol_indices)
                     Pi, parts, stats, grad_norm = self._train_step(total, preload_case)
                     P_np = preload_case["P"]
                     order_np = preload_case.get("order")
                     self._last_preload_case = copy.deepcopy(preload_case)
                     self._update_contact_rar_cache()
+                    self._update_volume_rar_cache()
                     pi_val = float(Pi.numpy())
                     if self._pi_baseline is None:
                         self._pi_baseline = pi_val if pi_val != 0.0 else 1.0
@@ -1660,6 +1875,8 @@ class Trainer:
                         order_txt = " order=" + "-".join(str(int(x) + 1) for x in order_np)
                     energy_summary = self._format_energy_summary(parts)
                     energy_txt = f" | {energy_summary}" if energy_summary else ""
+                    if vol_note:
+                        energy_txt += f" | {vol_note}"
                     train_note = (
                         f"P=[{int(P_np[0])},{int(P_np[1])},{int(P_np[2])}]"
                         f"{order_txt}{energy_txt} | Π={pi_val:.2e} {rel_txt} {d_txt} "
@@ -1970,6 +2187,8 @@ class Trainer:
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
+            # 强制启用可视化去除刚体位移，避免沿用 mirror_viz 的默认 False
+            remove_rigid=True,
             diag_out=diag_out,
         )
 
@@ -2032,6 +2251,8 @@ class Trainer:
             eval_scope=self.cfg.viz_eval_scope,
             diagnose_blanks=self.cfg.viz_diagnose_blanks,
             auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
+            # 强制启用可视化去除刚体位移，避免沿用 mirror_viz 的默认 False
+            remove_rigid=True,
             diag_out=diag_out,
         )
 
@@ -2039,13 +2260,48 @@ class Trainer:
             self.last_viz_diag = diag_out.get("blank_check")
         return result
 
+    def _fixed_viz_preload_cases(self) -> List[Dict[str, np.ndarray]]:
+        """生成固定的 6 组预紧案例以避免可视化阶段的随机性."""
+
+        nb = 3  # 现有镜面配置假定三颗螺栓
+
+        def _make_case(P_list: Sequence[float], order: Sequence[int]) -> Dict[str, np.ndarray]:
+            P_arr = np.asarray(P_list, dtype=np.float32).reshape(-1)
+            if P_arr.size != nb:
+                raise ValueError(f"固定可视化仅支持 {nb} 颗螺栓，收到 {P_arr.size} 维载荷。")
+            case: Dict[str, np.ndarray] = {"P": P_arr}
+            if not self.cfg.preload_use_stages:
+                return case
+            order_norm = self._normalize_order(order, nb)
+            if order_norm is None:
+                return case
+            case["order"] = order_norm
+            case.update(self._build_stage_case(P_arr, order_norm))
+            return case
+
+        cases: List[Dict[str, np.ndarray]] = []
+
+        # 三组单螺栓 2000N，顺序固定为 1-2-3
+        for P_single in ([2000.0, 0.0, 0.0], [0.0, 2000.0, 0.0], [0.0, 0.0, 2000.0]):
+            cases.append(_make_case(P_single, order=[0, 1, 2]))
+
+        # 三组 1500N 等幅，采用不同拧紧顺序
+        for order in ([0, 1, 2], [0, 2, 1], [2, 1, 0]):
+            cases.append(_make_case([1500.0, 1500.0, 1500.0], order=order))
+
+        return cases
+
     def _visualize_after_training(self, n_samples: int = 5):
         if self.asm is None or self.model is None:
             return
         os.makedirs(self.cfg.out_dir, exist_ok=True)
-        print(f"[trainer] Generating {n_samples} deflection maps for '{self.cfg.mirror_surface_name}' ...")
-        for i in range(n_samples):
-            preload_case = self._sample_preload_case()
+        cases = self._fixed_viz_preload_cases()
+        n_total = len(cases) if cases else n_samples
+        print(
+            f"[trainer] Generating {n_total} deflection maps for '{self.cfg.mirror_surface_name}' ..."
+        )
+        iter_cases = cases if cases else [self._sample_preload_case() for _ in range(n_samples)]
+        for i, preload_case in enumerate(iter_cases):
             P = preload_case["P"]
             order_display = None
             if self.cfg.preload_use_stages and "order" in preload_case:

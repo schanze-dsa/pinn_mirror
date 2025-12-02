@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-attach_ties_bcs.py — 从 INP 解析并挂载 Tie / Boundary（保留原功能 + 自动降级，Py38+）
+attach_ties_bcs.py — 挂载 Tie / Boundary（优先复用已解析的 asm 对象，Py38+）
 
 功能层次（按优先级）：
 1) 原生路径：若工程存在 TiePenalty/BoundaryPenalty，且 asm 暴露
@@ -17,7 +17,6 @@ attach_ties_bcs.py — 从 INP 解析并挂载 Tie / Boundary（保留原功能 
     attach_ties_and_bcs_from_inp(total, asm, inp_path, cfg)
 """
 
-import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Set
 import numpy as np
@@ -29,85 +28,14 @@ except Exception:
     TiePenalty = None  # type: ignore
 
 try:
-    from physics.boundary_conditions import BoundaryPenalty  # type: ignore
+    from physics.boundary_conditions import BoundaryPenalty, BoundaryConfig  # type: ignore
 except Exception:
     BoundaryPenalty = None  # type: ignore
+    BoundaryConfig = None  # type: ignore
 
 
 # ============================================================
-# 1) INP 解析（*Tie / *Boundary）
-# ============================================================
-def _clean(s: str) -> str:
-    return s.strip().rstrip(",")
-
-
-def _parse_inp_tie_boundary(inp_path: str) -> Dict[str, Any]:
-    if not os.path.isfile(inp_path):
-        raise FileNotFoundError("INP 不存在: {}".format(inp_path))
-
-    with open(inp_path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = [ln.rstrip() for ln in f]
-
-    ties: List[Dict[str, Any]] = []
-    bcs: List[Dict[str, Any]] = []
-
-    re_tie_hdr = re.compile(r"^\*Tie\b", re.I)
-    re_tie_name = re.compile(r"\bname\s*=\s*([^,]+)", re.I)
-    re_bnd_hdr = re.compile(r"^\*Boundary\b", re.I)
-
-    i, n = 0, len(lines)
-    while i < n:
-        s = lines[i].strip()
-        su = s.upper()
-
-        # *Tie
-        if re_tie_hdr.match(su):
-            name = None
-            m = re_tie_name.search(s)
-            if m:
-                name = _clean(m.group(1))
-            j = i + 1
-            toks: List[str] = []
-            while j < n and lines[j].strip() and not lines[j].lstrip().startswith("*"):
-                toks += [_clean(t) for t in lines[j].split(",") if t.strip()]
-                j += 1
-                if len(toks) >= 2:
-                    break
-            if len(toks) >= 2:
-                master, slave = toks[0], toks[1]
-                ties.append({"name": name or f"TIE@{master}->{slave}", "master": master, "slave": slave})
-            i = j
-            continue
-
-        # *Boundary（含 ENCASTRE）
-        if re_bnd_hdr.match(su):
-            i += 1
-            while i < n and lines[i].strip() and not lines[i].lstrip().startswith("*"):
-                row = [t.strip() for t in lines[i].split(",")]
-                if not row:
-                    i += 1
-                    continue
-                if len(row) >= 2 and row[1].upper().startswith("ENCASTRE"):
-                    bcs.append({"set": row[0], "type": "ENCASTRE", "dof1": 1, "dof2": 6, "raw": lines[i]})
-                else:
-                    def _to_int(x):
-                        try:
-                            return int(float(x))
-                        except Exception:
-                            return None
-                    d1 = _to_int(row[1]) if len(row) >= 2 else None
-                    d2 = _to_int(row[2]) if len(row) >= 3 else d1
-                    bcs.append({"set": row[0], "type": "BOUNDARY", "dof1": d1, "dof2": d2, "raw": lines[i]})
-                i += 1
-            continue
-
-        i += 1
-
-    return {"ties": ties, "bcs": bcs}
-
-
-# ============================================================
-# 2) 名称解析 & 几何辅助（原接口优先，缺失则降级）
+# 1) 名称解析 & 几何辅助（原接口优先，缺失则降级）
 #    ——含 SetDef 展开、items/stype 解析 + dict→array 规范化
 # ============================================================
 def _resolve_key_in_dict(d: Dict[str, Any], key: str) -> str:
@@ -492,6 +420,51 @@ def _nearest_on_vertices(xs, V_master) -> Tuple[np.ndarray, np.ndarray]:
     return xm.astype(np.float32), w
 
 
+# ============================================================
+# 1.1) 从已解析的 asm 对象提取 Tie/Boundary 配置
+# ============================================================
+def _extract_ties_from_asm(asm) -> List[Dict[str, Any]]:
+    ties_cfg: List[Dict[str, Any]] = []
+    for t in getattr(asm, "ties", []) or []:
+        master = getattr(t, "master", None)
+        slave = getattr(t, "slave", None)
+        if not master or not slave:
+            continue
+        name = getattr(t, "name", None) or f"TIE@{master}->{slave}"
+        ties_cfg.append({"name": name, "master": master, "slave": slave})
+    return ties_cfg
+
+
+def _parse_boundary_entry(raw_entry: Any) -> Dict[str, Any]:
+    raw = getattr(raw_entry, "raw", raw_entry)
+    row = [t.strip() for t in str(raw).split(",") if t.strip()]
+    setn = row[0] if row else ""
+    typ = "BOUNDARY"
+    d1 = d2 = None
+
+    if len(row) >= 2 and row[1].upper().startswith("ENCASTRE"):
+        typ = "ENCASTRE"
+        d1, d2 = 1, 6
+    else:
+        def _to_int(x):
+            try:
+                return int(float(x))
+            except Exception:
+                return None
+
+        d1 = _to_int(row[1]) if len(row) >= 2 else None
+        d2 = _to_int(row[2]) if len(row) >= 3 else d1
+
+    return {"set": setn, "type": typ, "dof1": d1, "dof2": d2, "raw": raw}
+
+
+def _extract_bcs_from_asm(asm) -> List[Dict[str, Any]]:
+    bcs_cfg: List[Dict[str, Any]] = []
+    for b in getattr(asm, "boundaries", []) or []:
+        bcs_cfg.append(_parse_boundary_entry(b))
+    return bcs_cfg
+
+
 def build_surface_correspondence(asm, slave_key: str, master_key: str, n_points: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     生成 Tie 点对应：(xs on slave, xm on master, w)。
@@ -586,17 +559,18 @@ class SimpleBC(object):
 # ============================================================
 def attach_ties_and_bcs_from_inp(total, asm, inp_path: str, cfg) -> None:
     """
-    解析 INP 并把 Tie/Boundary 挂到 total.attach(...)。
+    从已解析的 asm 对象中提取 Tie/Boundary 并挂到 total.attach(...)。
     - 若检测到真实罚项类/接口，优先构造真实算子；
     - 否则构造 SimpleTie/SimpleBC 以保证流程可运行。
     """
-    parsed = _parse_inp_tie_boundary(inp_path)
-    ties_cfg = parsed.get("ties", [])
-    bcs_cfg = parsed.get("bcs", [])
+    ties_cfg = _extract_ties_from_asm(asm)
+    bcs_cfg = _extract_bcs_from_asm(asm)
 
     n_tie_points = int(getattr(cfg, "n_tie_points", 2000))
     tie_alpha = float(getattr(cfg, "tie_alpha", 1.0e3))
     bc_alpha = float(getattr(cfg, "bc_alpha", 1.0e4))
+    bc_mu = float(getattr(cfg, "bc_mu", 1.0e3))
+    bc_mode = str(getattr(cfg, "bc_mode", "penalty")).lower()
 
     ties_out: List[Any] = []
     bcs_out: List[Any] = []
@@ -639,7 +613,8 @@ def attach_ties_and_bcs_from_inp(total, asm, inp_path: str, cfg) -> None:
 
         if BoundaryPenalty is not None and isinstance(X, np.ndarray) and X.shape[0] > 0:
             try:
-                bc = BoundaryPenalty(alpha=bc_alpha, dof1=d1, dof2=d2, kind=typ)
+                bc_cfg = BoundaryConfig(alpha=bc_alpha, mode=bc_mode, mu=bc_mu)
+                bc = BoundaryPenalty(cfg=bc_cfg, dof1=d1, dof2=d2, kind=typ)
                 if hasattr(bc, "build"):
                     bc.build(X)
                 else:
