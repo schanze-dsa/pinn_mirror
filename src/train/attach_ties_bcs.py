@@ -459,8 +459,9 @@ def _parse_boundary_entry(raw_entry: Any) -> Dict[str, Any]:
 
 
 def _extract_bcs_from_asm(asm) -> List[Dict[str, Any]]:
+    """抽取已解析的边界条件，兼容 asm.boundaries / asm.bcs。"""
     bcs_cfg: List[Dict[str, Any]] = []
-    for b in getattr(asm, "boundaries", []) or []:
+    for b in (getattr(asm, "boundaries", None) or getattr(asm, "bcs", []) or []):
         bcs_cfg.append(_parse_boundary_entry(b))
     return bcs_cfg
 
