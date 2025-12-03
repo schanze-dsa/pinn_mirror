@@ -1723,7 +1723,6 @@ class Trainer:
         attach_ties_and_bcs_from_inp(
             total=total,
             asm=self.asm,
-            inp_path=self.cfg.inp_path,
             cfg=self.cfg,
         )
         print("[dbg] Tie/BC 已挂载到 total")
