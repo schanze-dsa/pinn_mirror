@@ -10,8 +10,7 @@ One-click runner for your DFEM/PINN project (PyCharm 直接运行即可).
 - 自动解析 INP & 表面 key（支持精确/模糊；含 bolt2 的 ASM::"bolt2 uo"）
 - 与新版 surfaces.py / inp_parser.py 对齐（ELEMENT 表面可直接采样）
 - 训练配置集中覆盖（降显存：节点前向分块、降低采样规模、混合精度）
-- 支持从 config.yaml 读取材料、螺栓、接触对与 DFEM 配置（main.py 只做兜底）
-- 训练前“预训练审计打印”（镜面/螺栓/接触/绑定/超参等一并核对）
+- 训练配置由 config.yaml 驱动（未找到或缺失必填项会直接报错）
 - 训练结束后在 outputs/ 生成随机 5 组镜面变形云图（文件名含三螺栓预紧力）
 """
 
@@ -400,7 +399,6 @@ def _prepare_config_with_autoguess():
     cfg.model_cfg.preload_shift = preload_mid
     cfg.model_cfg.preload_scale = max(preload_half_span, 1e-3)
     # =================================================
-    print("elas_cfg =", vars(cfg.elas_cfg))
     return cfg, asm
 
 
