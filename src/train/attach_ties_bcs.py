@@ -14,7 +14,7 @@ attach_ties_bcs.py — 挂载 Tie / Boundary（优先复用已解析的 asm 对�
    - type=ELEMENT：items 为 ELSET(+面号 S1..S6)，内置 C3D8/C3D20 角点面映射，其它类型回退为全节点。
 
 对外主入口：
-    attach_ties_and_bcs_from_inp(total, asm, inp_path, cfg)
+    attach_ties_and_bcs_from_inp(total, asm, cfg)
 """
 
 import re
@@ -557,7 +557,7 @@ class SimpleBC(object):
 # ============================================================
 # 4) 对外主函数：解析 + 几何构造 + 挂载
 # ============================================================
-def attach_ties_and_bcs_from_inp(total, asm, inp_path: str, cfg) -> None:
+def attach_ties_and_bcs_from_inp(total, asm, cfg) -> None:
     """
     从已解析的 asm 对象中提取 Tie/Boundary 并挂到 total.attach(...)。
     - 若检测到真实罚项类/接口，优先构造真实算子；
