@@ -34,22 +34,6 @@ def _debug(msg: str) -> None:
         print(msg)
 
 
-_SURFACE_DEBUG = os.environ.get("PINN_SURFACE_DEBUG", "0") == "1"
-
-
-def _debug(msg: str) -> None:
-    if _SURFACE_DEBUG:
-        print(msg)
-
-
-_SURFACE_DEBUG = os.environ.get("PINN_SURFACE_DEBUG", "0") == "1"
-
-
-def _debug(msg: str) -> None:
-    if _SURFACE_DEBUG:
-        print(msg)
-
-
 # =========================
 # 基本数据结构
 # =========================
