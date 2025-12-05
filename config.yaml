@@ -255,6 +255,8 @@ output_config:
   viz_use_shape_function_interp: true   # 启用形函数插值，让镜面云图更光滑
   viz_surface_source: "surface"         # 使用 INP 提供的单层镜面
   viz_refine_subdivisions: 2            # 细分 2 层已足够，后续由 griddata 提升分辨率
+  viz_grid_resolution: 1400             # 高分辨率插值网格，进一步平滑云图
+  viz_grid_upsample: 2                  # 先插值再二次超采样，减少像素感
 
 # ------------------------------------------------------------
 # 9. INP 文件路径

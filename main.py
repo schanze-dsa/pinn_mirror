@@ -203,6 +203,10 @@ def _prepare_config_with_autoguess():
         cfg.viz_surface_source = str(output_cfg["viz_surface_source"])
     if "viz_refine_subdivisions" in output_cfg:
         cfg.viz_refine_subdivisions = int(output_cfg["viz_refine_subdivisions"])
+    if "viz_grid_resolution" in output_cfg:
+        cfg.viz_grid_resolution = int(output_cfg["viz_grid_resolution"])
+    if "viz_grid_upsample" in output_cfg:
+        cfg.viz_grid_upsample = int(output_cfg["viz_grid_upsample"])
     cfg.adam_steps = cfg.max_steps
 
     cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))

@@ -739,6 +739,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            refine_subdivisions: int = 2,
                            refine_max_points: Optional[int] = None,
                            use_shape_function_interp: bool = False,
+                           grid_resolution: int = 1000,
+                           grid_upsample: int = 1,
                            smooth_scalar_iters: int = 0,
                            smooth_scalar_lambda: float = 0.6,
                            eval_batch_size: int = 65_536,
@@ -1039,13 +1041,25 @@ def plot_mirror_deflection(asm: AssemblyModel,
             # -------------------------------------------------------
             from scipy.interpolate import griddata
 
-            resolution = 1000
+            resolution = max(32, int(grid_resolution or 0))
             xi = np.linspace(UV_plot[:, 0].min(), UV_plot[:, 0].max(), resolution)
             yi = np.linspace(UV_plot[:, 1].min(), UV_plot[:, 1].max(), resolution)
             Xi, Yi = np.meshgrid(xi, yi)
 
             print(f"[viz] Running cubic interpolation on {resolution}x{resolution} grid...")
             Zi = griddata((UV_plot[:, 0], UV_plot[:, 1]), d_plot, (Xi, Yi), method="cubic")
+
+            upsample = max(1, int(grid_upsample or 1))
+            if upsample > 1:
+                try:
+                    from scipy.ndimage import zoom
+
+                    Zi = zoom(Zi, upsample, order=3)
+                    Xi = zoom(Xi, upsample, order=1)
+                    Yi = zoom(Yi, upsample, order=1)
+                    print(f"[viz] Upsampled grid by {upsample}x -> {Zi.shape[0]}x{Zi.shape[1]}")
+                except Exception as exc:  # pragma: no cover - optional dependency path
+                    print(f"[viz] Warning: high-res resampling failed ({exc}); using base grid")
 
             mask_nan = np.isnan(Zi)
             if np.any(mask_nan):
