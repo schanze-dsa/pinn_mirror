@@ -35,6 +35,15 @@ if SRC not in sys.path:
 
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
 
+# ---------- SavedModel 默认输出路径 ----------
+def _default_saved_model_dir(out_dir: str) -> str:
+    """Return a timestamped SavedModel export directory under ``out_dir``."""
+
+    base = os.path.abspath(out_dir or "outputs")
+    os.makedirs(base, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.join(base, f"saved_model_{ts}")
+
 # --- 项目内模块导入 ---
 from train.trainer import TrainerConfig
 from inp_io.inp_parser import load_inp
@@ -186,6 +195,18 @@ def _prepare_config_with_autoguess():
         max_steps=train_steps,
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
+    output_cfg = cfg_yaml.get("output_config", {}) or {}
+    cfg.viz_use_shape_function_interp = bool(
+        output_cfg.get("viz_use_shape_function_interp", cfg.viz_use_shape_function_interp)
+    )
+    if "viz_surface_source" in output_cfg:
+        cfg.viz_surface_source = str(output_cfg["viz_surface_source"])
+    if "viz_refine_subdivisions" in output_cfg:
+        cfg.viz_refine_subdivisions = int(output_cfg["viz_refine_subdivisions"])
+    if "viz_grid_resolution" in output_cfg:
+        cfg.viz_grid_resolution = int(output_cfg["viz_grid_resolution"])
+    if "viz_grid_upsample" in output_cfg:
+        cfg.viz_grid_upsample = int(output_cfg["viz_grid_upsample"])
     cfg.adam_steps = cfg.max_steps
 
     cfg.lr = float(optimizer_cfg.get("learning_rate", cfg.lr))
