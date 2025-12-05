@@ -662,15 +662,8 @@ class DisplacementModel:
             cfg.field.cond_dim = cfg.encoder.out_dim
         self.field = DisplacementNet(cfg.field)
 
-    @tf.function(jit_compile=False)
-    def u_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:
-        """
-        Unified forward:
-            X: (N,3) float tensor (coordinates; normalized outside if采用归一化)
-            params: dict with either
-                - 'P_hat': (3,) or (N,3) normalized preload
-                - or 'P': (3,) real preload in N + cfg.preload_shift/scale provided
-        """
+    def _normalize_inputs(self, X: tf.Tensor, params: Optional[Dict]) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Validate/convert inputs and ensure stable shapes for tf.function trace reuse."""
         if params is None:
             raise ValueError("params must contain 'P_hat' or 'P'.")
 
@@ -685,35 +678,66 @@ class DisplacementModel:
             raise ValueError("params must have 'P_hat' or 'P'.")
 
         P_hat = tf.convert_to_tensor(P_hat, dtype=tf.float32)
+        if P_hat.shape.rank == 1:
+            P_hat = tf.expand_dims(P_hat, axis=0)
+        P_hat = tf.ensure_shape(P_hat, (None, 3))
+
+        X = tf.convert_to_tensor(X, dtype=tf.float32)
+        if X.shape.rank == 1:
+            X = tf.expand_dims(X, axis=0)
+        X = tf.ensure_shape(X, (None, 3))
+
+        return X, P_hat
+
+    @tf.function(
+        jit_compile=False,
+        reduce_retracing=True,
+        input_signature=(
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="P_hat"),
+        ),
+    )
+    def _u_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> tf.Tensor:
         z = self.encoder(P_hat)          # (B, cond_dim)
-        u = self.field(tf.convert_to_tensor(X), z)   # (N,3)
+        u = self.field(X, z)             # (N,3)
         # Physics operators和能量算子都假定输入为 float32；若启用混合精度，
         # 网络内部会在 float16/bfloat16 下计算，此处统一 cast 回 float32，
         # 以避免如 tie/boundary 约束中出现 "expected float but got half" 的报错。
         return tf.cast(u, tf.float32)
 
-    @tf.function(jit_compile=False)
+    def u_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:
+        """
+        Unified forward:
+            X: (N,3) float tensor (coordinates; normalized outside if采用归一化)
+            params: dict with either
+                - 'P_hat': (3,) or (N,3) normalized preload
+                - or 'P': (3,) real preload in N + cfg.preload_shift/scale provided
+        """
+        X, P_hat = self._normalize_inputs(X, params)
+        return self._u_fn_compiled(X, P_hat)
+
+    @tf.function(
+        jit_compile=False,
+        reduce_retracing=True,
+        input_signature=(
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="P_hat"),
+        ),
+    )
+    def _us_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        if self.stress_out is None:
+            raise ValueError("stress head disabled (stress_out_dim<=0)")
+        z = self.encoder(P_hat)          # (B, cond_dim)
+        u, sigma = self.field(X, z, return_stress=True)
+        return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+
     def us_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
         """
         带应力头的前向：返回位移 u 和预测的应力分量 sigma。
         sigma 的维度由 cfg.field.stress_out_dim 决定（默认 6）。
         """
-        if params is None:
-            raise ValueError("params must contain 'P_hat' or 'P'.")
-
-        if "P_hat" in params:
-            P_hat = params["P_hat"]
-        elif "P" in params:
-            shift = tf.cast(self.cfg.preload_shift, tf.float32)
-            scale = tf.cast(self.cfg.preload_scale, tf.float32)
-            P_hat = (tf.convert_to_tensor(params["P"], dtype=tf.float32) - shift) / scale
-        else:
-            raise ValueError("params must have 'P_hat' or 'P'.")
-
-        P_hat = tf.convert_to_tensor(P_hat, dtype=tf.float32)
-        z = self.encoder(P_hat)          # (B, cond_dim)
-        u, sigma = self.field(tf.convert_to_tensor(X), z, return_stress=True)
-        return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+        X, P_hat = self._normalize_inputs(X, params)
+        return self._us_fn_compiled(X, P_hat)
 
 
 def create_displacement_model(cfg: Optional[ModelConfig] = None) -> DisplacementModel:
