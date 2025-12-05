@@ -429,15 +429,14 @@ class ParamEncoder(tf.keras.layers.Layer):
         cur = tf.shape(P_hat)[-1]
         target_tf = tf.cast(target, tf.int32)
 
-        def _pad():
-            pad_width = target_tf - cur
-            pad_zeros = tf.zeros((tf.shape(P_hat)[0], pad_width), dtype=P_hat.dtype)
-            return tf.concat([P_hat, pad_zeros], axis=-1)
-
-        def _trim():
-            return P_hat[:, :target_tf]
-
-        adjusted = tf.cond(cur < target_tf, _pad, _trim)
+        # Avoid tf.cond to prevent trace-time Optional type inconsistencies when using
+        # mixed precision (half vs int32). We pad with zeros only when needed, then
+        # slice to the target width so both under- and over-length inputs are handled
+        # in a single branch with consistent dtypes.
+        pad_width = tf.maximum(target_tf - cur, 0)
+        pad_zeros = tf.zeros((tf.shape(P_hat)[0], pad_width), dtype=P_hat.dtype)
+        padded = tf.concat([P_hat, pad_zeros], axis=-1)
+        adjusted = padded[:, :target_tf]
         adjusted.set_shape((None, target))
         return adjusted
 
@@ -661,16 +660,12 @@ class DisplacementModel:
             print(f"[pinn_model] Adjust cond_dim from {cfg.field.cond_dim} -> {cfg.encoder.out_dim}")
             cfg.field.cond_dim = cfg.encoder.out_dim
         self.field = DisplacementNet(cfg.field)
+        # Alias stress head for backward compatibility with previously traced graphs
+        # that referenced `self.stress_out` directly.
+        self.stress_out = self.field.stress_out
 
-    @tf.function(jit_compile=False)
-    def u_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:
-        """
-        Unified forward:
-            X: (N,3) float tensor (coordinates; normalized outside if采用归一化)
-            params: dict with either
-                - 'P_hat': (3,) or (N,3) normalized preload
-                - or 'P': (3,) real preload in N + cfg.preload_shift/scale provided
-        """
+    def _normalize_inputs(self, X: tf.Tensor, params: Optional[Dict]) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Validate/convert inputs and ensure stable shapes for tf.function trace reuse."""
         if params is None:
             raise ValueError("params must contain 'P_hat' or 'P'.")
 
@@ -685,35 +680,70 @@ class DisplacementModel:
             raise ValueError("params must have 'P_hat' or 'P'.")
 
         P_hat = tf.convert_to_tensor(P_hat, dtype=tf.float32)
+        if P_hat.shape.rank == 1:
+            P_hat = tf.expand_dims(P_hat, axis=0)
+
+        # P_hat may include staged metadata (mask/last/rank) -> length 4*n_bolts; avoid
+        # over-constraining the last dimension. We only ensure rank-2 here and let
+        # ParamEncoder._normalize_dim pad/trim to cfg.encoder.in_dim when set.
+        P_hat = tf.ensure_shape(P_hat, (None, None))
+
+        X = tf.convert_to_tensor(X, dtype=tf.float32)
+        if X.shape.rank == 1:
+            X = tf.expand_dims(X, axis=0)
+        X = tf.ensure_shape(X, (None, 3))
+
+        return X, P_hat
+
+    @tf.function(
+        jit_compile=False,
+        reduce_retracing=True,
+        input_signature=(
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=(None, None), dtype=tf.float32, name="P_hat"),
+        ),
+    )
+    def _u_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> tf.Tensor:
         z = self.encoder(P_hat)          # (B, cond_dim)
-        u = self.field(tf.convert_to_tensor(X), z)   # (N,3)
+        u = self.field(X, z)             # (N,3)
         # Physics operators和能量算子都假定输入为 float32；若启用混合精度，
         # 网络内部会在 float16/bfloat16 下计算，此处统一 cast 回 float32，
         # 以避免如 tie/boundary 约束中出现 "expected float but got half" 的报错。
         return tf.cast(u, tf.float32)
 
-    @tf.function(jit_compile=False)
+    def u_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> tf.Tensor:
+        """
+        Unified forward:
+            X: (N,3) float tensor (coordinates; normalized outside if采用归一化)
+            params: dict with either
+                - 'P_hat': (3,) or (N,3) normalized preload
+                - or 'P': (3,) real preload in N + cfg.preload_shift/scale provided
+        """
+        X, P_hat = self._normalize_inputs(X, params)
+        return self._u_fn_compiled(X, P_hat)
+
+    @tf.function(
+        jit_compile=False,
+        reduce_retracing=True,
+        input_signature=(
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
+            tf.TensorSpec(shape=(None, None), dtype=tf.float32, name="P_hat"),
+        ),
+    )
+    def _us_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        if self.field.stress_out is None:
+            raise ValueError("stress head disabled (stress_out_dim<=0)")
+        z = self.encoder(P_hat)          # (B, cond_dim)
+        u, sigma = self.field(X, z, return_stress=True)
+        return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+
     def us_fn(self, X: tf.Tensor, params: Optional[Dict] = None) -> Tuple[tf.Tensor, tf.Tensor]:
         """
         带应力头的前向：返回位移 u 和预测的应力分量 sigma。
         sigma 的维度由 cfg.field.stress_out_dim 决定（默认 6）。
         """
-        if params is None:
-            raise ValueError("params must contain 'P_hat' or 'P'.")
-
-        if "P_hat" in params:
-            P_hat = params["P_hat"]
-        elif "P" in params:
-            shift = tf.cast(self.cfg.preload_shift, tf.float32)
-            scale = tf.cast(self.cfg.preload_scale, tf.float32)
-            P_hat = (tf.convert_to_tensor(params["P"], dtype=tf.float32) - shift) / scale
-        else:
-            raise ValueError("params must have 'P_hat' or 'P'.")
-
-        P_hat = tf.convert_to_tensor(P_hat, dtype=tf.float32)
-        z = self.encoder(P_hat)          # (B, cond_dim)
-        u, sigma = self.field(tf.convert_to_tensor(X), z, return_stress=True)
-        return tf.cast(u, tf.float32), tf.cast(sigma, tf.float32)
+        X, P_hat = self._normalize_inputs(X, params)
+        return self._us_fn_compiled(X, P_hat)
 
 
 def create_displacement_model(cfg: Optional[ModelConfig] = None) -> DisplacementModel:
