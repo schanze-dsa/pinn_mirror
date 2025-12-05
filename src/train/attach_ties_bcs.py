@@ -2,6 +2,8 @@
 """
 attach_ties_bcs.py — 挂载 Tie / Boundary（优先复用已解析的 asm 对象，Py38+）
 
+注意：本模块不再二次打开 .inp 文件，Tie/Boundary 信息完全依赖 asm 上游解析结果，防止重复 I/O 和正则扫描。
+
 功能层次（按优先级）：
 1) 原生路径：若工程存在 TiePenalty/BoundaryPenalty，且 asm 暴露
    get_triangulated_surface / project_points_onto_surface / get_nset_node_ids / get_node_coords，
@@ -14,7 +16,7 @@ attach_ties_bcs.py — 挂载 Tie / Boundary（优先复用已解析的 asm 对�
    - type=ELEMENT：items 为 ELSET(+面号 S1..S6)，内置 C3D8/C3D20 角点面映射，其它类型回退为全节点。
 
 对外主入口：
-    attach_ties_and_bcs_from_inp(total, asm, inp_path, cfg)
+    attach_ties_and_bcs_from_inp(total, asm, cfg)
 """
 
 import re
@@ -458,9 +460,31 @@ def _parse_boundary_entry(raw_entry: Any) -> Dict[str, Any]:
     return {"set": setn, "type": typ, "dof1": d1, "dof2": d2, "raw": raw}
 
 
+def _boundary_mask(d1: Optional[int], d2: Optional[int], kind: str, N: int) -> np.ndarray:
+    """Generate a (N,3) mask for constrained DOFs."""
+
+    mask = np.zeros((N, 3), dtype=np.float32)
+    kind_upper = kind.upper()
+    if kind_upper == "ENCASTRE":
+        mask.fill(1.0)
+        return mask
+
+    if d1 is None:
+        return mask
+
+    d1 = int(d1)
+    d2 = int(d2) if d2 is not None else d1
+    for dof in range(min(d1, d2), max(d1, d2) + 1):
+        if 1 <= dof <= 3:
+            mask[:, dof - 1] = 1.0
+
+    return mask
+
+
 def _extract_bcs_from_asm(asm) -> List[Dict[str, Any]]:
+    """抽取已解析的边界条件，兼容 asm.boundaries / asm.bcs。"""
     bcs_cfg: List[Dict[str, Any]] = []
-    for b in getattr(asm, "boundaries", []) or []:
+    for b in (getattr(asm, "boundaries", None) or getattr(asm, "bcs", []) or []):
         bcs_cfg.append(_parse_boundary_entry(b))
     return bcs_cfg
 
@@ -557,7 +581,7 @@ class SimpleBC(object):
 # ============================================================
 # 4) 对外主函数：解析 + 几何构造 + 挂载
 # ============================================================
-def attach_ties_and_bcs_from_inp(total, asm, inp_path: str, cfg) -> None:
+def attach_ties_and_bcs_from_inp(total, asm, cfg) -> None:
     """
     从已解析的 asm 对象中提取 Tie/Boundary 并挂到 total.attach(...)。
     - 若检测到真实罚项类/接口，优先构造真实算子；
@@ -607,18 +631,16 @@ def attach_ties_and_bcs_from_inp(total, asm, inp_path: str, cfg) -> None:
         d1 = b.get("dof1")
         d2 = b.get("dof2") if b.get("dof2") is not None else d1
 
-        X, _ = get_nset_coords(asm, setn)
+        X, w = get_nset_coords(asm, setn)
         if isinstance(X, (list, tuple, np.ndarray, dict)):
             X = _as_array3(X) if len(np.asarray(X).shape) != 0 else X  # ★ 兜底
 
         if BoundaryPenalty is not None and isinstance(X, np.ndarray) and X.shape[0] > 0:
             try:
                 bc_cfg = BoundaryConfig(alpha=bc_alpha, mode=bc_mode, mu=bc_mu)
-                bc = BoundaryPenalty(cfg=bc_cfg, dof1=d1, dof2=d2, kind=typ)
-                if hasattr(bc, "build"):
-                    bc.build(X)
-                else:
-                    bc.X = X; bc.dof1 = d1; bc.dof2 = d2; bc.kind = typ
+                bc = BoundaryPenalty(cfg=bc_cfg)
+                mask = _boundary_mask(d1, d2, typ, X.shape[0])
+                bc.build_from_numpy(X, mask, u_target=None, w_bc=w)
                 bcs_out.append(bc)
                 continue
             except Exception:
