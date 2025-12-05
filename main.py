@@ -35,6 +35,15 @@ if SRC not in sys.path:
 
 CONFIG_PATH = os.path.join(ROOT, "config.yaml")
 
+# ---------- SavedModel 默认输出路径 ----------
+def _default_saved_model_dir(out_dir: str) -> str:
+    """Return a timestamped SavedModel export directory under ``out_dir``."""
+
+    base = os.path.abspath(out_dir or "outputs")
+    os.makedirs(base, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return os.path.join(base, f"saved_model_{ts}")
+
 # --- 项目内模块导入 ---
 from train.trainer import TrainerConfig
 from inp_io.inp_parser import load_inp
