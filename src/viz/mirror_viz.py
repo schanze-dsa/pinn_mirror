@@ -31,7 +31,7 @@ Author: you
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
 import numpy as np
@@ -216,6 +216,50 @@ def _refine_surface_samples(X3D: np.ndarray,
         np.asarray(pts2d, dtype=np.float64),
         np.asarray(tris, dtype=np.int32),
     )
+
+
+def _build_vertex_adjacency(triangles: np.ndarray, n_vertices: int) -> List[Set[int]]:
+    adj: List[Set[int]] = [set() for _ in range(n_vertices)]
+    for a, b, c in triangles:
+        adj[a].update((b, c))
+        adj[b].update((a, c))
+        adj[c].update((a, b))
+    return adj
+
+
+def _smooth_scalar_on_tri_mesh(values: np.ndarray,
+                               triangles: np.ndarray,
+                               iterations: int = 1,
+                               lam: float = 0.6) -> np.ndarray:
+    """Simple Laplacian smoothing on a triangulated scalar field.
+
+    Keeps non-finite entries untouched and blends each vertex with the mean of
+    its neighbors. ``lam`` controls blending strength (0=no smoothing, 1=full
+    neighbor mean). ``iterations`` applies the smoothing repeatedly.
+    """
+
+    vals = np.asarray(values, dtype=np.float64).copy()
+    lam = float(np.clip(lam, 0.0, 1.0))
+    if iterations <= 0 or lam <= 0.0:
+        return vals
+
+    n_vertices = vals.shape[0]
+    neighbors = _build_vertex_adjacency(triangles.astype(int), n_vertices)
+    finite_mask = np.isfinite(vals)
+
+    for _ in range(int(iterations)):
+        updated = vals.copy()
+        for idx, nbrs in enumerate(neighbors):
+            if not finite_mask[idx] or len(nbrs) == 0:
+                continue
+            valid_neighbors = [j for j in nbrs if finite_mask[j]]
+            if not valid_neighbors:
+                continue
+            mean_val = float(np.mean(vals[valid_neighbors]))
+            updated[idx] = (1.0 - lam) * vals[idx] + lam * mean_val
+        vals = updated
+
+    return vals
 from matplotlib import colors
 
 from inp_io.inp_parser import AssemblyModel
@@ -650,6 +694,8 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            draw_wireframe: bool = False,
                            refine_subdivisions: int = 2,
                            refine_max_points: Optional[int] = None,
+                           smooth_scalar_iters: int = 0,
+                           smooth_scalar_lambda: float = 0.6,
                            eval_batch_size: int = 65_536,
                            eval_scope: str = "assembly",
                            diagnose_blanks: bool = False,
@@ -697,6 +743,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
         draw_wireframe   : Whether to overlay triangle edges（若想避免“双层网格”视觉，请保持 False）。
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle（>0 提升平滑度）。
         refine_max_points   : Optional guardrail limiting the total evaluation points.
+        smooth_scalar_iters : Optional Laplacian smoothing iterations applied to displacement
+                            magnitudes on the triangulated surface before绘图；>0 可进一步消除
+                            颗粒感（默认 0 不平滑）。
+        smooth_scalar_lambda: 每次迭代平滑强度（0~1，默认 0.6，越大越平滑）。
         retriangulate_2d    : If True, rebuild a Delaunay triangulation in 2D and mask it
                             with detected boundary loops to eliminate sampling holes while
                             keeping annular holes intact.
@@ -900,6 +950,20 @@ def plot_mirror_deflection(asm: AssemblyModel,
         diag_out["blank_check"] = diag_result
         if eval_scope_info is not None:
             diag_out["eval_scope"] = eval_scope_info
+
+    # Optional scalar smoothing to eliminate coarse patches after refinement
+    smoothing_steps = max(0, int(smooth_scalar_iters or 0))
+    if smoothing_steps > 0:
+        triangles_for_smoothing = tri.get_masked_triangles()
+        if triangles_for_smoothing.size > 0 and np.any(np.isfinite(d_plot)):
+            d_plot = _smooth_scalar_on_tri_mesh(
+                d_plot,
+                triangles_for_smoothing,
+                iterations=smoothing_steps,
+                lam=float(smooth_scalar_lambda),
+            )
+        else:  # pragma: no cover - defensive
+            print("[viz] skip scalar smoothing: missing triangles or all values invalid")
 
     # 5) Draw surface map (optional)
     fig = ax = None
