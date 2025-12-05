@@ -171,10 +171,13 @@ def _eval_surface_or_assembly(
 def _refine_surface_samples(X3D: np.ndarray,
                             UV: np.ndarray,
                             tri_idx: np.ndarray,
-                            subdivisions: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                            subdivisions: int,
+                            return_barycentric: bool = False
+                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """Uniformly subdivide each triangle ``subdivisions`` times per edge.
 
-    Returns refined ``(X_ref, UV_ref, tri_ref)`` suitable for plotting.
+    Returns refined ``(X_ref, UV_ref, tri_ref, bary_weights, parent_triangles)`` suitable for
+    plotting. When ``return_barycentric`` is False (default), the last two values are ``None``.
     """
 
     m = int(max(0, subdivisions))
@@ -184,9 +187,11 @@ def _refine_surface_samples(X3D: np.ndarray,
     pts3d: List[np.ndarray] = []
     pts2d: List[np.ndarray] = []
     tris: List[List[int]] = []
+    bary_weights: List[Tuple[float, float, float]] = []
+    parent_tri: List[int] = []
     base_idx = 0
 
-    for (i0, i1, i2) in tri_idx:
+    for tri_id, (i0, i1, i2) in enumerate(tri_idx):
         X0, X1, X2 = X3D[[i0, i1, i2]]
         uv0, uv1, uv2 = UV[[i0, i1, i2]]
         local: Dict[Tuple[int, int], int] = {}
@@ -198,6 +203,9 @@ def _refine_surface_samples(X3D: np.ndarray,
                 w0 = 1.0 - w1 - w2
                 pts3d.append(w0 * X0 + w1 * X1 + w2 * X2)
                 pts2d.append(w0 * uv0 + w1 * uv1 + w2 * uv2)
+                if return_barycentric:
+                    bary_weights.append((w0, w1, w2))
+                    parent_tri.append(tri_id)
                 local[(i, j)] = base_idx
                 base_idx += 1
 
@@ -211,11 +219,18 @@ def _refine_surface_samples(X3D: np.ndarray,
                     d = local[(i + 1, j + 1)]
                     tris.append([b, d, c])
 
-    return (
-        np.asarray(pts3d, dtype=np.float64),
-        np.asarray(pts2d, dtype=np.float64),
-        np.asarray(tris, dtype=np.int32),
-    )
+    X_ref = np.asarray(pts3d, dtype=np.float64)
+    UV_ref = np.asarray(pts2d, dtype=np.float64)
+    tri_ref = np.asarray(tris, dtype=np.int32)
+    if return_barycentric:
+        return (
+            X_ref,
+            UV_ref,
+            tri_ref,
+            np.asarray(bary_weights, dtype=np.float64),
+            np.asarray(parent_tri, dtype=np.int64),
+        )
+    return (X_ref, UV_ref, tri_ref, None, None)
 
 
 def _build_vertex_adjacency(triangles: np.ndarray, n_vertices: int) -> List[Set[int]]:
@@ -225,6 +240,35 @@ def _build_vertex_adjacency(triangles: np.ndarray, n_vertices: int) -> List[Set[
         adj[b].update((a, c))
         adj[c].update((a, b))
     return adj
+
+
+def _interpolate_displacement_on_refined(u_vertices: np.ndarray,
+                                         tri_idx: np.ndarray,
+                                         parent_triangles: np.ndarray,
+                                         bary_weights: np.ndarray) -> np.ndarray:
+    """Use linear shape functions to interpolate displacement to refined samples.
+
+    Args:
+        u_vertices: (Nv, 3) nodal displacement vectors on the coarse surface.
+        tri_idx:    (T, 3) triangle connectivity using indices into ``u_vertices``.
+        parent_triangles: (Nr,) indices into ``tri_idx`` for each refined point.
+        bary_weights:     (Nr, 3) barycentric coordinates within the parent triangle.
+    """
+
+    if bary_weights is None or parent_triangles is None:
+        return u_vertices
+
+    tri_idx = np.asarray(tri_idx, dtype=np.int64)
+    parent_triangles = np.asarray(parent_triangles, dtype=np.int64)
+    bary_weights = np.asarray(bary_weights, dtype=np.float64)
+
+    if bary_weights.shape[0] != parent_triangles.shape[0]:
+        raise ValueError("parent_triangles and bary_weights must have the same length")
+
+    tri_nodes = tri_idx[parent_triangles]  # (Nr, 3)
+    u_local = u_vertices[tri_nodes]        # (Nr, 3, 3)
+    # einsum -> sum_j w_j * u_local[..., j, :]
+    return np.einsum("ni,nij->nj", bary_weights, u_local)
 
 
 def _smooth_scalar_on_tri_mesh(values: np.ndarray,
@@ -694,6 +738,7 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            draw_wireframe: bool = False,
                            refine_subdivisions: int = 2,
                            refine_max_points: Optional[int] = None,
+                           use_shape_function_interp: bool = False,
                            smooth_scalar_iters: int = 0,
                            smooth_scalar_lambda: float = 0.6,
                            eval_batch_size: int = 65_536,
@@ -743,6 +788,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
         draw_wireframe   : Whether to overlay triangle edges（若想避免“双层网格”视觉，请保持 False）。
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle（>0 提升平滑度）。
         refine_max_points   : Optional guardrail limiting the total evaluation points.
+        use_shape_function_interp : If True, reuse coarse nodal displacements and interpolate
+                            refined samples via linear (P1) shape functions instead of rerunning
+                            the network, producing a smoother map that respects FE connectivity.
         smooth_scalar_iters : Optional Laplacian smoothing iterations applied to displacement
                             magnitudes on the triangulated surface before绘图；>0 可进一步消除
                             颗粒感（默认 0 不平滑）。
@@ -857,8 +905,13 @@ def plot_mirror_deflection(asm: AssemblyModel,
             )
 
     if applied_subdiv > 0:
-        X_plot, UV_plot, tri_plot = _refine_surface_samples(X3D, UV, tri_idx, applied_subdiv)
-        u_plot = _eval_displacement_batched(u_fn, params, X_plot, eval_batch_size)
+        X_plot, UV_plot, tri_plot, bary_w, bary_parent = _refine_surface_samples(
+            X3D, UV, tri_idx, applied_subdiv, return_barycentric=True
+        )
+        if use_shape_function_interp:
+            u_plot = _interpolate_displacement_on_refined(u_base, tri_idx, bary_parent, bary_w)
+        else:
+            u_plot = _eval_displacement_batched(u_fn, params, X_plot, eval_batch_size)
     else:
         X_plot, UV_plot, tri_plot = X3D, UV, tri_idx
         u_plot = u_base
