@@ -268,8 +268,18 @@ def guess_surface_key(asm: AssemblyModel, bare_name: str) -> Optional[str]:
     Returns the first unique match or None if ambiguous/not found.
     """
     target = bare_name.strip().lower()
+
+    # 1) 优先：与 surface.name 完全一致（忽略大小写/空格）
+    exact = [k for k, s in asm.surfaces.items()
+             if s.name.strip().lower() == target or k.strip().lower() == target]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None  # 仍然由上层提示冲突
+
+    # 2) 其次：片段匹配（若唯一则返回）
     matches = [k for k, s in asm.surfaces.items()
-               if s.name.strip().lower() == target or target in k.lower()]
+               if target in k.lower() or target in s.name.strip().lower()]
     if len(matches) == 1:
         return matches[0]
     return None  # ambiguous or not found; let the caller handle
