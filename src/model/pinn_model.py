@@ -21,7 +21,7 @@ Public factory:
 
 Notes:
 - This file只关注“网络前向”，不做物理装配；训练循环将把本模型与能量/接触算子组合。
-- 激活默认 SiLU；可选 GELU/RELU/Tanh/SIREN（sine）。
+- 激活默认 SiLU；可选 GELU/RELU/Tanh。
 - 混合精度可选（'float16' 或 'bfloat16'）；权重保持 float32，数值稳定。
 
 Author: you
@@ -66,7 +66,6 @@ class FieldConfig:
     residual_skips: Tuple[int, int] = (3, 6)
     out_dim: int = 3          # displacement ux,uy,uz
     stress_out_dim: int = 6   # 应力分量输出维度（默认 6: σxx,σyy,σzz,σxy,σyz,σxz）；<=0 关闭应力头
-    w0: float = 30.0
     use_graph: bool = True    # 是否启用 GCN 主干；若为 False 将报错
     graph_k: int = 12         # kNN 图中的邻居数量
     graph_knn_chunk: int = 1024  # 构建 kNN/图卷积时每批处理的节点数量
@@ -109,11 +108,6 @@ def _get_activation(name: str):
         return tf.nn.relu
     if name == "tanh":
         return tf.nn.tanh
-    if name == "sine":
-        # SIREN-style activation
-        def sine(x):
-            return tf.sin(x)
-        return sine
     raise ValueError(f"Unknown activation '{name}'")
 
 def _maybe_mixed_precision(policy: Optional[str]):
