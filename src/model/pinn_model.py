@@ -680,7 +680,11 @@ class DisplacementModel:
         P_hat = tf.convert_to_tensor(P_hat, dtype=tf.float32)
         if P_hat.shape.rank == 1:
             P_hat = tf.expand_dims(P_hat, axis=0)
-        P_hat = tf.ensure_shape(P_hat, (None, 3))
+
+        # P_hat may include staged metadata (mask/last/rank) -> length 4*n_bolts; avoid
+        # over-constraining the last dimension. We only ensure rank-2 here and let
+        # ParamEncoder._normalize_dim pad/trim to cfg.encoder.in_dim when set.
+        P_hat = tf.ensure_shape(P_hat, (None, None))
 
         X = tf.convert_to_tensor(X, dtype=tf.float32)
         if X.shape.rank == 1:
@@ -694,7 +698,7 @@ class DisplacementModel:
         reduce_retracing=True,
         input_signature=(
             tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
-            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="P_hat"),
+            tf.TensorSpec(shape=(None, None), dtype=tf.float32, name="P_hat"),
         ),
     )
     def _u_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> tf.Tensor:
@@ -721,7 +725,7 @@ class DisplacementModel:
         reduce_retracing=True,
         input_signature=(
             tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="X"),
-            tf.TensorSpec(shape=(None, 3), dtype=tf.float32, name="P_hat"),
+            tf.TensorSpec(shape=(None, None), dtype=tf.float32, name="P_hat"),
         ),
     )
     def _us_fn_compiled(self, X: tf.Tensor, P_hat: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
