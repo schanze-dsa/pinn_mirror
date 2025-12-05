@@ -429,15 +429,14 @@ class ParamEncoder(tf.keras.layers.Layer):
         cur = tf.shape(P_hat)[-1]
         target_tf = tf.cast(target, tf.int32)
 
-        def _pad():
-            pad_width = target_tf - cur
-            pad_zeros = tf.zeros((tf.shape(P_hat)[0], pad_width), dtype=P_hat.dtype)
-            return tf.concat([P_hat, pad_zeros], axis=-1)
-
-        def _trim():
-            return P_hat[:, :target_tf]
-
-        adjusted = tf.cond(cur < target_tf, _pad, _trim)
+        # Avoid tf.cond to prevent trace-time Optional type inconsistencies when using
+        # mixed precision (half vs int32). We pad with zeros only when needed, then
+        # slice to the target width so both under- and over-length inputs are handled
+        # in a single branch with consistent dtypes.
+        pad_width = tf.maximum(target_tf - cur, 0)
+        pad_zeros = tf.zeros((tf.shape(P_hat)[0], pad_width), dtype=P_hat.dtype)
+        padded = tf.concat([P_hat, pad_zeros], axis=-1)
+        adjusted = padded[:, :target_tf]
         adjusted.set_shape((None, target))
         return adjusted
 
