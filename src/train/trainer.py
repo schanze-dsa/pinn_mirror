@@ -191,12 +191,12 @@ class TrainerConfig:
     ckpt_dir: str = "checkpoints"
     viz_samples_after_train: int = 6
     viz_title_prefix: str = "Total Deformation (trained PINN)"
-    viz_style: str = "contour"             # 默认采用等值填充以获得平滑云图
+    viz_style: str = "smooth"              # 默认使用 Gouraud 平滑着色
     viz_colormap: str = "turbo"             # Abaqus-like rainbow palette
-    viz_levels: int = 64                    # 等值线数量，提升平滑度
+    viz_levels: int = 64                    # 等值线数量，提升平滑度（仅 contour 模式）
     viz_symmetric: bool = False             # displacement magnitude is nonnegative
     viz_units: str = "mm"
-    viz_draw_wireframe: bool = False
+    viz_draw_wireframe: bool = False        # 关闭三角网格叠加，避免出现“双层网格”感
     viz_surface_enabled: bool = True        # 是否渲染单一镜面云图
     viz_surface_source: str = "part_top"    # "surface" 使用 INP 表面；"part_top" 优先用零件外表面上表面
     viz_write_data: bool = True             # export displacement samples next to figure
@@ -205,7 +205,7 @@ class TrainerConfig:
     viz_full_structure_part: Optional[str] = "mirror1"  # None -> 全装配
     viz_write_full_structure_data: bool = False  # 记录全装配位移数据
     viz_retriangulate_2d: bool = False      # 兼容旧配置的占位符，不再使用
-    viz_refine_subdivisions: int = 2        # 细分表面三角形以平滑云图
+    viz_refine_subdivisions: int = 3        # 更细的细分以获得更平滑的云图
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
     viz_eval_scope: str = "assembly"        # "surface" or "assembly"/"all"
@@ -1723,7 +1723,6 @@ class Trainer:
         attach_ties_and_bcs_from_inp(
             total=total,
             asm=self.asm,
-            inp_path=self.cfg.inp_path,
             cfg=self.cfg,
         )
         print("[dbg] Tie/BC 已挂载到 total")
