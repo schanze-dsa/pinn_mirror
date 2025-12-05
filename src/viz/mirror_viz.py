@@ -31,7 +31,7 @@ Author: you
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
 import numpy as np
@@ -171,10 +171,13 @@ def _eval_surface_or_assembly(
 def _refine_surface_samples(X3D: np.ndarray,
                             UV: np.ndarray,
                             tri_idx: np.ndarray,
-                            subdivisions: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                            subdivisions: int,
+                            return_barycentric: bool = False
+                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """Uniformly subdivide each triangle ``subdivisions`` times per edge.
 
-    Returns refined ``(X_ref, UV_ref, tri_ref)`` suitable for plotting.
+    Returns refined ``(X_ref, UV_ref, tri_ref, bary_weights, parent_triangles)`` suitable for
+    plotting. When ``return_barycentric`` is False (default), the last two values are ``None``.
     """
 
     m = int(max(0, subdivisions))
@@ -184,9 +187,11 @@ def _refine_surface_samples(X3D: np.ndarray,
     pts3d: List[np.ndarray] = []
     pts2d: List[np.ndarray] = []
     tris: List[List[int]] = []
+    bary_weights: List[Tuple[float, float, float]] = []
+    parent_tri: List[int] = []
     base_idx = 0
 
-    for (i0, i1, i2) in tri_idx:
+    for tri_id, (i0, i1, i2) in enumerate(tri_idx):
         X0, X1, X2 = X3D[[i0, i1, i2]]
         uv0, uv1, uv2 = UV[[i0, i1, i2]]
         local: Dict[Tuple[int, int], int] = {}
@@ -198,6 +203,9 @@ def _refine_surface_samples(X3D: np.ndarray,
                 w0 = 1.0 - w1 - w2
                 pts3d.append(w0 * X0 + w1 * X1 + w2 * X2)
                 pts2d.append(w0 * uv0 + w1 * uv1 + w2 * uv2)
+                if return_barycentric:
+                    bary_weights.append((w0, w1, w2))
+                    parent_tri.append(tri_id)
                 local[(i, j)] = base_idx
                 base_idx += 1
 
@@ -211,11 +219,91 @@ def _refine_surface_samples(X3D: np.ndarray,
                     d = local[(i + 1, j + 1)]
                     tris.append([b, d, c])
 
-    return (
-        np.asarray(pts3d, dtype=np.float64),
-        np.asarray(pts2d, dtype=np.float64),
-        np.asarray(tris, dtype=np.int32),
-    )
+    X_ref = np.asarray(pts3d, dtype=np.float64)
+    UV_ref = np.asarray(pts2d, dtype=np.float64)
+    tri_ref = np.asarray(tris, dtype=np.int32)
+    if return_barycentric:
+        return (
+            X_ref,
+            UV_ref,
+            tri_ref,
+            np.asarray(bary_weights, dtype=np.float64),
+            np.asarray(parent_tri, dtype=np.int64),
+        )
+    return (X_ref, UV_ref, tri_ref, None, None)
+
+
+def _build_vertex_adjacency(triangles: np.ndarray, n_vertices: int) -> List[Set[int]]:
+    adj: List[Set[int]] = [set() for _ in range(n_vertices)]
+    for a, b, c in triangles:
+        adj[a].update((b, c))
+        adj[b].update((a, c))
+        adj[c].update((a, b))
+    return adj
+
+
+def _interpolate_displacement_on_refined(u_vertices: np.ndarray,
+                                         tri_idx: np.ndarray,
+                                         parent_triangles: np.ndarray,
+                                         bary_weights: np.ndarray) -> np.ndarray:
+    """Use linear shape functions to interpolate displacement to refined samples.
+
+    Args:
+        u_vertices: (Nv, 3) nodal displacement vectors on the coarse surface.
+        tri_idx:    (T, 3) triangle connectivity using indices into ``u_vertices``.
+        parent_triangles: (Nr,) indices into ``tri_idx`` for each refined point.
+        bary_weights:     (Nr, 3) barycentric coordinates within the parent triangle.
+    """
+
+    if bary_weights is None or parent_triangles is None:
+        return u_vertices
+
+    tri_idx = np.asarray(tri_idx, dtype=np.int64)
+    parent_triangles = np.asarray(parent_triangles, dtype=np.int64)
+    bary_weights = np.asarray(bary_weights, dtype=np.float64)
+
+    if bary_weights.shape[0] != parent_triangles.shape[0]:
+        raise ValueError("parent_triangles and bary_weights must have the same length")
+
+    tri_nodes = tri_idx[parent_triangles]  # (Nr, 3)
+    u_local = u_vertices[tri_nodes]        # (Nr, 3, 3)
+    # einsum -> sum_j w_j * u_local[..., j, :]
+    return np.einsum("ni,nij->nj", bary_weights, u_local)
+
+
+def _smooth_scalar_on_tri_mesh(values: np.ndarray,
+                               triangles: np.ndarray,
+                               iterations: int = 1,
+                               lam: float = 0.6) -> np.ndarray:
+    """Simple Laplacian smoothing on a triangulated scalar field.
+
+    Keeps non-finite entries untouched and blends each vertex with the mean of
+    its neighbors. ``lam`` controls blending strength (0=no smoothing, 1=full
+    neighbor mean). ``iterations`` applies the smoothing repeatedly.
+    """
+
+    vals = np.asarray(values, dtype=np.float64).copy()
+    lam = float(np.clip(lam, 0.0, 1.0))
+    if iterations <= 0 or lam <= 0.0:
+        return vals
+
+    n_vertices = vals.shape[0]
+    neighbors = _build_vertex_adjacency(triangles.astype(int), n_vertices)
+    finite_mask = np.isfinite(vals)
+
+    for _ in range(int(iterations)):
+        updated = vals.copy()
+        for idx, nbrs in enumerate(neighbors):
+            if not finite_mask[idx] or len(nbrs) == 0:
+                continue
+            valid_neighbors = [j for j in nbrs if finite_mask[j]]
+            if not valid_neighbors:
+                continue
+            mean_val = float(np.mean(vals[valid_neighbors]))
+            updated[idx] = (1.0 - lam) * vals[idx] + lam * mean_val
+        vals = updated
+
+    return vals
 from matplotlib import colors
 
 from inp_io.inp_parser import AssemblyModel
@@ -650,6 +738,9 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            draw_wireframe: bool = False,
                            refine_subdivisions: int = 2,
                            refine_max_points: Optional[int] = None,
+                           use_shape_function_interp: bool = False,
+                           smooth_scalar_iters: int = 0,
+                           smooth_scalar_lambda: float = 0.6,
                            eval_batch_size: int = 65_536,
                            eval_scope: str = "assembly",
                            diagnose_blanks: bool = False,
@@ -697,6 +788,13 @@ def plot_mirror_deflection(asm: AssemblyModel,
         draw_wireframe   : Whether to overlay triangle edges（若想避免“双层网格”视觉，请保持 False）。
         refine_subdivisions : Uniform barycentric subdivisions per surface triangle（>0 提升平滑度）。
         refine_max_points   : Optional guardrail limiting the total evaluation points.
+        use_shape_function_interp : If True, reuse coarse nodal displacements and interpolate
+                            refined samples via linear (P1) shape functions instead of rerunning
+                            the network, producing a smoother map that respects FE connectivity.
+        smooth_scalar_iters : Optional Laplacian smoothing iterations applied to displacement
+                            magnitudes on the triangulated surface before绘图；>0 可进一步消除
+                            颗粒感（默认 0 不平滑）。
+        smooth_scalar_lambda: 每次迭代平滑强度（0~1，默认 0.6，越大越平滑）。
         retriangulate_2d    : If True, rebuild a Delaunay triangulation in 2D and mask it
                             with detected boundary loops to eliminate sampling holes while
                             keeping annular holes intact.
@@ -807,8 +905,13 @@ def plot_mirror_deflection(asm: AssemblyModel,
             )
 
     if applied_subdiv > 0:
-        X_plot, UV_plot, tri_plot = _refine_surface_samples(X3D, UV, tri_idx, applied_subdiv)
-        u_plot = _eval_displacement_batched(u_fn, params, X_plot, eval_batch_size)
+        X_plot, UV_plot, tri_plot, bary_w, bary_parent = _refine_surface_samples(
+            X3D, UV, tri_idx, applied_subdiv, return_barycentric=True
+        )
+        if use_shape_function_interp:
+            u_plot = _interpolate_displacement_on_refined(u_base, tri_idx, bary_parent, bary_w)
+        else:
+            u_plot = _eval_displacement_batched(u_fn, params, X_plot, eval_batch_size)
     else:
         X_plot, UV_plot, tri_plot = X3D, UV, tri_idx
         u_plot = u_base
@@ -901,6 +1004,20 @@ def plot_mirror_deflection(asm: AssemblyModel,
         if eval_scope_info is not None:
             diag_out["eval_scope"] = eval_scope_info
 
+    # Optional scalar smoothing to eliminate coarse patches after refinement
+    smoothing_steps = max(0, int(smooth_scalar_iters or 0))
+    if smoothing_steps > 0:
+        triangles_for_smoothing = tri.get_masked_triangles()
+        if triangles_for_smoothing.size > 0 and np.any(np.isfinite(d_plot)):
+            d_plot = _smooth_scalar_on_tri_mesh(
+                d_plot,
+                triangles_for_smoothing,
+                iterations=smoothing_steps,
+                lam=float(smooth_scalar_lambda),
+            )
+        else:  # pragma: no cover - defensive
+            print("[viz] skip scalar smoothing: missing triangles or all values invalid")
+
     # 5) Draw surface map (optional)
     fig = ax = None
     if render_surface:
@@ -917,10 +1034,45 @@ def plot_mirror_deflection(asm: AssemblyModel,
         vmin = -vmax if symmetric else float(np.min(d_plot))
 
         if style_key == "contour":
-            contour_kwargs = {"levels": levels, "cmap": cmap}
-            if symmetric:
-                contour_kwargs.update(vmin=vmin, vmax=vmax)
-            cs = ax.tricontourf(tri, d_plot, **contour_kwargs)
+            # -------------------------------------------------------
+            # 高级光滑处理：使用 griddata 进行二次插值与孔洞修复
+            # -------------------------------------------------------
+            from scipy.interpolate import griddata
+
+            resolution = 1000
+            xi = np.linspace(UV_plot[:, 0].min(), UV_plot[:, 0].max(), resolution)
+            yi = np.linspace(UV_plot[:, 1].min(), UV_plot[:, 1].max(), resolution)
+            Xi, Yi = np.meshgrid(xi, yi)
+
+            print(f"[viz] Running cubic interpolation on {resolution}x{resolution} grid...")
+            Zi = griddata((UV_plot[:, 0], UV_plot[:, 1]), d_plot, (Xi, Yi), method="cubic")
+
+            mask_nan = np.isnan(Zi)
+            if np.any(mask_nan):
+                Zi_fill = griddata((UV_plot[:, 0], UV_plot[:, 1]), d_plot, (Xi, Yi), method="nearest")
+                Zi[mask_nan] = Zi_fill[mask_nan]
+
+            center_x, center_y = np.mean(UV_plot[:, 0]), np.mean(UV_plot[:, 1])
+            R_grid = np.sqrt((Xi - center_x) ** 2 + (Yi - center_y) ** 2)
+
+            r_points = np.sqrt((UV_plot[:, 0] - center_x) ** 2 + (UV_plot[:, 1] - center_y) ** 2)
+            r_inner = np.min(r_points) * 1.02
+            r_outer = np.max(r_points) * 0.98
+
+            Zi[R_grid < r_inner] = np.nan
+            Zi[R_grid > r_outer] = np.nan
+
+            im = ax.imshow(
+                Zi,
+                origin="lower",
+                extent=[xi.min(), xi.max(), yi.min(), yi.max()],
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="bicubic",
+            )
+
+            cs = im
         else:
             norm = colors.Normalize(vmin=vmin, vmax=vmax)
             shading = "gouraud" if style_key == "smooth" else "flat"

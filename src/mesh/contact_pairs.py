@@ -267,9 +267,33 @@ def guess_surface_key(asm: AssemblyModel, bare_name: str) -> Optional[str]:
     Try to guess a full surface key in asm.surfaces from a bare name (case-insensitive substring match).
     Returns the first unique match or None if ambiguous/not found.
     """
-    target = bare_name.strip().lower()
+    target_cs = bare_name.strip()
+    target = target_cs.lower()
+
+    # - 若用户给的是裸的几何名，优先尝试自动补成 ABAQUS 的 key 形式 ASM::"<name>"
+    #   这样不会把包含相同片段的其他面误判成冲突（例如 “bolt3 mirror up”）。
+    if "::" not in target_cs:
+        asm_key_cs = f'ASM::"{target_cs}"'
+        if asm_key_cs in asm.surfaces:
+            return asm_key_cs
+
+    # 0) 完全大小写敏感匹配（优先用用户提供的精确写法）
+    cs_exact = [k for k, s in asm.surfaces.items()
+                if s.name.strip() == target_cs or k.strip() == target_cs]
+    if len(cs_exact) == 1:
+        return cs_exact[0]
+
+    # 1) 完全大小写不敏感匹配（若仍唯一则返回，否则视为歧义）
+    exact = [k for k, s in asm.surfaces.items()
+             if s.name.strip().lower() == target or k.strip().lower() == target]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None  # 仍然由上层提示冲突
+
+    # 2) 片段匹配（若唯一则返回）
     matches = [k for k, s in asm.surfaces.items()
-               if s.name.strip().lower() == target or target in k.lower()]
+               if target in k.lower() or target in s.name.strip().lower()]
     if len(matches) == 1:
         return matches[0]
     return None  # ambiguous or not found; let the caller handle

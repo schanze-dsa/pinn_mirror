@@ -207,6 +207,7 @@ class TrainerConfig:
     viz_retriangulate_2d: bool = False      # 兼容旧配置的占位符，不再使用
     viz_refine_subdivisions: int = 3        # 更细的细分以获得更平滑的云图
     viz_refine_max_points: int = 180_000    # guardrail against runaway refinement cost
+    viz_use_shape_function_interp: bool = False  # 细分可选采用线性形函数插值，避免重新跑网络
     viz_eval_batch_size: int = 65_536       # batch PINN queries during visualization
     viz_eval_scope: str = "assembly"        # "surface" or "assembly"/"all"
     viz_diagnose_blanks: bool = False       # 是否在生成云图时自动诊断留白原因
@@ -2181,6 +2182,7 @@ class Trainer:
             draw_wireframe=self.cfg.viz_draw_wireframe,
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
+            use_shape_function_interp=self.cfg.viz_use_shape_function_interp,
             retriangulate_2d=self.cfg.viz_retriangulate_2d,
             eval_batch_size=self.cfg.viz_eval_batch_size,
             eval_scope=self.cfg.viz_eval_scope,
@@ -2245,6 +2247,7 @@ class Trainer:
             draw_wireframe=self.cfg.viz_draw_wireframe,
             refine_subdivisions=self.cfg.viz_refine_subdivisions,
             refine_max_points=self.cfg.viz_refine_max_points,
+            use_shape_function_interp=self.cfg.viz_use_shape_function_interp,
             retriangulate_2d=self.cfg.viz_retriangulate_2d,
             eval_batch_size=self.cfg.viz_eval_batch_size,
             eval_scope=self.cfg.viz_eval_scope,
