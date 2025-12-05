@@ -645,10 +645,10 @@ def plot_mirror_deflection(asm: AssemblyModel,
                            full_structure_data_out_path: Optional[str] = None,
                            full_structure_part: Optional[str] = None,
                            surface_source: str = "part_top",
-                           style: str = "contour",
+                           style: str = "smooth",
                            cmap: Optional[str] = None,
                            draw_wireframe: bool = False,
-                           refine_subdivisions: int = 0,
+                           refine_subdivisions: int = 2,
                            refine_max_points: Optional[int] = None,
                            eval_batch_size: int = 65_536,
                            eval_scope: str = "assembly",
@@ -690,12 +690,12 @@ def plot_mirror_deflection(asm: AssemblyModel,
         surface_source      : "surface" 使用 INP 表面；"part"/"part_top" 从目标零件
                             的外边界三角化得到表面，"part_top" 只保留主导法向一致的
                             外表面（便于提取镜面上表面环形云图）。
-        style            : "contour"(默认) 使用 tricontourf 等值填充获得平滑云图；
-                            "smooth" 为 Gouraud 着色的 tripcolor；"flat" 为平面着色。
+        style            : "smooth"(默认) 使用 Gouraud 着色的 tripcolor；
+                            "contour" 使用 tricontourf 等值填充获得平滑云图；"flat" 为平面着色。
         cmap             : Optional matplotlib colormap name; defaults to
                             ``"turbo"`` for所有样式以匹配示例中的平滑彩虹云图。
-        draw_wireframe   : Whether to overlay triangle edges.
-        refine_subdivisions : Uniform barycentric subdivisions per surface triangle.
+        draw_wireframe   : Whether to overlay triangle edges（若想避免“双层网格”视觉，请保持 False）。
+        refine_subdivisions : Uniform barycentric subdivisions per surface triangle（>0 提升平滑度）。
         refine_max_points   : Optional guardrail limiting the total evaluation points.
         retriangulate_2d    : If True, rebuild a Delaunay triangulation in 2D and mask it
                             with detected boundary loops to eliminate sampling holes while

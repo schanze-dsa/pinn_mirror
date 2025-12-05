@@ -55,15 +55,7 @@ class BoundaryConfig:
 # -----------------------------
 
 class BoundaryPenalty:
-    """
-    Displacement boundary penalty energy.
-
-    Similar to :class:`TiePenalty`, the constructor accepts a superset of the
-    modern configuration so that older call-sites (e.g. ``BoundaryPenalty(alpha
-    =..., dof1=..., dof2=..., kind=...)``) keep working.  ``attach_ties_bcs``
-    still relies on that signature when constructing penalties from Abaqus
-    ``*Boundary`` definitions.
-    """
+    """Displacement boundary penalty energy."""
 
     def __init__(
         self,
@@ -72,10 +64,6 @@ class BoundaryPenalty:
         alpha: Optional[float] = None,
         dtype: Optional[str] = None,
         mode: Optional[str] = None,
-        dof1: Optional[int] = None,
-        dof2: Optional[int] = None,
-        kind: Optional[str] = None,
-        **_legacy_kwargs,
     ):
         if cfg is None:
             cfg = BoundaryConfig()
@@ -89,12 +77,6 @@ class BoundaryPenalty:
 
         self.cfg = cfg
         self.dtype = tf.float32 if self.cfg.dtype == "float32" else tf.float64
-
-        # Store legacy boundary metadata so the ``build`` alias can reconstruct
-        # masks similar to the historical implementation.
-        self._legacy_dof1 = dof1
-        self._legacy_dof2 = dof2
-        self._legacy_kind = kind.upper() if isinstance(kind, str) else None
 
         # per-batch tensors
         self.X: Optional[tf.Tensor] = None          # (N,3)
@@ -157,27 +139,6 @@ class BoundaryPenalty:
         self.X = self.mask = self.u_target = self.w = None
         self._N = 0
 
-    # ---- compatibility aliases -------------------------------------------------
-
-    def _legacy_mask(self, N: int) -> np.ndarray:
-        mask = np.zeros((N, 3), dtype=np.float32)
-
-        if self._legacy_kind == "ENCASTRE":
-            mask.fill(1.0)
-            return mask
-
-        if self._legacy_dof1 is None:
-            return mask
-
-        d1 = int(self._legacy_dof1)
-        d2 = int(self._legacy_dof2) if self._legacy_dof2 is not None else d1
-
-        for dof in range(min(d1, d2), max(d1, d2) + 1):
-            if 1 <= dof <= 3:
-                mask[:, dof - 1] = 1.0
-
-        return mask
-
     def build(
         self,
         X_bc: np.ndarray,
@@ -186,11 +147,11 @@ class BoundaryPenalty:
         w_bc: Optional[np.ndarray] = None,
         extra_w: Optional[np.ndarray] = None,
     ):
-        """Backward-compatible build helper used by ``attach_ties_bcs``."""
+        """Build helper for ``attach_ties_bcs``."""
 
         X_np = np.asarray(X_bc)
         if dof_mask is None:
-            dof_mask = self._legacy_mask(X_np.shape[0])
+            raise ValueError("[BoundaryPenalty] dof_mask is required for build().")
         self.build_from_numpy(X_np, dof_mask, u_target, w_bc, extra_w)
 
     # ---------- energy ----------
