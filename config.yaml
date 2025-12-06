@@ -174,9 +174,9 @@ contact_pairs:
 # 4.5 边界条件（固定约束）
 # ------------------------------------------------------------
 # 默认使用 ALM 模式，以较低罚系数逼近硬约束；如需退回纯罚函数，可改为 penalty。
-bc_mode: alm            # alm | penalty | hard
-bc_alpha: 1.0e4         # 罚函数/ALM 基础刚度
-bc_mu: 1.0e3            # ALM 增广系数
+bc_mode: alm            # alm | penalty | hard - 使用ALM避免高权重
+bc_alpha: 5.0e3         # 罚函数/ALM 基础刚度 (降低以配合低w_bc)
+bc_mu: 2.0e3            # ALM 增广系数 (提高以更强约束)
 
 # ------------------------------------------------------------
 # 5. 网络与优化器配置（后续 DFEM 改造时会用）
@@ -198,10 +198,10 @@ mirror_surface_name: 'MIRROR up'
 
 optimizer_config:
   type: Adam
-  learning_rate: 0.0005
-  grad_clip_norm: 1.0e6
+  learning_rate: 0.00001     # 进一步降低！从1e-4降到1e-5防止NaN
+  grad_clip_norm: 5.0        # 更激进裁剪（从10降到5）
   batch_size: 32
-  epochs: 1              # Adam 阶段的迭代步数
+  epochs: 1000              # Adam 阶段的迭代步数
   lbfgs:
     enabled: false           # 是否在 Adam 之后追加 L-BFGS 精调
     max_iter: 200           # L-BFGS 最大迭代次数
@@ -225,25 +225,25 @@ elasticity_config:
 # ------------------------------------------------------------
 loss_config:
   base_weights:
-    w_int: 1.0e-7      # 内能
-    w_cn: 1.0e-7      # 法向接触能量
-    w_ct: 1.0e-7      # 摩擦能量/摩擦残差
-    w_tie: 1.0e-7     # 绑定/多体约束
-    w_bc: 1.0e4       # 边界条件强罚函数（近似硬约束）
-    w_pre: 1.0e-7     # 预紧功（乘在 -W_pre 上）
-    w_sigma: 1.0e-7   # 应力监督
+    w_int: 1.0        # 内能（弹性变形）- 基准权重
+    w_cn: 5.0         # 法向接触能量 - 装配关键项，权重较高
+    w_ct: 0.1         # 摩擦能量 - 降低！摩擦能量数值大，易爆炸
+    w_tie: 1.0        # 绑定/多体约束
+    w_bc: 50.0        # 边界条件 - 降低权重，依赖ALM强制执行
+    w_pre: 0.1        # 预紧功（乘在 -W_pre 上）- 负贡献，保持小
+    w_sigma: 0.0      # 应力监督 - 无ground truth时设为0
 
   adaptive:
-    enabled: true           # 是否启用自适应加权（weighted PINN）
+    enabled: false          # 暂时禁用！自适应权重把w_ct调到9.56导致爆炸
     update_every: 10        # 每多少个 global step 更新一次权重
     ema_decay: 0.99         # 残差/能量的 EMA 衰减系数
     temperature: 1.0        # softmax 温度
-    min_weight: 1.0e-9      # 单项权重下限
-    max_weight: 1.0e2       # 单项权重上限
+    min_weight: 0.01        # 提高下限，避免权重过小
+    max_weight: 10.0        # 降低上限！原1e2太大
     focus_terms:
       - w_int
       - w_cn
-      - w_ct
+      # - w_ct  # 移除摩擦！它数值不稳定
       - w_pre   # 重点自适应的损失项
 
 # ------------------------------------------------------------
