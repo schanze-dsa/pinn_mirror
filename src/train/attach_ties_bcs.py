@@ -609,7 +609,19 @@ def attach_ties_and_bcs_from_inp(total, asm, cfg) -> None:
 
         if TiePenalty is not None:
             try:
-                tie = TiePenalty(alpha=tie_alpha)  # 若你的类构造不同，可在此适配
+                # 读取Tie配置参数（支持ALM）
+                tie_mode = str(getattr(cfg, "tie_mode", "alm"))
+                tie_mu = float(getattr(cfg, "tie_mu", 1.0e3))
+                
+                # 尝试使用TieConfig传递完整配置
+                try:
+                    from physics.tie_constraints import TieConfig
+                    tie_cfg = TieConfig(alpha=tie_alpha, mode=tie_mode, mu=tie_mu)
+                    tie = TiePenalty(cfg=tie_cfg)
+                except ImportError:
+                    # 降级：只传alpha（会使用默认mode='alm', mu=1000）
+                    tie = TiePenalty(alpha=tie_alpha)
+                
                 if hasattr(tie, "build_from_points"):
                     tie.build_from_points(xs, xm, w)
                 elif hasattr(tie, "build"):

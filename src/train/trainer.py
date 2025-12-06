@@ -1989,6 +1989,8 @@ class Trainer:
                             )
                             if postfix:
                                 p_train.set_postfix_str(postfix)
+                                # 额外打印到终端（确保不被进度条覆盖）
+                                print(f"\n[Step {step}] {postfix}", flush=True)
 
                             metric_name = self.cfg.save_best_on.lower()
                             metric_val = (
