@@ -281,6 +281,15 @@ def _prepare_config_with_autoguess():
         if yaml_key in base_weights_yaml:
             setattr(cfg.total_cfg, attr, float(base_weights_yaml[yaml_key]))
 
+    # CRITICAL: Read network_config for DFEM parameters
+    net_cfg_yaml = cfg_yaml.get("network_config", {})
+    if "dfem_mode" in net_cfg_yaml:
+        cfg.model_cfg.field.dfem_mode = bool(net_cfg_yaml["dfem_mode"])
+        print(f"[main] DFEM mode set from config: {cfg.model_cfg.field.dfem_mode}")
+    if "node_emb_dim" in net_cfg_yaml:
+        cfg.model_cfg.field.node_emb_dim = int(net_cfg_yaml["node_emb_dim"])
+        print(f"[main] Node embedding dim: {cfg.model_cfg.field.node_emb_dim}")
+
     adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
     cfg.loss_adaptive_enabled = bool(
         adaptive_cfg.get("enabled", cfg.loss_adaptive_enabled)

@@ -84,6 +84,11 @@ class FieldConfig:
     # 输出缩放：网络预测无量纲位移后再乘以该尺度，便于微小量级的数值稳定
     output_scale: float = 1.0e-2
     output_scale_trainable: bool = False
+    
+    # DFEM mode: use learnable node embeddings instead of spatial coordinates
+    dfem_mode: bool = False           # Enable pure DFEM mode
+    n_nodes: Optional[int] = None     # Total number of mesh nodes (required if dfem_mode=True)
+    node_emb_dim: int = 64            # Dimension of learnable node embeddings
 
 @dataclass
 class ModelConfig:
@@ -363,6 +368,8 @@ def _build_knn_graph(x: tf.Tensor, k: int, chunk_size: int) -> tf.Tensor:
                 size=0,
                 dynamic_size=True,
                 clear_after_read=False,
+                element_shape=None,  # Allow variable-sized chunks
+                infer_shape=False,    # Disable shape inference in while_loop
             )
 
             def _cond(start, *_):
@@ -524,7 +531,7 @@ class DisplacementNet(tf.keras.Model):
         self.use_graph = bool(cfg.use_graph)
         self.use_film = bool(getattr(cfg, "use_film", False))
 
-        # Fourier PE
+        # Fourier PE (used if not in DFEM mode)
         self.pe = GaussianFourierFeatures(
             in_dim=cfg.in_dim_coord,
             num=cfg.fourier.num,
@@ -533,7 +540,25 @@ class DisplacementNet(tf.keras.Model):
             trainable=cfg.fourier.trainable,
         )
 
-        in_dim_total = self.pe.out_dim + cfg.cond_dim
+        # DFEM mode: learnable node embeddings instead of positional encoding
+        self.dfem_mode = cfg.dfem_mode
+        if self.dfem_mode:
+            if cfg.n_nodes is None or cfg.n_nodes <= 0:
+                raise ValueError(
+                    "FieldConfig.dfem_mode=True requires n_nodes > 0, "
+                    f"got {cfg.n_nodes}"
+                )
+            self.n_nodes = cfg.n_nodes
+            # Learnable embeddings for each node
+            self.node_embeddings = tf.Variable(
+                tf.random.normal((self.n_nodes, cfg.node_emb_dim), stddev=0.02),
+                trainable=True,
+                name="node_embeddings"
+            )
+            in_dim_total = cfg.node_emb_dim + cfg.cond_dim
+        else:
+            in_dim_total = self.pe.out_dim + cfg.cond_dim
+            
         if not self.use_graph:
             raise ValueError(
                 "FieldConfig.use_graph=False 已不再支持；请开启 GCN 主干以运行位移网络。"
@@ -597,6 +622,32 @@ class DisplacementNet(tf.keras.Model):
             self.output_scale = tf.Variable(scale_init, trainable=True, name="output_scale")
         else:
             self.output_scale = tf.cast(scale_init, tf.float32)
+    
+    def prebuild_adjacency(self, X_nodes: tf.Tensor | np.ndarray):
+        """
+        Pre-build and cache the adjacency graph using node coordinates.
+        Should be called once during initialization with all mesh node coordinates.
+        
+        Args:
+            X_nodes: (N_nodes, 3) node coordinates
+        """
+        if not self.dfem_mode:
+            # For traditional PINN, this is optional but can still cache
+            pass
+            
+        X_nodes = tf.convert_to_tensor(X_nodes, dtype=tf.float32)
+        n_nodes = tf.shape(X_nodes)[0]
+        
+        # Build KNN graph
+        knn_idx = _build_knn_graph(X_nodes, self.cfg.graph_k, self.cfg.graph_knn_chunk)
+        adj = _knn_to_adj(knn_idx, n_nodes)
+        
+        # Cache
+        self._global_knn_idx = knn_idx
+        self._global_adj = adj
+        self._global_knn_n = int(n_nodes.numpy() if hasattr(n_nodes, 'numpy') else n_nodes)
+        
+        print(f"[DisplacementNet] Pre-built adjacency graph: {self._global_knn_n} nodes, k={self.cfg.graph_k}")
 
     def call(
         self,
@@ -648,8 +699,16 @@ class DisplacementNet(tf.keras.Model):
         if zb.dtype != feat_dtype:
             zb = tf.cast(zb, feat_dtype)
 
-        # positional encoding
-        x_feat = self.pe(x)
+        # DFEM mode: use node embeddings; Traditional: use positional encoding
+        if self.dfem_mode:
+            # x should contain node indices in DFEM mode: (N,) or (N,1) or (N,3) ignored
+            # We use implicit indexing: x[i] corresponds to node i
+            node_indices = tf.range(N, dtype=tf.int32)
+            x_feat = tf.gather(self.node_embeddings, node_indices)  # (N, node_emb_dim)
+        else:
+            # Traditional PINN: positional encoding of coordinates
+            x_feat = self.pe(x)  # (N, fourier_dim)
+            
         if x_feat.dtype != feat_dtype:
             x_feat = tf.cast(x_feat, feat_dtype)
         

@@ -245,21 +245,24 @@ class TotalEnergy:
             if "R_contact_comp" in stats_cn:
                 parts["R_contact_comp"] = tf.cast(stats_cn["R_contact_comp"], dtype)
 
-        if self.ties:
+        # Tie constraints (skip if w_tie=0)
+        if self.ties and abs(self.w_tie) > 1e-15:
             tie_terms = []
-            for i, t in enumerate(self.ties):
-                Ei, si = t.energy(u_fn, params)
-                tie_terms.append(tf.cast(Ei, dtype))
-                stats.update({f"tie{i+1}_{k}": v for k, v in si.items()})
-            if tie_terms:
-                parts["E_tie"] = tf.add_n(tie_terms)
+            for tie in self.ties:
+                et, tstat = tie.energy(u_fn, params)
+                tie_terms.append(tf.cast(et, dtype))
+                if tstat:
+                    for k, v in tstat.items():
+                        stats[f"tie_{k}"] = v
+            parts["E_tie"] = tf.add_n(tie_terms)
 
         if self.bcs:
             for i, b in enumerate(self.bcs):
                 _, si = b.energy(u_fn, params)
                 stats.update({f"bc{i+1}_{k}": v for k, v in si.items()})
 
-        if self.preload is not None:
+        # Preload work (skip if w_pre=0)
+        if self.preload is not None and abs(self.w_pre) > 1e-15:
             W_pre, pstats = self.preload.energy(u_fn, params)
             parts["W_pre"] = tf.cast(W_pre, dtype)
             stats.update({f"pre_{k}": v for k, v in pstats.items()})

@@ -187,9 +187,15 @@ tie_mu: 2.0e2           # Tie ALM增广系数 (从5e2降到2e2)
 # 5. 网络与优化器配置（后续 DFEM 改造时会用）
 # ------------------------------------------------------------
 network_config:
-  model_type: pinn         # 之后会 DFEM 化：网络预测节点位移/场
-  input_dim: 3             # 例如三个预紧力或加载参数
-  output_dim: 1            # 目标量维度；如需输出完整位移场可在代码中扩展
+  model_type: pinn         # 保留兼容性
+  input_dim: 3             # P输入维度 (P1,P2,P3)
+  output_dim: 1            # 保留字段（实际由FieldConfig.out_dim控制）
+  
+  # DFEM mode: use node embeddings instead of spatial coordinates
+  dfem_mode: true          # 启用纯DFEM模式
+  n_nodes: null            # 将由ElasticityEnergy自动设置
+  node_emb_dim: 64         # 节点嵌入维度
+  
   layers:
     - 64
     - 64
@@ -198,8 +204,25 @@ network_config:
 # ------------------------------------------------------------
 # 6. 后处理与可视化
 # ------------------------------------------------------------
+# 指定镜面表面名，用于镜面变形可视化与相关后处理；需与 INP 表面名完全匹配。
+mirror_surface_name: 'MIRROR up'
+
+optimizer_config:
+  type: Adam
+  learning_rate: 0.00001     # 从1e-4降到1e-5，防止DFEM初期NaN
+  grad_clip_norm: 1.0        # 从10降到1，加强裁剪防止梯度爆炸
+  batch_size: 32
+  epochs: 1000              # Adam 阶段的迭代步数
+  lbfgs:
+    enabled: false           # 是否在 Adam 之后追加 L-BFGS 精调
+    max_iter: 200            # L-BFGS 最大迭代次数
+    tolerance: 1.0e-6        # 收敛判据（目标函数相对变化）
+    history_size: 50         # 拟牛顿历史记忆对数
+    line_search: 50          # 线搜索最大迭代
+    reuse_last_batch: true   # true 表示复用 Adam 最后一次随机样本
+
 # ------------------------------------------------------------
-# 6. 弹性 DFEM 配置（ElasticityConfig）
+# 7. 弹性 DFEM 配置（ElasticityConfig）
 # ------------------------------------------------------------
 elasticity_config:
   coord_scale: 1.0          # 坐标缩放系数
@@ -215,8 +238,9 @@ loss_config:
   base_weights:
     # 策略：将所有项的加权后能量 (weighted energy) 统一控制在 1.0 ~ 10.0 左右
     
-    # Eint ~ 2e5, 乘 1e-5 后约 2.0
-    w_int: 1.0e-5
+    # DFEM节点嵌入随机初始化导致Eint爆炸，需要降低100倍
+    # Eint初始~1e6, 乘1e-7后约0.1，待稳定后可逐步提高
+    w_int: 1.0e-7
     
     # Ecn ~ 3e4, 乘 1e-4 后约 3.0 (接触很重要，稍微大点没关系)
     w_cn: 1.0e-4
@@ -225,14 +249,16 @@ loss_config:
     # 摩擦是核心物理，必须保留！通过降低k_t来控制数值
     w_ct: 1.0e-8
     
-    # 【修复Tie占比】Etie ~ 1e7, 再降低10倍
-    w_tie: 1.0e-8     # 从1e-7降到1e-8，让Tie贡献<5%
+    # 【禁用Tie约束】Etie完全冻结在1.001e+07，阻碍训练
+    # 暂时禁用，等修复后再启用
+    w_tie: 0.0        # 从1e-10改为0，完全禁用
     w_bc: 1.0e-2      # 边界条件通常残差较小，给大一点
     
     # 【关键修复】预紧功不参与优化！它是输入载荷，不是目标
     w_pre: 0.0        # 禁用预紧功的损失贡献（之前1e-6导致负损失和NaN）
     
-    w_sigma: 0.0      # 如果没用应力监督就设为0
+    # 应力监督：用线弹性理论应力指导网络
+    w_sigma: 1.0      # 启用应力监督
 
   adaptive:
     # 暂时开启，但必须限制范围！防止它自动把 w_ct 调回 9.0 这种危险值

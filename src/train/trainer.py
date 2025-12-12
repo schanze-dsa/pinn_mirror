@@ -531,10 +531,13 @@ class Trainer:
         weights = self._loss_weight_lookup()
         entries: List[str] = []
         for key, label in display:
+            weight = weights.get(key, 0.0)
+            # Skip if weight is effectively zero
+            if abs(weight) < 1e-15:
+                continue
             val = self._extract_part_scalar(parts, *aliases.get(key, (key,)))
             if val is None:
                 continue
-            weight = weights.get(key, 0.0)
             entries.append(f"{label}={val:.3e}(w={weight:.3g})")
         return " ".join(entries)
 
@@ -1103,6 +1106,13 @@ class Trainer:
                 cfg=cfg.elas_cfg,
             )
             pb.update(1)
+            
+            # DFEM integration: update model config with n_nodes from elasticity
+            if hasattr(cfg, 'model_cfg') and hasattr(cfg.model_cfg, 'field'):
+                if getattr(cfg.model_cfg.field, 'dfem_mode', False):
+                    n_nodes = self.elasticity.n_nodes
+                    cfg.model_cfg.field.n_nodes = n_nodes
+                    print(f"[trainer] DFEM mode: set n_nodes={n_nodes} from ElasticityEnergy")
 
             # 4) 接触（优先使用 cfg；否则尝试自动探测）
             self._cp_specs = []
@@ -1188,6 +1198,16 @@ class Trainer:
             if cfg.mixed_precision:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
             self.model = create_displacement_model(cfg.model_cfg)
+            
+            # DFEM: pre-build adjacency using node coordinates
+            if hasattr(self.model.field, 'dfem_mode') and self.model.field.dfem_mode:
+                if hasattr(self, 'elasticity') and self.elasticity is not None:
+                    X_nodes = self.elasticity.X_nodes_tf
+                    self.model.field.prebuild_adjacency(X_nodes)
+                else:
+                    print("[trainer] WARNING: DFEM mode enabled but ElasticityEnergy not available")
+                    
+            # Legacy graph precompute (for non-DFEM mode)
             if getattr(cfg.model_cfg.field, "graph_precompute", False) and getattr(self, "elasticity", None):
                 try:
                     self.model.field.set_global_graph(self.elasticity.X_nodes_tf)
