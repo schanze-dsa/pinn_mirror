@@ -191,6 +191,8 @@ class ElasticityEnergy:
         params: Optional[Dict[str, tf.Tensor]] = None,
         tape: Optional[tf.GradientTape] = None,  # 为兼容旧签名，此处不再使用
         return_cache: bool = False,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
     ):
         """
         计算 DFEM 弹性内能 E_int 以及一些统计信息 stats。
@@ -203,7 +205,10 @@ class ElasticityEnergy:
         del tape  # 不再使用，仅为兼容旧调用保留形参
 
         # 1) 在所有节点上评估位移 u(X_nodes)，按节点拼成全局 DOF 向量
-        u_nodes = self._eval_u_on_nodes(u_fn, params)  # (N,3)
+        if u_nodes is None:
+            u_nodes = self._eval_u_on_nodes(u_fn, params)  # (N,3)
+        else:
+            u_nodes = tf.cast(u_nodes, tf.float32)
         # 展平成一维：全局 DOF 向量 u_d，约定 DOF 排布为 [ux0,uy0,uz0, ux1,uy1,uz1, ...]
         u_flat = tf.reshape(tf.cast(u_nodes, tf.float32), (-1,))  # (3N,)
 

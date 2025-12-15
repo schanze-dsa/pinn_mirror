@@ -106,6 +106,8 @@ class LossWeightState:
 
     min_factor: float = 0.25
     max_factor: float = 4.0
+    min_weight: float | None = None
+    max_weight: float | None = None
     gamma: float = 2.0
 
     update_every: int = 1
@@ -129,6 +131,8 @@ class LossWeightState:
         ema_decay: float = 0.95,
         min_factor: float = 0.25,
         max_factor: float = 4.0,
+        min_weight: float | None = None,
+        max_weight: float | None = None,
         gamma: float = 2.0,
         focus_terms: Tuple[str, ...] | None = None,
         update_every: int = 1,
@@ -154,6 +158,8 @@ class LossWeightState:
             decay=ema_decay,
             min_factor=min_factor,
             max_factor=max_factor,
+            min_weight=min_weight,
+            max_weight=max_weight,
             gamma=gamma,
             focus_terms=tuple(focus_terms or tuple()),
             update_every=max(int(update_every), 1),
@@ -218,8 +224,12 @@ def update_loss_weights(
             "E_ct": ("R_fric_comp",),
         }
 
+        scheme_norm = str(state.adaptive_scheme or "").strip().lower()
+        balance_mode = scheme_norm in {"balance", "balanced", "equalize", "equalise"}
+
         values = []
         term_order = []
+        weights_now = []
         d = state.decay
         for term in state.focus_terms:
             # 依次尝试 term 自身及别名，找到第一个存在的分量
@@ -233,11 +243,25 @@ def update_loss_weights(
                 if isinstance(part, (float, int, np.generic)):
                     val = abs(_to_float(part))
                     break
+
+            # balance 模式下用“当前加权贡献”做 EMA（避免某一项长期主导总损失）
+            metric = val
+            w_now = float(state.current.get(term, state.base.get(term, 0.0)))
+            if balance_mode:
+                metric = abs(w_now) * val
+
             prev = state.ema_terms.get(term, 0.0)
-            ema = d * prev + (1.0 - d) * val
+            ema = d * prev + (1.0 - d) * metric
             state.ema_terms[term] = ema
-            values.append(ema)
+
+            base_w = float(state.base.get(term, 0.0))
+            # base=0 的项等价于禁用，跳过以免干扰自适应分配
+            if abs(base_w) <= 0.0:
+                continue
+
+            values.append(float(ema))
             term_order.append(term)
+            weights_now.append(w_now if w_now != 0.0 else base_w)
 
         # 同步兼容字段（便于调试输出）
         state.ema_contact = state.ema_terms.get("E_cn", state.ema_contact)
@@ -253,24 +277,65 @@ def update_loss_weights(
             state.last_factor_ct = state.last_factors.get("E_ct", 1.0)
             return
 
-        vals = np.array(values, dtype=np.float64)
-        mean = float(np.mean(vals)) if np.mean(vals) > 1e-16 else 1.0
-        x = vals / mean
+        vals = np.asarray(values, dtype=np.float64)
+        eps = 1e-18
 
-        logits = state.gamma * x
-        logits = logits - np.max(logits)
-        exp = np.exp(logits)
-        soft = exp / np.sum(exp)
+        if balance_mode:
+            # 目标：让各项“加权贡献”大致同量级，避免某一项（如 E_sigma）长期主导
+            positive = vals[np.isfinite(vals) & (vals > eps)]
+            if positive.size == 0:
+                state.current = dict(state.base)
+                state.last_factors = {term: 1.0 for term in term_order}
+                state.last_factor_cn = state.last_factors.get("E_cn", 1.0)
+                state.last_factor_ct = state.last_factors.get("E_ct", 1.0)
+                return
 
-        avg = float(len(soft)) if len(soft) > 0 else 1.0
-        factors = avg * soft
-        factors = np.clip(factors, state.min_factor, state.max_factor)
+            target = float(np.median(positive))
+            factors = target / (vals + eps)
+            factors = np.clip(factors, state.min_factor, state.max_factor)
 
-        new_current = dict(state.base)
-        state.last_factors = {}
-        for term, factor in zip(term_order, factors):
-            if term in new_current:
-                new_current[term] = new_current[term] * float(factor)
+            new_current = dict(state.base)
+            state.last_factors = {}
+            min_w = state.min_weight
+            max_w = state.max_weight
+            for term, w_old, factor in zip(term_order, weights_now, factors):
+                new_w = float(w_old) * float(factor)
+                if new_w < 0.0:
+                    new_w = 0.0
+                if min_w is not None:
+                    new_w = max(float(min_w), new_w)
+                if max_w is not None:
+                    new_w = min(float(max_w), new_w)
+                new_current[term] = new_w
+                state.last_factors[term] = float(factor)
+        else:
+            mean = float(np.mean(vals)) if np.mean(vals) > eps else 1.0
+            x = vals / mean
+
+            logits = state.gamma * x
+            logits = logits - np.max(logits)
+            exp = np.exp(logits)
+            soft = exp / np.sum(exp)
+
+            avg = float(len(soft)) if len(soft) > 0 else 1.0
+            factors = avg * soft
+            factors = np.clip(factors, state.min_factor, state.max_factor)
+
+            new_current = dict(state.base)
+            state.last_factors = {}
+            min_w = state.min_weight
+            max_w = state.max_weight
+            for term, factor in zip(term_order, factors):
+                if term not in new_current:
+                    continue
+                new_w = float(new_current[term]) * float(factor)
+                if new_w < 0.0:
+                    new_w = 0.0
+                if min_w is not None:
+                    new_w = max(float(min_w), new_w)
+                if max_w is not None:
+                    new_w = min(float(max_w), new_w)
+                new_current[term] = new_w
                 state.last_factors[term] = float(factor)
 
         state.current = new_current

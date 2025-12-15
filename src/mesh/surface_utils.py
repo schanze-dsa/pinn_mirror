@@ -652,11 +652,28 @@ def _closest_pt_on_triangle(P: np.ndarray, A: np.ndarray, B: np.ndarray, C: np.n
     return Q, np.sum((P - Q) ** 2), np.array([u, v, w])
 
 
-def project_points_onto_surface(part_or_asm, ts: TriSurface, Q: np.ndarray,
-                                prefilter_k: int = 8, chunk: int = 4096
-                                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def project_points_onto_surface(
+    part_or_asm,
+    ts: TriSurface,
+    Q: np.ndarray,
+    prefilter_k: int = 8,
+    chunk: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Project query points Q (M,3) to closest points on the surface.
+
+    Returns
+    -------
+    Xp : (M,3) float64
+        Closest points on the triangulated surface.
+    n : (M,3) float64
+        Per-point surface normals (from the closest triangle).
+    idx : (M,) int64
+        Closest triangle indices.
+    dist : (M,) float64
+        Euclidean distance |Q - Xp|.
+    bary : (M,3) float64
+        Barycentric coordinates of Xp on the closest triangle.
     """
     areas, normals, centroids = compute_tri_geometry(part_or_asm, ts)
 
@@ -666,6 +683,7 @@ def project_points_onto_surface(part_or_asm, ts: TriSurface, Q: np.ndarray,
     n = np.empty((M, 3), dtype=np.float64)
     idx = np.empty((M,), dtype=np.int64)
     dist = np.empty((M,), dtype=np.float64)
+    bary = np.empty((M, 3), dtype=np.float64)
 
     tri_vertices = []
     for tri in ts.tri_node_ids:
@@ -683,19 +701,22 @@ def project_points_onto_surface(part_or_asm, ts: TriSurface, Q: np.ndarray,
             best_d2 = float("inf")
             best_t = 0
             best_Q = None
+            best_bary = None
             for t in cand_idx[i]:
                 A, B, C = tri_vertices[int(t)]
-                Qproj, d2t, _ = _closest_pt_on_triangle(q, A, B, C)
+                Qproj, d2t, bary_t = _closest_pt_on_triangle(q, A, B, C)
                 if d2t < best_d2:
                     best_d2 = d2t
                     best_t = int(t)
                     best_Q = Qproj
+                    best_bary = bary_t
             Xp[s + i] = best_Q
             n[s + i]  = normals[best_t]
             idx[s + i] = best_t
             dist[s + i] = np.sqrt(best_d2)
+            bary[s + i] = best_bary
 
-    return Xp, n, idx, dist
+    return Xp, n, idx, dist, bary
 
 
 # -----------------------------

@@ -54,6 +54,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
+from mesh.interp_utils import interp_bary_tf
+
 # Optional import for type hints (no runtime cyclic dep)
 try:
     from .contact_normal_alm import NormalContactALM, softplus_neg, _ensure_2d, _to_tf
@@ -130,6 +132,12 @@ class FrictionContactALM:
         self.t2: Optional[tf.Tensor] = None  # (N,3)
         self.w:  Optional[tf.Tensor] = None  # (N,)
 
+        # Optional interpolation metadata (Route-2)
+        self.xs_node_idx: Optional[tf.Tensor] = None  # (N,3) int32
+        self.xs_bary: Optional[tf.Tensor] = None      # (N,3) float32/float64
+        self.xm_node_idx: Optional[tf.Tensor] = None  # (N,3) int32
+        self.xm_bary: Optional[tf.Tensor] = None      # (N,3) float32/float64
+
         # multipliers (tangential, 2D)
         self.lmbda_t: Optional[tf.Variable] = None  # (N,2)
 
@@ -165,6 +173,11 @@ class FrictionContactALM:
         t2: np.ndarray,
         w_area: np.ndarray,
         extra_weights: Optional[np.ndarray] = None,
+        *,
+        xs_node_idx: Optional[np.ndarray] = None,
+        xs_bary: Optional[np.ndarray] = None,
+        xm_node_idx: Optional[np.ndarray] = None,
+        xm_bary: Optional[np.ndarray] = None,
     ):
         """
         Initialize per-batch tensors from NumPy arrays.
@@ -190,6 +203,17 @@ class FrictionContactALM:
 
         self.xs, self.xm, self.t1, self.t2, self.w = Xs, Xm, T1, T2, W
         self._built_N = int(Xs.shape[0])
+
+        if xs_node_idx is not None and xs_bary is not None and xm_node_idx is not None and xm_bary is not None:
+            self.xs_node_idx = tf.convert_to_tensor(xs_node_idx, dtype=tf.int32)
+            self.xs_bary = tf.convert_to_tensor(xs_bary, dtype=self.dtype)
+            self.xm_node_idx = tf.convert_to_tensor(xm_node_idx, dtype=tf.int32)
+            self.xm_bary = tf.convert_to_tensor(xm_bary, dtype=self.dtype)
+        else:
+            self.xs_node_idx = None
+            self.xs_bary = None
+            self.xm_node_idx = None
+            self.xm_bary = None
 
         # reset tangential multipliers
         self.lmbda_t = tf.Variable(
@@ -247,11 +271,15 @@ class FrictionContactALM:
         self.build_from_numpy(
             cat["xs"], cat["xm"], cat["t1"], cat["t2"], cat["w_area"],
             extra_weights=extra_weights,
+            xs_node_idx=cat.get("xs_node_idx"),
+            xs_bary=cat.get("xs_bary"),
+            xm_node_idx=cat.get("xm_node_idx"),
+            xm_bary=cat.get("xm_bary"),
         )
 
     # ---------- internals ----------
 
-    def _relative_slip_t(self, u_fn, params=None) -> tf.Tensor:
+    def _relative_slip_t(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None) -> tf.Tensor:
         """
         Compute tangential relative displacement components s_t in the [t1,t2] basis:
             s  = ((xs + u(xs)) - (xm + u(xm)))
@@ -262,8 +290,20 @@ class FrictionContactALM:
         t1 = tf.cast(self.t1, self.dtype)
         t2 = tf.cast(self.t2, self.dtype)
 
-        u_s = tf.cast(_ensure_2d(u_fn(xs, params)), self.dtype)
-        u_m = tf.cast(_ensure_2d(u_fn(xm, params)), self.dtype)
+        use_interp = (
+            u_nodes is not None
+            and self.xs_node_idx is not None
+            and self.xs_bary is not None
+            and self.xm_node_idx is not None
+            and self.xm_bary is not None
+        )
+        if use_interp:
+            u_nodes = tf.cast(u_nodes, self.dtype)
+            u_s = tf.cast(interp_bary_tf(u_nodes, self.xs_node_idx, self.xs_bary), self.dtype)
+            u_m = tf.cast(interp_bary_tf(u_nodes, self.xm_node_idx, self.xm_bary), self.dtype)
+        else:
+            u_s = tf.cast(_ensure_2d(u_fn(xs, params)), self.dtype)
+            u_m = tf.cast(_ensure_2d(u_fn(xm, params)), self.dtype)
 
         s = (xs + u_s) - (xm + u_m)                  # (N,3)
         s1 = tf.reduce_sum(t1 * s, axis=1)           # (N,)
@@ -273,7 +313,7 @@ class FrictionContactALM:
         self._last_st = st
         return st
 
-    def _effective_normal_pressure(self, u_fn, params=None) -> tf.Tensor:
+    def _effective_normal_pressure(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None) -> tf.Tensor:
         """
         Compute p_eff, the effective normal compression used in the friction cone:
             p_eff = max(0, lambda_n + mu_n * phi(g)), phi(g)=softplus(-g; beta)
@@ -283,9 +323,12 @@ class FrictionContactALM:
             raise RuntimeError("FrictionContactALM needs link_normal(normal_op) before use.")
 
         if hasattr(self.normal_op, "effective_normal_pressure"):
-            return tf.cast(self.normal_op.effective_normal_pressure(u_fn, params), self.dtype)
+            return tf.cast(
+                self.normal_op.effective_normal_pressure(u_fn, params, u_nodes=u_nodes),
+                self.dtype,
+            )
 
-        g = self.normal_op._gap(u_fn, params)                      # (N,)
+        g = self.normal_op._gap(u_fn, params, u_nodes=u_nodes)                      # (N,)
         phi = softplus_neg(g, self.normal_op.beta)                 # (N,)
         p_eff = self.normal_op.lmbda + self.normal_op.mu_n * phi   # (N,)
         p_eff = tf.maximum(p_eff, tf.cast(0.0, self.dtype))        # no tension
@@ -298,6 +341,8 @@ class FrictionContactALM:
         u_fn,
         params=None,
         extra_weights: Optional[tf.Tensor] = None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
     ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
         """
         Compute friction energy and stats.
@@ -316,7 +361,7 @@ class FrictionContactALM:
         其中 w_eff = w * extra_weights（若 extra_weights 为 None，则 w_eff = w）。
         """
         # 切向滑移
-        st = self._relative_slip_t(u_fn, params)           # (N,2)
+        st = self._relative_slip_t(u_fn, params, u_nodes=u_nodes)           # (N,2)
 
         # 有效权重：保留 self.w 作为几何/面积基权重，额外权重只在本次调用中生效
         w_eff = self.w
@@ -325,7 +370,7 @@ class FrictionContactALM:
 
         # 有效法向压力 p_eff（用于摩擦圆锥半径 & 平滑能量）
         if self.cfg.use_effective_normal:
-            p_eff = self._effective_normal_pressure(u_fn, params)
+            p_eff = self._effective_normal_pressure(u_fn, params, u_nodes=u_nodes)
         else:
             if self.normal_op is None:
                 raise RuntimeError("use_effective_normal=False still needs link_normal(normal_op).")
@@ -409,6 +454,7 @@ class FrictionContactALM:
         u_fn,
         params=None,
         step_scale: float = 1.0,
+        u_nodes: Optional[tf.Tensor] = None,
     ):
         """
         Outer update for tangential multipliers (增强型 ALM)：
@@ -418,14 +464,14 @@ class FrictionContactALM:
         其中 eta = step_scale 为可调步长因子。保持接口向后兼容。
         """
         # 切向滑移
-        st = self._relative_slip_t(u_fn, params)                  # (N,2)
+        st = self._relative_slip_t(u_fn, params, u_nodes=u_nodes)                  # (N,2)
 
         # 试探应力
         tau_trial = self.lmbda_t + self.k_t * st
 
         # 摩擦圆锥半径（与 energy 中保持一致）
         if self.cfg.use_effective_normal:
-            p_eff = self._effective_normal_pressure(u_fn, params)
+            p_eff = self._effective_normal_pressure(u_fn, params, u_nodes=u_nodes)
         else:
             p_eff = tf.maximum(self.normal_op.lmbda, tf.cast(0.0, self.dtype))
         tau_c = self.mu_f * p_eff
@@ -469,6 +515,8 @@ class FrictionContactALM:
     def reset_for_new_batch(self):
         """Clear batch tensors/state to allow rebuild with new samples."""
         self.xs = self.xm = self.t1 = self.t2 = self.w = None
+        self.xs_node_idx = self.xs_bary = None
+        self.xm_node_idx = self.xm_bary = None
         self.lmbda_t = None
         self._built_N = 0
         self._last_st = None

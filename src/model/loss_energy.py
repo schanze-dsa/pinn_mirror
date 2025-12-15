@@ -68,6 +68,12 @@ class TotalConfig:
     w_bc: float = 1.0            # boundary penalty -> E_bc
     w_pre: float = 1.0           # multiplies the subtracted W_pre
     w_sigma: float = 1.0         # stress supervision term (σ_pred vs σ_phys)
+    # 参考应力尺度，用于将 E_sigma 归一化为无量纲（例如取材料屈服强度 MPa）
+    sigma_ref: float = 1.0
+
+    # staged preload 路径惩罚权重（增量势能中对加载顺序敏感）
+    path_penalty_weight: float = 1.0
+    fric_path_penalty_weight: float = 1.0
 
     adaptive_scheme: str = "contact_only"
 
@@ -213,10 +219,16 @@ class TotalEnergy:
         }
         stats: Dict[str, tf.Tensor] = {}
 
+        u_nodes = None
         elastic_cache = None
         if self.elasticity is not None:
+            u_nodes = self.elasticity._eval_u_on_nodes(u_fn, params)
             E_int_res = self.elasticity.energy(
-                u_fn, params, tape=tape, return_cache=bool(stress_fn)
+                u_fn,
+                params,
+                tape=tape,
+                return_cache=bool(stress_fn),
+                u_nodes=u_nodes,
             )
             if bool(stress_fn):
                 E_int, estates, elastic_cache = E_int_res  # type: ignore[misc]
@@ -226,7 +238,7 @@ class TotalEnergy:
             stats.update({f"el_{k}": v for k, v in estates.items()})
 
         if self.contact is not None:
-            _, cparts, stats_cn, stats_ct = self.contact.energy(u_fn, params)
+            _, cparts, stats_cn, stats_ct = self.contact.energy(u_fn, params, u_nodes=u_nodes)
             if "E_cn" in cparts:
                 parts["E_cn"] = tf.cast(cparts["E_cn"], dtype)
             elif "E_n" in cparts:
@@ -263,8 +275,12 @@ class TotalEnergy:
 
         # Preload work (skip if w_pre=0)
         if self.preload is not None and abs(self.w_pre) > 1e-15:
-            W_pre, pstats = self.preload.energy(u_fn, params)
+            W_pre, pstats = self.preload.energy(u_fn, params, u_nodes=u_nodes)
             parts["W_pre"] = tf.cast(W_pre, dtype)
+            # 同时暴露两种键：
+            # - stats["preload"]：供 Trainer 直接读取（例如打印 bolt_deltas）
+            # - stats["pre_preload"]：兼容 staged preload 的历史逻辑
+            stats.update(pstats)
             stats.update({f"pre_{k}": v for k, v in pstats.items()})
 
         # 应力监督：需要应力头、弹性算子缓存以及配置中开启权重
@@ -300,11 +316,30 @@ class TotalEnergy:
             sigma_cells = sigma_cells[:, : tf.shape(sigma_phys)[1]]
 
             diff = sigma_cells - sigma_phys
-            loss_sigma = tf.reduce_mean(diff * diff)
+            # 归一化：让应力监督项无量纲，避免其量纲/尺度压过势能项
+            sigma_ref = tf.cast(getattr(self.cfg, "sigma_ref", 1.0), dtype)
+            sigma_ref = tf.maximum(sigma_ref, tf.cast(1e-12, dtype))
+            diff_n = diff / sigma_ref
+            loss_sigma = tf.reduce_mean(diff_n * diff_n)
             parts["E_sigma"] = loss_sigma * tf.cast(
                 getattr(self.elasticity.cfg, "stress_loss_weight", 1.0), dtype
             )
             stats["stress_rms"] = tf.sqrt(tf.reduce_mean(sigma_cells * sigma_cells) + 1e-20)
+
+            # Von Mises 应力（预测/物理），便于日志中评估与屈服强度的比值
+            def _von_mises(sig: tf.Tensor) -> tf.Tensor:
+                sxx, syy, szz, sxy, syz, sxz = tf.unstack(sig, axis=1)
+                return tf.sqrt(
+                    0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2)
+                    + 3.0 * (sxy * sxy + syz * syz + sxz * sxz)
+                )
+
+            vm_pred = _von_mises(sigma_cells)
+            vm_phys = _von_mises(sigma_phys)
+            stats["stress_vm_pred_max"] = tf.reduce_max(vm_pred)
+            stats["stress_vm_pred_mean"] = tf.reduce_mean(vm_pred)
+            stats["stress_vm_phys_max"] = tf.reduce_max(vm_phys)
+            stats["stress_vm_phys_mean"] = tf.reduce_mean(vm_phys)
 
         return parts, stats
 
@@ -394,6 +429,7 @@ class TotalEnergy:
         prev_P: Optional[tf.Tensor] = None
         prev_slip: Optional[tf.Tensor] = None
         prev_W_pre = tf.cast(0.0, dtype)
+        last_preload_entry: Optional[dict] = None
 
         stage_count = len(stage_seq)
 
@@ -421,14 +457,26 @@ class TotalEnergy:
                 stats_all[f"s{idx+1}_cum{key}"] = totals[key]
 
             bolt_deltas = None
-            pre_entry = stage_stats.get("pre_preload")
-            if isinstance(pre_entry, dict) and "bolt_deltas" in pre_entry:
-                bolt_deltas = tf.cast(pre_entry["bolt_deltas"], dtype)
+            pre_entry = stage_stats.get("preload")
+            if pre_entry is None:
+                pre_entry = stage_stats.get("preload_stats")
+            if pre_entry is None:
+                pre_entry = stage_stats.get("pre_preload")
+            if isinstance(pre_entry, dict):
+                bd = pre_entry.get("bolt_deltas")
+                if bd is None:
+                    bd = pre_entry.get("bolt_delta")
+                if bd is not None:
+                    bolt_deltas = tf.cast(bd, dtype)
+                    last_preload_entry = pre_entry
 
             P_vec = tf.cast(tf.convert_to_tensor(stage_params.get("P", [])), dtype)
             slip_t = None
             if self.contact is not None and hasattr(self.contact, "last_friction_slip"):
                 slip_t = self.contact.last_friction_slip()
+
+            w_path = tf.cast(getattr(self.cfg, "path_penalty_weight", 1.0), dtype)
+            w_fric_path = tf.cast(getattr(self.cfg, "fric_path_penalty_weight", 1.0), dtype)
 
             stage_path_penalty = tf.cast(0.0, dtype)
             if idx > 0:
@@ -437,14 +485,16 @@ class TotalEnergy:
                 if bolt_deltas is not None and prev_bolt_deltas is not None:
                     disp_jump = tf.reduce_sum(tf.abs(bolt_deltas - prev_bolt_deltas))
                     stage_path = disp_jump * load_jump
-                    stage_path_penalty = stage_path_penalty + stage_path
+                    stage_path_penalty = stage_path_penalty + w_path * stage_path
                     stats_all[f"s{idx+1}_path_penalty"] = stage_path
+                    stats_all[f"s{idx+1}_path_penalty_w"] = w_path
 
                 if slip_t is not None and prev_slip is not None:
                     slip_jump = tf.reduce_sum(tf.abs(slip_t - prev_slip))
                     fric_path = slip_jump * load_jump
-                    stage_path_penalty = stage_path_penalty + fric_path
+                    stage_path_penalty = stage_path_penalty + w_fric_path * fric_path
                     stats_all[f"s{idx+1}_fric_path_penalty"] = fric_path
+                    stats_all[f"s{idx+1}_fric_path_penalty_w"] = w_fric_path
 
             W_cur = tf.cast(stage_parts.get("W_pre", tf.cast(0.0, dtype)), dtype)
             delta_W = W_cur - prev_W_pre
@@ -489,6 +539,8 @@ class TotalEnergy:
                 stats_all["stage_count"] = root_params["stage_count"]
 
         stats_all["path_penalty_total"] = path_penalty
+        if isinstance(last_preload_entry, dict):
+            stats_all["preload"] = last_preload_entry
 
         Pi = Pi_accum
         return Pi, totals, stats_all
@@ -533,9 +585,15 @@ class TotalEnergy:
         if self.contact is not None:
             if staged_updates:
                 for st_params in staged_updates:
-                    self.contact.update_multipliers(u_fn, st_params)
+                    u_nodes = None
+                    if self.elasticity is not None:
+                        u_nodes = self.elasticity._eval_u_on_nodes(u_fn, st_params)
+                    self.contact.update_multipliers(u_fn, st_params, u_nodes=u_nodes)
             else:
-                self.contact.update_multipliers(u_fn, target_params)
+                u_nodes = None
+                if self.elasticity is not None:
+                    u_nodes = self.elasticity._eval_u_on_nodes(u_fn, target_params)
+                self.contact.update_multipliers(u_fn, target_params, u_nodes=u_nodes)
         if self.bcs:
             if staged_updates:
                 for st_params in staged_updates:

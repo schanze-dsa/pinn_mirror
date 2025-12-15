@@ -9,7 +9,8 @@ physics/preload_model.py
   - _fetch_surface_points(): 优先调用 assembly.surfaces.get_surface_points()
     自动把 SurfaceDef（ELEMENT 面）转换为 (X,N,w)。
   - _coerce_surface_like_to_points(): 统一把多种“表面样式”落成点集，需要时利用 asm。
-  - energy(): 使用 (X + u) · N 的积分形式累加，权重为 w，全部使用 tf.float32。
+  - energy(): 使用端面“轴向平均位移差”近似螺栓伸长量 Δ，并累加 W_pre = Σ P_i Δ_i；
+    其中 P_i 为螺栓预紧力(总力, N)，Δ 为长度量纲(与坐标单位一致)。
   - _u_fn_chunked(): 对 u_fn 前向做 micro-batch，避免一次性大批量前向引起显存峰值。
 """
 
@@ -19,6 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
+
+from mesh.interp_utils import interp_bary_tf
 
 
 # ---------- 规格 ----------
@@ -45,9 +48,53 @@ class BoltSampleData:
     X_up: np.ndarray
     N_up: np.ndarray
     w_up: np.ndarray
+    up_node_idx: Optional[np.ndarray] = None   # (n,3) int32
+    up_bary: Optional[np.ndarray] = None       # (n,3) float32
     X_dn: Optional[np.ndarray] = None
     N_dn: Optional[np.ndarray] = None
     w_dn: Optional[np.ndarray] = None
+    dn_node_idx: Optional[np.ndarray] = None   # (n,3) int32
+    dn_bary: Optional[np.ndarray] = None       # (n,3) float32
+
+
+def _compute_area_weights(tri_idx: np.ndarray, tri_areas: np.ndarray) -> np.ndarray:
+    """
+    Unbiased per-sample area weights for surface integration.
+
+    We sample triangles proportional to area; weighting each sample by (area / count)
+    yields unbiased estimates of surface integrals with reduced variance.
+    """
+    tri_idx = np.asarray(tri_idx, dtype=np.int64).reshape(-1)
+    tri_areas = np.asarray(tri_areas, dtype=np.float64).reshape(-1)
+    if tri_idx.size == 0 or tri_areas.size == 0:
+        return np.zeros((0,), dtype=np.float64)
+    counts = np.bincount(tri_idx, minlength=tri_areas.shape[0]).astype(np.float64)
+    w = tri_areas[tri_idx] / (counts[tri_idx] + 1e-16)
+    total_area = float(tri_areas.sum())
+    w_sum = float(w.sum())
+    if w_sum > 0:
+        w *= total_area / w_sum
+    return w
+
+
+def _sorted_node_ids(asm: Any) -> np.ndarray:
+    return np.asarray(sorted(int(nid) for nid in asm.nodes.keys()), dtype=np.int64)
+
+
+def _map_node_ids_to_idx(sorted_node_ids: np.ndarray, node_ids: np.ndarray) -> np.ndarray:
+    nid = np.asarray(node_ids, dtype=np.int64)
+    idx = np.searchsorted(sorted_node_ids, nid)
+    if idx.size == 0:
+        return idx.astype(np.int32)
+    bad = (
+        (idx < 0)
+        | (idx >= sorted_node_ids.shape[0])
+        | (sorted_node_ids[idx] != nid)
+    )
+    if np.any(bad):
+        missing = np.unique(nid[bad])[:10]
+        raise KeyError(f"Some node IDs are missing in asm.nodes (example: {missing}).")
+    return idx.astype(np.int32)
 
 
 # ---------- 辅助：把各种“表面样式”转为 (X,N,w) ----------
@@ -118,31 +165,89 @@ class PreloadWork:
         从装配的 surfaces 中根据 specs 采样出每个螺栓的上/下表面点集合。
         保留用户在 INP 中的原始键名（包括 'bolt2 uo' 这样的笔误），不做重命名。
         """
-        rng = np.random.RandomState(seed)
+        rng = np.random.default_rng(seed)
         bolts: List[BoltSampleData] = []
         for sp in specs:
-            X_up, N_up, w_up = self._fetch_surface_points(asm, sp.up_key, n_points_each)
-            X_dn = N_dn = w_dn = None
+            X_up, N_up, w_up, up_node_idx, up_bary = self._fetch_surface_points_with_interp(
+                asm, sp.up_key, n_points_each, rng
+            )
+            X_dn = N_dn = w_dn = dn_node_idx = dn_bary = None
             if sp.down_key:
-                X_dn, N_dn, w_dn = self._fetch_surface_points(asm, sp.down_key, n_points_each)
+                X_dn, N_dn, w_dn, dn_node_idx, dn_bary = self._fetch_surface_points_with_interp(
+                    asm, sp.down_key, n_points_each, rng
+                )
 
             # 打乱（可选）
-            idx = np.arange(X_up.shape[0]); rng.shuffle(idx)
+            idx = rng.permutation(X_up.shape[0])
             X_up, N_up, w_up = X_up[idx], N_up[idx], w_up[idx]
+            if up_node_idx is not None:
+                up_node_idx = up_node_idx[idx]
+            if up_bary is not None:
+                up_bary = up_bary[idx]
             if X_dn is not None:
-                idy = np.arange(X_dn.shape[0]); rng.shuffle(idy)
+                idy = rng.permutation(X_dn.shape[0])
                 X_dn, N_dn, w_dn = X_dn[idy], N_dn[idy], w_dn[idy]
+                if dn_node_idx is not None:
+                    dn_node_idx = dn_node_idx[idy]
+                if dn_bary is not None:
+                    dn_bary = dn_bary[idy]
 
             bolts.append(BoltSampleData(
                 name=sp.name,
                 X_up=X_up.astype(np.float32), N_up=N_up.astype(np.float32), w_up=w_up.astype(np.float32),
+                up_node_idx=None if up_node_idx is None else up_node_idx.astype(np.int32),
+                up_bary=None if up_bary is None else up_bary.astype(np.float32),
                 X_dn=None if X_dn is None else X_dn.astype(np.float32),
                 N_dn=None if N_dn is None else N_dn.astype(np.float32),
                 w_dn=None if w_dn is None else w_dn.astype(np.float32),
+                dn_node_idx=None if dn_node_idx is None else dn_node_idx.astype(np.int32),
+                dn_bary=None if dn_bary is None else dn_bary.astype(np.float32),
             ))
         self._bolts = bolts
 
     # --------- 采样辅助 ---------
+    def _fetch_surface_points_with_interp(
+        self,
+        asm: Any,
+        key: str,
+        n_points_each: int,
+        rng: np.random.Generator,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Try triangulation-based sampling so we can return barycentric interpolation metadata.
+
+        Returns: (X, N, w, tri_node_idx, bary)
+        If triangulation fails (e.g., NODE surfaces), falls back to the legacy point sampler
+        and returns (X, N, w, None, None).
+        """
+        try:
+            from mesh.surface_utils import (
+                resolve_surface_to_tris,
+                compute_tri_geometry,
+                sample_points_on_surface,
+            )
+
+            ts = resolve_surface_to_tris(asm, key)
+            provider = asm.parts[ts.part_name] if getattr(ts, "part_name", None) in getattr(asm, "parts", {}) else asm
+
+            X, tri_idx, bary, N = sample_points_on_surface(provider, ts, n_points_each, rng=rng)
+            tri_areas, _, _ = compute_tri_geometry(provider, ts)
+            w = _compute_area_weights(tri_idx, tri_areas)
+
+            sorted_node_ids = _sorted_node_ids(asm)
+            tri_node_ids = ts.tri_node_ids[tri_idx.astype(np.int64)]
+            tri_node_idx = _map_node_ids_to_idx(sorted_node_ids, tri_node_ids)
+            return (
+                X.astype(np.float32),
+                N.astype(np.float32),
+                w.astype(np.float32),
+                tri_node_idx.astype(np.int32),
+                bary.astype(np.float32),
+            )
+        except Exception:
+            X, N, w = self._fetch_surface_points(asm, key, n_points_each)
+            return X, N, w, None, None
+
     def _fetch_surface_points(self, asm, key: str, n_points_each: int
                               ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -222,43 +327,77 @@ class PreloadWork:
         return tf.concat(outs, axis=0)    # (N,3) float32
 
     # --------- 物理量计算 ---------
-    def _bolt_delta(self, u_fn, params, bolt: BoltSampleData) -> tf.Tensor:
+    def _bolt_delta(
+        self,
+        u_fn,
+        params,
+        bolt: BoltSampleData,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
+    ) -> tf.Tensor:
         """
-        计算单个螺栓的“轴向开口量”近似：Δ = ∫[(X_up+u_up)·N_up] w_up - ∫[(X_dn+u_dn)·N_dn] w_dn
-        若无下侧，则仅用上侧项。
-        返回标量 tf.float32。
+        计算单个螺栓端面的“轴向相对位移差”(近似螺栓伸长量)：
+
+            Δ = mean_A( u_up · a ) - mean_A( u_dn · a )
+
+        其中 a 为螺栓轴向单位向量(由上端面法向的面积加权平均近似)。
+
+        注意：这里使用“位移”而非 “(X+u)” 的绝对位置，确保 u=0 时 Δ=0，
+        且当 P_i 被解释为预紧力(总力, N)时，W_pre = P·Δ 的量纲为能量(力×位移)。
+
+        若无下侧端面，则退化为 Δ = mean_A(u_up·a)。
         """
-        policy = tf.keras.mixed_precision.global_policy()
-        compute_dtype = getattr(policy, "compute_dtype", tf.float32)
+        # 预紧功/位移差属于“物理量统计”，这里强制使用 float32，避免 mixed_float16 下的数值误差
+        dtype = tf.float32
+        eps = tf.cast(getattr(self.cfg, "epsilon", 1e-12), dtype)
 
         # 上侧
-        X_up = tf.cast(tf.convert_to_tensor(bolt.X_up), compute_dtype)  # (m,3)
-        N_up = tf.cast(tf.convert_to_tensor(bolt.N_up), compute_dtype)  # (m,3)
-        w_up = tf.cast(tf.convert_to_tensor(bolt.w_up), compute_dtype)  # (m,)
-        u_up = tf.cast(
-            self._u_fn_chunked(u_fn, params, X_up, batch=int(getattr(self.cfg, "forward_chunk", 2048))),
-            compute_dtype
-        )  # (m,3)
-        s_up = tf.reduce_sum((X_up + u_up) * N_up, axis=1) * w_up       # (m,)
-        I_up = tf.cast(tf.reduce_sum(s_up), tf.float32)
+        X_up = tf.cast(tf.convert_to_tensor(bolt.X_up), dtype)  # (m,3)
+        N_up = tf.cast(tf.convert_to_tensor(bolt.N_up), dtype)  # (m,3)
+        w_up = tf.cast(tf.convert_to_tensor(bolt.w_up), dtype)  # (m,)
+        u_up = None
+        if u_nodes is not None and bolt.up_node_idx is not None and bolt.up_bary is not None:
+            u_up = interp_bary_tf(
+                tf.cast(u_nodes, dtype),
+                tf.convert_to_tensor(bolt.up_node_idx, dtype=tf.int32),
+                tf.convert_to_tensor(bolt.up_bary, dtype=dtype),
+            )
+        else:
+            u_up = self._u_fn_chunked(
+                u_fn, params, X_up, batch=int(getattr(self.cfg, "forward_chunk", 2048))
+            )  # (m,3)
+        # 轴向单位向量 a：用端面法向的面积加权平均近似
+        wsum_up = tf.reduce_sum(w_up) + eps
+        a = tf.reduce_sum(N_up * w_up[:, None], axis=0) / wsum_up
+        a = a / (tf.norm(a) + eps)  # (3,)
+
+        uax_up = tf.reduce_sum(u_up * a[None, :], axis=1)              # (m,)
+        mean_up = tf.reduce_sum(uax_up * w_up) / wsum_up               # scalar
 
         if bolt.X_dn is None:
-            return I_up
+            return tf.cast(mean_up, tf.float32)
 
         # 下侧
-        X_dn = tf.cast(tf.convert_to_tensor(bolt.X_dn), compute_dtype)
-        N_dn = tf.cast(tf.convert_to_tensor(bolt.N_dn), compute_dtype)
-        w_dn = tf.cast(tf.convert_to_tensor(bolt.w_dn), compute_dtype)
-        u_dn = tf.cast(
-            self._u_fn_chunked(u_fn, params, X_dn, batch=int(getattr(self.cfg, "forward_chunk", 2048))),
-            compute_dtype
-        )  # (m,3)
-        s_dn = tf.reduce_sum((X_dn + u_dn) * N_dn, axis=1) * w_dn
-        I_dn = tf.cast(tf.reduce_sum(s_dn), tf.float32)
+        X_dn = tf.cast(tf.convert_to_tensor(bolt.X_dn), dtype)
+        w_dn = tf.cast(tf.convert_to_tensor(bolt.w_dn), dtype)
+        u_dn = None
+        if u_nodes is not None and bolt.dn_node_idx is not None and bolt.dn_bary is not None:
+            u_dn = interp_bary_tf(
+                tf.cast(u_nodes, dtype),
+                tf.convert_to_tensor(bolt.dn_node_idx, dtype=tf.int32),
+                tf.convert_to_tensor(bolt.dn_bary, dtype=dtype),
+            )
+        else:
+            u_dn = self._u_fn_chunked(
+                u_fn, params, X_dn, batch=int(getattr(self.cfg, "forward_chunk", 2048))
+            )  # (m,3)
+        wsum_dn = tf.reduce_sum(w_dn) + eps
+        uax_dn = tf.reduce_sum(u_dn * a[None, :], axis=1)
+        mean_dn = tf.reduce_sum(uax_dn * w_dn) / wsum_dn
 
-        return I_up - I_dn
+        return tf.cast(mean_up - mean_dn, tf.float32)
 
-    def energy(self, u_fn, params: Dict[str, tf.Tensor]):
+    def energy(self, u_fn, params: Dict[str, tf.Tensor], *, u_nodes: Optional[tf.Tensor] = None):
         """
         预紧功近似：W_pre = Σ_i  P_i * Δ_i
         其中 P_i 来自 params["P"] (shape=(3,))，Δ_i 来自 _bolt_delta。
@@ -301,7 +440,7 @@ class PreloadWork:
 
         deltas = []
         for bolt in self._bolts:
-            di = self._bolt_delta(u_fn, params, bolt)   # 标量
+            di = self._bolt_delta(u_fn, params, bolt, u_nodes=u_nodes)   # 标量
             deltas.append(di)
         delta_vec = tf.stack(deltas, axis=0)            # (nb,)
 

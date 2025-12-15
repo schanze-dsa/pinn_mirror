@@ -47,6 +47,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import tensorflow as tf
 
+from mesh.interp_utils import interp_bary_tf
+
 
 # --------------------------------------------------------------------------- #
 # Utilities
@@ -112,6 +114,13 @@ class NormalContactALM:
         self.n:  Optional[tf.Tensor] = None   # (N,3) normals (unit, may be auto-flipped)
         self.w:  Optional[tf.Tensor] = None   # (N,) base weights (e.g., area)
 
+        # Optional interpolation metadata (Route-2): evaluate u on mesh nodes once,
+        # then interpolate u(xs)/u(xm) from nodal displacements.
+        self.xs_node_idx: Optional[tf.Tensor] = None  # (N,3) int32
+        self.xs_bary: Optional[tf.Tensor] = None      # (N,3) float32/float64
+        self.xm_node_idx: Optional[tf.Tensor] = None  # (N,3) int32
+        self.xm_bary: Optional[tf.Tensor] = None      # (N,3) float32/float64
+
         # State (multipliers λ_n)
         self.lmbda: Optional[tf.Variable] = None  # (N,)
         self._built_N: int = 0
@@ -134,6 +143,11 @@ class NormalContactALM:
         w_area: np.ndarray,
         extra_weights: Optional[np.ndarray] = None,
         auto_orient: bool = True,
+        *,
+        xs_node_idx: Optional[np.ndarray] = None,
+        xs_bary: Optional[np.ndarray] = None,
+        xm_node_idx: Optional[np.ndarray] = None,
+        xm_bary: Optional[np.ndarray] = None,
     ):
         """
         Initialize per-batch tensors from NumPy arrays.
@@ -170,6 +184,18 @@ class NormalContactALM:
         self.xs, self.xm, self.n, self.w = Xs, Xm, Nn, W
         self._built_N = int(Xs.shape[0])
 
+        # Optional interpolation metadata
+        if xs_node_idx is not None and xs_bary is not None and xm_node_idx is not None and xm_bary is not None:
+            self.xs_node_idx = tf.convert_to_tensor(xs_node_idx, dtype=tf.int32)
+            self.xs_bary = tf.convert_to_tensor(xs_bary, dtype=self.dtype)
+            self.xm_node_idx = tf.convert_to_tensor(xm_node_idx, dtype=tf.int32)
+            self.xm_bary = tf.convert_to_tensor(xm_bary, dtype=self.dtype)
+        else:
+            self.xs_node_idx = None
+            self.xs_bary = None
+            self.xm_node_idx = None
+            self.xm_bary = None
+
         # (Re)init multipliers (per-batch state)
         self.lmbda = tf.Variable(
             tf.zeros((self._built_N,), dtype=self.dtype),
@@ -202,6 +228,10 @@ class NormalContactALM:
             cat["w_area"],
             extra_weights=extra_weights,
             auto_orient=auto_orient,
+            xs_node_idx=cat.get("xs_node_idx"),
+            xs_bary=cat.get("xs_bary"),
+            xm_node_idx=cat.get("xm_node_idx"),
+            xm_bary=cat.get("xm_bary"),
         )
 
     def _auto_orient_normals(self):
@@ -215,21 +245,15 @@ class NormalContactALM:
         med = tfp_median(g0)
         flip = med < tf.cast(0.0, self.dtype)
 
-        def _flip():
-            self.n.assign(-self.n)
-            return tf.constant(0, dtype=tf.int32)
-
-        def _noflip():
-            return tf.constant(0, dtype=tf.int32)
-
-        _ = tf.cond(flip, _flip, _noflip)
+        n_new = tf.cond(flip, lambda: -n, lambda: n)
+        self.n = n_new
         self._auto_flip_done = True
 
     # ------------------------------------------------------------------ #
     # 核心计算：gap / energy / multipliers
     # ------------------------------------------------------------------ #
 
-    def _gap(self, u_fn, params=None) -> tf.Tensor:
+    def _gap(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None) -> tf.Tensor:
         """
         Compute signed gap:
             g = ((xs + u(xs)) - (xm + u(xm))) · n
@@ -241,8 +265,20 @@ class NormalContactALM:
         xm = tf.cast(self.xm, self.dtype)
         n = tf.cast(self.n,  self.dtype)
 
-        u_s = tf.cast(_ensure_2d(u_fn(xs, params)), self.dtype)
-        u_m = tf.cast(_ensure_2d(u_fn(xm, params)), self.dtype)
+        use_interp = (
+            u_nodes is not None
+            and self.xs_node_idx is not None
+            and self.xs_bary is not None
+            and self.xm_node_idx is not None
+            and self.xm_bary is not None
+        )
+        if use_interp:
+            u_nodes = tf.cast(u_nodes, self.dtype)
+            u_s = tf.cast(interp_bary_tf(u_nodes, self.xs_node_idx, self.xs_bary), self.dtype)
+            u_m = tf.cast(interp_bary_tf(u_nodes, self.xm_node_idx, self.xm_bary), self.dtype)
+        else:
+            u_s = tf.cast(_ensure_2d(u_fn(xs, params)), self.dtype)
+            u_m = tf.cast(_ensure_2d(u_fn(xm, params)), self.dtype)
 
         g = tf.reduce_sum(((xs + u_s) - (xm + u_m)) * n, axis=1)
         self._last_gap = g
@@ -253,6 +289,8 @@ class NormalContactALM:
         u_fn,
         params=None,
         extra_weights: Optional[tf.Tensor] = None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
     ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor]]:
         """
         Compute ALM normal-contact energy (scalar) and stats (dict):
@@ -277,7 +315,7 @@ class NormalContactALM:
             不会永久写回 self.w。可用于 weighted PINN 中基于残差
             的自适应权重。
         """
-        g = self._gap(u_fn, params)
+        g = self._gap(u_fn, params, u_nodes=u_nodes)
         phi = softplus_neg(g, self.beta)         # (N,)
 
         # 有效权重 w_eff：保留 self.w 作为几何/面积基权重，额外权重只在本次调用中生效
@@ -296,7 +334,8 @@ class NormalContactALM:
         stats = {
             "cn_min_gap": tf.reduce_min(g),
             "cn_mean_gap": tf.reduce_mean(g),
-            "cn_pen_ratio": tf.reduce_mean(tf.cast(phi > 0.0, self.dtype)),  # fraction with penetration (phi>0)
+            # fraction with penetration (gap < 0)
+            "cn_pen_ratio": tf.reduce_mean(tf.cast(g < tf.cast(0.0, self.dtype), self.dtype)),
             "cn_phi_mean": tf.reduce_mean(phi),
             "cn_mean_weight": tf.reduce_mean(w_eff),
             "cn_mean_pressure": tf.reduce_mean(p_eff),
@@ -309,6 +348,7 @@ class NormalContactALM:
         u_fn,
         params=None,
         step_scale: float = 1.0,
+        u_nodes: Optional[tf.Tensor] = None,
     ):
         """
         Outer-loop ALM update (not part of gradient path):
@@ -323,10 +363,10 @@ class NormalContactALM:
         """
         if self.cfg.mode.lower() != "alm":
             # 纯软化罚函数模式下不需要更新乘子，但仍刷新 gap 统计
-            self._gap(u_fn, params)
+            self._gap(u_fn, params, u_nodes=u_nodes)
             return
 
-        g = self._gap(u_fn, params)
+        g = self._gap(u_fn, params, u_nodes=u_nodes)
         phi = softplus_neg(g, self.beta)
 
         eta = tf.cast(step_scale, self.dtype)
@@ -369,9 +409,9 @@ class NormalContactALM:
             p = self.lmbda + p
         return tf.maximum(p, tf.cast(0.0, self.dtype))
 
-    def effective_normal_pressure(self, u_fn, params=None) -> tf.Tensor:
+    def effective_normal_pressure(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None) -> tf.Tensor:
         """Expose effective compressive pressure for friction算子复用。"""
-        g = self._gap(u_fn, params)
+        g = self._gap(u_fn, params, u_nodes=u_nodes)
         phi = softplus_neg(g, self.beta)
         return self._compute_effective_pressure(phi)
 
@@ -382,6 +422,8 @@ class NormalContactALM:
         注意：这会丢弃当前批次的 λ，需要在下一次 build_* 之后重新优化。
         """
         self.xs = self.xm = self.n = self.w = None
+        self.xs_node_idx = self.xs_bary = None
+        self.xm_node_idx = self.xm_bary = None
         self.lmbda = None
         self._built_N = 0
         self._last_gap = None

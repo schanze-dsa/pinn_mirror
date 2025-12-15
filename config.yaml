@@ -192,9 +192,9 @@ network_config:
   output_dim: 1            # 保留字段（实际由FieldConfig.out_dim控制）
   
   # DFEM mode: use node embeddings instead of spatial coordinates
-  dfem_mode: true          # 启用纯DFEM模式
-  n_nodes: null            # 将由ElasticityEnergy自动设置
-  node_emb_dim: 64         # 节点嵌入维度
+  dfem_mode: false         # 关闭 DFEM 节点嵌入（回到 Fourier + GCN）；DFEM 能量积分仍由 ElasticityEnergy 提供
+  n_nodes: null            # dfem_mode=true 时由 ElasticityEnergy 自动设置；dfem_mode=false 时忽略
+  node_emb_dim: 64         # dfem_mode=true 时使用；dfem_mode=false 时忽略
   
   layers:
     - 64
@@ -255,10 +255,11 @@ loss_config:
     w_bc: 1.0e-2      # 边界条件通常残差较小，给大一点
     
     # 【关键修复】预紧功不参与优化！它是输入载荷，不是目标
-    w_pre: 0.0        # 禁用预紧功的损失贡献（之前1e-6导致负损失和NaN）
+    w_pre: 1.0e-7     # 启用预紧外功项（P 为总力 N，Δ 为轴向位移差；该系数仅用于数值缩放）
     
     # 应力监督：用线弹性理论应力指导网络
-    w_sigma: 1.0      # 启用应力监督
+    # Esig ~ 1e7, 需要非常小的权重
+    w_sigma: 1.0e-4   # 从1.0降到1e-4，防止主导损失
 
   adaptive:
     # 暂时开启，但必须限制范围！防止它自动把 w_ct 调回 9.0 这种危险值
@@ -272,7 +273,8 @@ loss_config:
       - w_int
       - w_cn
       - w_ct    # 保留摩擦项的自适应调整
-      - w_pre
+      # 注意：预紧外功 W_pre 不参与自适应加权（避免等价“缩放载荷”）。
+      # 预紧项的权重会与 w_int 保持固定比例（由代码绑定），从而保持 P 的物理意义不变。
 
 # ------------------------------------------------------------
 # 4.4 接触力学参数 (Contact Mechanics Parameters)

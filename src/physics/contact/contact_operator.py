@@ -124,15 +124,24 @@ class ContactOperator:
                 raise KeyError(f"[ContactOperator] cat missing key '{k}'")
 
         # normal
+        interp_keys = ["xs_node_idx", "xs_bary", "xm_node_idx", "xm_bary"]
+        normal_cat = {"xs": cat["xs"], "xm": cat["xm"], "n": cat["n"], "w_area": cat["w_area"]}
+        for k in interp_keys:
+            if k in cat:
+                normal_cat[k] = cat[k]
         self.normal.build_from_cat(
-            {"xs": cat["xs"], "xm": cat["xm"], "n": cat["n"], "w_area": cat["w_area"]},
+            normal_cat,
             extra_weights=extra_weights,
             auto_orient=auto_orient,
         )
 
         # friction (linked to normal)
+        fric_cat = {"xs": cat["xs"], "xm": cat["xm"], "t1": cat["t1"], "t2": cat["t2"], "w_area": cat["w_area"]}
+        for k in interp_keys:
+            if k in cat:
+                fric_cat[k] = cat[k]
         self.friction.build_from_cat(
-            {"xs": cat["xs"], "xm": cat["xm"], "t1": cat["t1"], "t2": cat["t2"], "w_area": cat["w_area"]},
+            fric_cat,
             extra_weights=extra_weights,
         )
 
@@ -157,6 +166,8 @@ class ContactOperator:
         self,
         u_fn,
         params=None,
+        *,
+        u_nodes: Optional[tf.Tensor] = None,
     ) -> Tuple[tf.Tensor, Dict[str, tf.Tensor], Dict[str, tf.Tensor], Dict[str, tf.Tensor]]:
         """
         Compute total contact energy and return:
@@ -180,15 +191,15 @@ class ContactOperator:
         if not self._built:
             raise RuntimeError("[ContactOperator] call build_from_cat() before energy().")
 
-        En, stats_cn = self.normal.energy(u_fn, params)
-        Et, stats_ct = self.friction.energy(u_fn, params)
+        En, stats_cn = self.normal.energy(u_fn, params, u_nodes=u_nodes)
+        Et, stats_ct = self.friction.energy(u_fn, params, u_nodes=u_nodes)
 
         E = En + Et
         parts = {"E_n": En, "E_t": Et}
 
         return E, parts, stats_cn, stats_ct
 
-    def update_multipliers(self, u_fn, params=None):
+    def update_multipliers(self, u_fn, params=None, *, u_nodes: Optional[tf.Tensor] = None):
         """
         Outer-loop ALM update for both normal and friction.
 
@@ -206,8 +217,8 @@ class ContactOperator:
                 do_update = True
 
         if do_update:
-            self.normal.update_multipliers(u_fn, params)
-            self.friction.update_multipliers(u_fn, params)
+            self.normal.update_multipliers(u_fn, params, u_nodes=u_nodes)
+            self.friction.update_multipliers(u_fn, params, u_nodes=u_nodes)
 
         self._step += 1
 

@@ -24,7 +24,6 @@ import sys
 import argparse
 import math
 from datetime import datetime
-from dataclasses import asdict
 import yaml  # 新增：读取 config.yaml
 
 # --- 确保 "src" 在 Python 路径中 ---
@@ -157,12 +156,33 @@ def _prepare_config_with_autoguess():
     if not isinstance(mat_props, dict) or not mat_props:
         raise ValueError("config.yaml 必须提供非空的 material_properties。")
     materials = {}
+    yield_candidates = []
     for name, props in mat_props.items():
         E = props.get("E", None)
         nu = props.get("nu", None)
         if E is None or nu is None:
             continue
-        materials[name] = (float(E), float(nu))
+        E_f = float(E)
+        nu_f = float(nu)
+        if E_f <= 0.0:
+            raise ValueError(f"material_properties.{name}.E 必须为正值，当前为 {E}")
+        if not (-1.0 < nu_f < 0.5):
+            raise ValueError(f"material_properties.{name}.nu 超出物理范围 (-1,0.5)，当前为 {nu}")
+        if nu_f > 0.495:
+            print(f"[main] 警告：材料 {name} 的 ν={nu_f} 接近 0.5，线弹性可能病态。")
+        if E_f < 1e2 or E_f > 1e7:
+            print(f"[main] 警告：材料 {name} 的 E={E_f:g} 量级异常，请确认单位是否为 MPa。")
+        materials[name] = (E_f, nu_f)
+
+        # 收集屈服强度候选（若提供）
+        for k in ("sigma_y_tension", "sigma_y_compression", "sigma_y", "yield_strength"):
+            v = props.get(k, None)
+            if v is None:
+                continue
+            try:
+                yield_candidates.append(float(v))
+            except Exception:
+                pass
     if not materials:
         raise ValueError("material_properties 解析后为空，请检查配置内容。")
 
@@ -195,6 +215,17 @@ def _prepare_config_with_autoguess():
         max_steps=train_steps,
         viz_samples_after_train=5,   # 随机 5 组，标题包含三螺栓预紧力
     )
+    # 若 config.yaml 中提供了材料屈服强度，则默认取最小值作为全局屈服参考
+    if yield_candidates:
+        try:
+            cfg.yield_strength = float(min(yield_candidates))
+            print(f"[main] 读取材料屈服强度（最小值）: σy={cfg.yield_strength:g}")
+            # 用屈服强度作为应力监督的归一化尺度，使 E_sigma 无量纲且量级稳定
+            if cfg.yield_strength and cfg.yield_strength > 0:
+                cfg.total_cfg.sigma_ref = float(cfg.yield_strength)
+                print(f"[main] 应力监督归一化参考: sigma_ref={cfg.total_cfg.sigma_ref:g}")
+        except Exception:
+            pass
     output_cfg = cfg_yaml.get("output_config", {}) or {}
     if "save_path" in output_cfg:
         cfg.out_dir = str(output_cfg["save_path"])
@@ -276,6 +307,8 @@ def _prepare_config_with_autoguess():
         "w_bc": ("w_bc", "E_bc"),
         "w_pre": ("w_pre", "W_pre"),
         "w_sigma": ("w_sigma", "E_sigma"),
+        "w_path": ("path_penalty_weight", "path_penalty_total"),
+        "w_fric_path": ("fric_path_penalty_weight", "fric_path_penalty_total"),
     }
     for yaml_key, (attr, _) in weight_key_map.items():
         if yaml_key in base_weights_yaml:
@@ -290,16 +323,45 @@ def _prepare_config_with_autoguess():
         cfg.model_cfg.field.node_emb_dim = int(net_cfg_yaml["node_emb_dim"])
         print(f"[main] Node embedding dim: {cfg.model_cfg.field.node_emb_dim}")
 
+    # ===== 接触力学参数（normal/friction）=====
+    normal_cfg_yaml = cfg_yaml.get("normal_config", {}) or {}
+    if isinstance(normal_cfg_yaml, dict) and normal_cfg_yaml:
+        if "beta" in normal_cfg_yaml:
+            cfg.contact_cfg.normal.beta = float(normal_cfg_yaml["beta"])
+        if "mu_n" in normal_cfg_yaml:
+            cfg.contact_cfg.normal.mu_n = float(normal_cfg_yaml["mu_n"])
+        if "mode" in normal_cfg_yaml:
+            cfg.contact_cfg.normal.mode = str(normal_cfg_yaml["mode"])
+
+    fric_cfg_yaml = cfg_yaml.get("friction_config", {}) or {}
+    if isinstance(fric_cfg_yaml, dict) and fric_cfg_yaml:
+        if "k_t" in fric_cfg_yaml:
+            cfg.contact_cfg.friction.k_t = float(fric_cfg_yaml["k_t"])
+        if "mu_t" in fric_cfg_yaml:
+            cfg.contact_cfg.friction.mu_t = float(fric_cfg_yaml["mu_t"])
+        if "mu_f" in fric_cfg_yaml:
+            cfg.contact_cfg.friction.mu_f = float(fric_cfg_yaml["mu_f"])
+        if "use_smooth_friction" in fric_cfg_yaml:
+            val = bool(fric_cfg_yaml["use_smooth_friction"])
+            cfg.contact_cfg.use_smooth_friction = val
+            cfg.contact_cfg.friction.use_smooth_friction = val
+
     adaptive_cfg = loss_cfg_yaml.get("adaptive", {}) or {}
     cfg.loss_adaptive_enabled = bool(
         adaptive_cfg.get("enabled", cfg.loss_adaptive_enabled)
     )
     cfg.loss_update_every = int(adaptive_cfg.get("update_every", cfg.loss_update_every))
     cfg.loss_ema_decay = float(adaptive_cfg.get("ema_decay", cfg.loss_ema_decay))
+    # 绝对权重上下限（建议用该方式约束自适应权重，避免出现危险的超大权重）
     if "min_weight" in adaptive_cfg:
-        cfg.loss_min_factor = float(adaptive_cfg["min_weight"])
+        cfg.loss_min_weight = float(adaptive_cfg["min_weight"])
     if "max_weight" in adaptive_cfg:
-        cfg.loss_max_factor = float(adaptive_cfg["max_weight"])
+        cfg.loss_max_weight = float(adaptive_cfg["max_weight"])
+    # 每次更新时的相对缩放因子上下限（可选；默认 0.25~4.0）
+    if "min_factor" in adaptive_cfg:
+        cfg.loss_min_factor = float(adaptive_cfg["min_factor"])
+    if "max_factor" in adaptive_cfg:
+        cfg.loss_max_factor = float(adaptive_cfg["max_factor"])
     temperature = float(adaptive_cfg.get("temperature", 0.0) or 0.0)
     if temperature > 0.0:
         cfg.loss_gamma = 1.0 / temperature
@@ -317,18 +379,16 @@ def _prepare_config_with_autoguess():
     cfg.loss_focus_terms = tuple(focus_terms)
     cfg.total_cfg.adaptive_scheme = adaptive_cfg.get("scheme", cfg.total_cfg.adaptive_scheme)
 
-    # 若启用分阶段加载但 focus_terms 未包含 W_pre，则自动加入以增强预紧信号
-    if cfg.preload_use_stages and "W_pre" not in cfg.loss_focus_terms:
-        cfg.loss_focus_terms = tuple(list(cfg.loss_focus_terms) + ["W_pre"])
-
     # 启用应力头时默认也纳入自适应关注项，避免固定权重过大导致梯度爆炸
     has_stress_head = getattr(cfg.model_cfg.field, "stress_out_dim", 0) > 0
     if has_stress_head and "E_sigma" not in cfg.loss_focus_terms:
         cfg.loss_focus_terms = tuple(list(cfg.loss_focus_terms) + ["E_sigma"])
 
-    # 只要存在任意关注项，就切换为 focus 策略
+    # 只要存在任意关注项，就默认使用“平衡”策略（也可在 config.yaml 中通过 adaptive.scheme 显式指定）
     if cfg.loss_focus_terms:
-        cfg.total_cfg.adaptive_scheme = "focus"
+        scheme_norm = str(getattr(cfg.total_cfg, "adaptive_scheme", "") or "").strip().lower()
+        if scheme_norm in {"", "contact_only", "basic"}:
+            cfg.total_cfg.adaptive_scheme = "balance"
 
     cfg.resample_contact_every = int(
         cfg_yaml.get("resample_contact_every", cfg.resample_contact_every)
@@ -368,9 +428,36 @@ def _prepare_config_with_autoguess():
                 elif isinstance(entry, (list, tuple)):
                     stage_multiplier = max(stage_multiplier, len(entry))
 
+    # 载荷跨度（用于适当放大/缩小每阶段采样规模）
+    load_span = float(abs(getattr(cfg, "preload_max", 0.0) - getattr(cfg, "preload_min", 0.0)))
+    ref_span = 2000.0  # N；经验参考值，可按需要调整
+    load_factor = 1.0
+    if ref_span > 0:
+        load_factor = min(2.0, max(0.5, load_span / ref_span))
+    if stage_multiplier > 1 and abs(load_factor - 1.0) > 1e-3:
+        print(f"[main] 预紧载荷跨度 {load_span:g} N -> 每阶段采样系数 {load_factor:.2f}")
+
+    # 分阶段加载时，ContactOperator 内部的 update_every_steps 会被每阶段多次调用，
+    # 这里按阶段数放大一次频率，保持与单阶段训练相近的物理更新节奏。
+    if stage_multiplier > 1:
+        try:
+            cfg.contact_cfg.update_every_steps = int(
+                max(1, cfg.contact_cfg.update_every_steps * stage_multiplier)
+            )
+            cfg.alm_update_every = int(
+                max(1, cfg.alm_update_every * stage_multiplier)
+            )
+            print(
+                f"[main] 分阶段预紧启用：ALM 更新频率放宽为每 {cfg.alm_update_every} 步一次，"
+                f"ContactOperator.update_every_steps={cfg.contact_cfg.update_every_steps}"
+            )
+        except Exception:
+            pass
+
     contact_target = cfg.n_contact_points_per_pair
     if stage_multiplier > 1:
         per_stage_contact = max(256, math.ceil(contact_target / stage_multiplier))
+        per_stage_contact = max(256, int(math.ceil(per_stage_contact * load_factor)))
         approx_total_contact = per_stage_contact * stage_multiplier
         if per_stage_contact != contact_target:
             print(
@@ -390,6 +477,7 @@ def _prepare_config_with_autoguess():
 
         preload_target = cfg.preload_n_points_each
         per_stage_preload = max(128, math.ceil(preload_target / stage_multiplier))
+        per_stage_preload = max(128, int(math.ceil(per_stage_preload * load_factor)))
         approx_total_preload = per_stage_preload * stage_multiplier
         if per_stage_preload != preload_target:
             print(
@@ -408,6 +496,7 @@ def _prepare_config_with_autoguess():
 
         elas_target = cfg.elas_cfg.n_points_per_step
         per_stage_elas = max(1024, math.ceil(elas_target / stage_multiplier))
+        per_stage_elas = max(1024, int(math.ceil(per_stage_elas * load_factor)))
         if per_stage_elas != elas_target:
             print(
                 "[main] 分阶段预紧启用：将 DFEM 每步积分点从 "
@@ -433,6 +522,19 @@ def _prepare_config_with_autoguess():
 
 def _run_training(cfg, asm, export_saved_model: str = ""):
     from train.trainer import Trainer  # 再导一次确保路径就绪
+
+    # 为本次训练创建带时间戳的独立 checkpoint 目录，避免文件占用冲突
+    base_ckpt_dir = cfg.ckpt_dir or "checkpoints"
+    ts_tag = datetime.now().strftime("run-%Y%m%d-%H%M%S")
+    candidate = os.path.join(base_ckpt_dir, ts_tag)
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(base_ckpt_dir, f"{ts_tag}-{suffix}")
+        suffix += 1
+    os.makedirs(candidate, exist_ok=True)
+    cfg.ckpt_dir = candidate
+    print(f"[main] 本次训练的 checkpoint 输出目录：{cfg.ckpt_dir}")
+
     trainer = Trainer(cfg)
     trainer.run()
 
@@ -445,83 +547,11 @@ def _run_training(cfg, asm, export_saved_model: str = ""):
         print(f"[main] 未提供 --export，将 SavedModel 写入: {export_dir}")
     trainer.export_saved_model(export_dir)
 
-    print("\n✅ 训练完成！请到 'outputs/' 查看 5 张 “MIRROR up” 变形云图（文件名包含三颗预紧力数值）。")
+    print("\n[OK] 训练完成！请到 'outputs/' 查看 5 张 “MIRROR up” 变形云图（文件名包含三颗预紧力数值）。")
     print("   如需修改 INP 路径、表面名或超参，请编辑 config.yaml。")
-
-
-def _run_inference(cfg,
-                   preload_values,
-                   ckpt_path: str = "",
-                   out_path: str = "",
-                   data_out: str = "auto",
-                   title_prefix: str = "",
-                   show: bool = False,
-                   preload_order=None,
-                   export_saved_model: str = ""):
-    from train.trainer import Trainer
-
-    trainer = Trainer(cfg)
-    trainer.build()
-    restored = trainer.restore_checkpoint(ckpt_path or None)
-
-    if export_saved_model:
-        trainer.export_saved_model(export_saved_model)
-
-    save_path = trainer.generate_deflection_map(
-        preload_values,
-        out_path=out_path or None,
-        title_prefix=title_prefix or None,
-        show=show,
-        data_out_path=data_out,
-        preload_order=preload_order,
-    )
-
-    print("\n✅ 推理完成！")
-    print(f"   使用的检查点: {restored}")
-    print(f"   生成的云图: {save_path}")
-    if trainer.last_viz_data_path:
-        print(f"   位移数据: {trainer.last_viz_data_path}")
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Train the DFEM/PINN model or run inference with custom preloads."
-    )
-    parser.add_argument(
-        "--mode", choices=["train", "infer"], default="train",
-        help="train: 训练模型; infer: 使用已训模型生成云图"
-    )
-    parser.add_argument(
-        "--preload", nargs=3, type=float, metavar=("P1", "P2", "P3"),
-        help="三个螺栓的预紧力，单位 N (仅在 --mode infer 时使用)"
-    )
-    parser.add_argument(
-        "--order", nargs=3, type=int, metavar=("B1", "B2", "B3"),
-        help=(
-            "分阶段推理时三颗螺栓的拧紧顺序；例如 '2 3 1' 表示第二颗先拧，"
-            "再拧第三、第一颗。留空则默认按 1-2-3 的顺序加载。"
-        ),
-    )
-    parser.add_argument(
-        "--ckpt", default="",
-        help="指定要恢复的检查点路径；默认使用 checkpoints/ 下最新的"
-    )
-    parser.add_argument(
-        "--out", default="",
-        help="保存推理云图的路径；默认写入 outputs/ 目录"
-    )
-    parser.add_argument(
-        "--data", default="auto",
-        help="云图对应的位移采样 txt 文件路径。使用 'auto' 表示与图片同名，"
-             "使用 'none' 或空字符串表示不导出。"
-    )
-    parser.add_argument(
-        "--title", default="",
-        help="自定义云图标题前缀（默认沿用配置中的 viz_title_prefix）"
-    )
-    parser.add_argument(
-        "--show", action="store_true",
-        help="推理时显示 matplotlib 窗口"
+        description="Train the DFEM/PINN model."
     )
     parser.add_argument(
         "--export", default="",
@@ -531,23 +561,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     cfg, asm = _prepare_config_with_autoguess()
-
-    if args.mode == "train":
-        _run_training(cfg, asm, export_saved_model=args.export)
-    else:
-        if args.preload is None:
-            parser.error("--mode infer 需要提供 --preload P1 P2 P3")
-        _run_inference(
-            cfg,
-            preload_values=args.preload,
-            ckpt_path=args.ckpt,
-            out_path=args.out,
-            data_out=args.data,
-            title_prefix=args.title,
-            show=args.show,
-            preload_order=args.order,
-            export_saved_model=args.export,
-        )
+    _run_training(cfg, asm, export_saved_model=args.export)
 
 
 if __name__ == "__main__":

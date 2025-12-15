@@ -14,12 +14,14 @@ import os
 import sys
 import time
 import copy
+import re
+import math
+import shutil
 from dataclasses import dataclass, field
 import inspect
 from typing import Dict, List, Optional, Tuple, Any, Mapping, Sequence
 
 import numpy as np
-from tensorflow.python.util import deprecation
 import tensorflow as tf
 from tqdm.auto import tqdm  # 仅用 tqdm.auto，适配 PyCharm/终端
 
@@ -109,12 +111,21 @@ class TrainerConfig:
     contact_rar_fric_mix: float = 0.4          # 穿透 vs 摩擦残差的混合系数
     contact_rar_balance_pairs: bool = True     # 是否保持各接触对的样本占比
 
+    # 接触参数“软→硬”调度（用于训练前期更稳、后期更严格）
+    contact_hardening_enabled: bool = True
+    contact_hardening_fraction: float = 0.4    # 在前多少比例 steps 内线性/平滑提升到目标值
+    contact_beta_start: Optional[float] = None
+    contact_mu_n_start: Optional[float] = None
+    friction_k_t_start: Optional[float] = None
+    friction_mu_t_start: Optional[float] = None
+
     # 体积分点（弹性能量）RAR
     volume_rar_enabled: bool = True            # 是否启用体积分点基于应变能密度的 RAR
     volume_rar_fraction: float = 0.5           # 每步 DFEM 子单元子采样中，多少比例来自 RAR
     volume_rar_temperature: float = 1.0        # >1 平滑、<1 更尖锐
     volume_rar_uniform_ratio: float = 0.2      # 保底均匀抽样比例
     volume_rar_floor: float = 1e-8             # 基础重要性，避免全零
+    volume_rar_ema_decay: float = 0.9          # 重要性 EMA 平滑系数（0~1，越大越平滑）
 
     # 预紧
     preload_specs: List[Dict[str, str]] = field(default_factory=list)
@@ -160,6 +171,8 @@ class TrainerConfig:
     loss_ema_decay: float = 0.95
     loss_min_factor: float = 0.25
     loss_max_factor: float = 4.0
+    loss_min_weight: Optional[float] = None
+    loss_max_weight: Optional[float] = None
     loss_gamma: float = 2.0
     loss_focus_terms: Tuple[str, ...] = field(default_factory=tuple)
 
@@ -190,6 +203,10 @@ class TrainerConfig:
     # 输出
     out_dir: str = "outputs"
     ckpt_dir: str = "checkpoints"
+    ckpt_max_to_keep: int = 3
+    ckpt_save_retries: int = 3
+    ckpt_save_retry_delay_s: float = 1.0
+    ckpt_save_retry_backoff: float = 2.0
     viz_samples_after_train: int = 6
     viz_title_prefix: str = "Total Deformation (trained PINN)"
     viz_style: str = "smooth"              # 默认使用 Gouraud 平滑着色
@@ -217,6 +234,9 @@ class TrainerConfig:
     viz_auto_fill_blanks: bool = False      # 覆盖率低时自动用 2D 重新三角化填补留白（默认关闭以保留真实孔洞）
     viz_remove_rigid: bool = True           # 可视化时默认去除刚体平移/转动分量
     save_best_on: str = "Pi"   # or "E_int"
+
+    # 材料屈服强度（可选，用于日志中输出 σ_vm/σ_y 比值）；单位需与应力一致
+    yield_strength: Optional[float] = None
 
 
 class Trainer:
@@ -248,6 +268,7 @@ class Trainer:
         self._contact_rar_cache: Optional[Dict[str, Any]] = None
         self._volume_rar_cache: Optional[Dict[str, Any]] = None
         self._current_contact_cat: Optional[Dict[str, np.ndarray]] = None
+        self._contact_hardening_targets: Optional[Dict[str, float]] = None
 
         if cfg.preload_specs:
             self._set_preload_dim(len(cfg.preload_specs))
@@ -398,8 +419,6 @@ class Trainer:
         self.ckpt = None
         self.ckpt_manager = None
         self.best_metric = float("inf")
-        self.last_viz_data_path: Optional[str] = None
-        self.last_viz_diag = None
 
         # —— 体检/调试可读
         self.X_vol = None
@@ -412,6 +431,58 @@ class Trainer:
 
 
     # ----------------- 辅助工具 -----------------
+    def _cleanup_stale_ckpt_temp_dirs(self):
+        ckpt_dir = getattr(self.cfg, "ckpt_dir", None)
+        if not ckpt_dir:
+            return
+        try:
+            entries = os.listdir(ckpt_dir)
+        except Exception:
+            return
+        for name in entries:
+            if not (name.startswith("ckpt-") and name.endswith("_temp")):
+                continue
+            path = os.path.join(ckpt_dir, name)
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _save_checkpoint_best_effort(self, checkpoint_number: Optional[int]) -> Optional[str]:
+        if self.ckpt_manager is None:
+            return None
+
+        retries = max(0, int(getattr(self.cfg, "ckpt_save_retries", 0)))
+        delay_s = float(getattr(self.cfg, "ckpt_save_retry_delay_s", 0.0))
+        backoff = float(getattr(self.cfg, "ckpt_save_retry_backoff", 1.0))
+        delay_s = max(0.0, delay_s)
+        backoff = max(1.0, backoff)
+
+        for attempt in range(retries + 1):
+            try:
+                # 若对齐 step 保存失败，可让 manager 使用内部自增编号继续尝试，
+                # 这样能避开同名 *_temp 残留导致的二次失败。
+                if attempt == 0:
+                    return self.ckpt_manager.save(checkpoint_number=checkpoint_number)
+                return self.ckpt_manager.save(checkpoint_number=None)
+            except UnicodeDecodeError as exc:
+                msg = repr(exc)
+                print(
+                    f"[trainer] WARNING: checkpoint 保存失败 (UnicodeDecodeError) "
+                    f"attempt={attempt + 1}/{retries + 1} ({msg})"
+                )
+            except Exception as exc:
+                print(
+                    f"[trainer] WARNING: checkpoint 保存失败 "
+                    f"attempt={attempt + 1}/{retries + 1}: {exc}"
+                )
+
+            # 清理残留 *_temp 目录，避免下一次保存被同名目录影响
+            self._cleanup_stale_ckpt_temp_dirs()
+            if attempt < retries and delay_s > 0:
+                time.sleep(delay_s)
+                delay_s *= backoff
+        return None
 
     def _set_preload_dim(self, nb: int):
         nb_int = int(nb)
@@ -569,7 +640,9 @@ class Trainer:
             if isinstance(stats, Mapping):
                 preload_stats = stats.get("preload") or stats.get("preload_stats")
             if isinstance(preload_stats, Mapping):
-                bd = preload_stats.get("bolt_deltas") or preload_stats.get("bolt_delta")
+                bd = preload_stats.get("bolt_deltas")
+                if bd is None:
+                    bd = preload_stats.get("bolt_delta")
                 if bd is not None:
                     if hasattr(bd, "numpy"):
                         bd = bd.numpy()
@@ -585,8 +658,14 @@ class Trainer:
             mean_gap = None
 
             def _get_stat_float(*keys: str) -> Optional[float]:
+                """
+                Extract a scalar from stats. Supports staged keys like 's3_cn_mean_gap'
+                by taking the highest stage index found.
+                """
                 if not isinstance(stats, Mapping):
                     return None
+
+                # 1) direct lookup
                 for key in keys:
                     val = stats.get(key)
                     if val is None:
@@ -597,11 +676,34 @@ class Trainer:
                         return float(val)
                     except Exception:
                         continue
-                return None
+
+                # 2) staged lookup: pick latest stage sN_key
+                best_val = None
+                best_stage = -1
+                stage_re = re.compile(r"s(\\d+)_")
+                for name, val in stats.items():
+                    for key in keys:
+                        if not name.endswith(key):
+                            continue
+                        m = stage_re.match(name)
+                        stage_idx = int(m.group(1)) if m else 0
+                        if stage_idx < best_stage:
+                            continue
+                        try:
+                            if hasattr(val, "numpy"):
+                                v = float(val.numpy())
+                            else:
+                                v = float(val)
+                            best_stage = stage_idx
+                            best_val = v
+                        except Exception:
+                            continue
+                return best_val
 
             pen_ratio = _get_stat_float("n_pen_ratio", "cn_pen_ratio", "pen_ratio")
             stick_ratio = _get_stat_float("t_stick_ratio", "stick_ratio")
             slip_ratio = _get_stat_float("t_slip_ratio", "slip_ratio")
+            min_gap = _get_stat_float("n_min_gap", "cn_min_gap", "min_gap")
             mean_gap = _get_stat_float("n_mean_gap", "cn_mean_gap", "mean_gap")
 
             grad_disp = f"grad={grad_val:.2e}"
@@ -621,9 +723,45 @@ class Trainer:
             slip_disp = (
                 f"slip={slip_ratio * 100:.1f}%" if slip_ratio is not None else "slip=--"
             )
-            gap_disp = (
-                f"⟨gap⟩={mean_gap:.2e}" if mean_gap is not None else "⟨gap⟩=--"
-            )
+            gap_p01 = None
+            if self.contact is not None:
+                try:
+                    metrics = self.contact.last_sample_metrics()
+                    gap_arr = metrics.get("gap") if isinstance(metrics, dict) else None
+                    if gap_arr is not None:
+                        g = np.asarray(gap_arr, dtype=np.float64).reshape(-1)
+                        g = g[np.isfinite(g)]
+                        if g.size > 0:
+                            gap_p01 = float(np.quantile(g, 0.01))
+                except Exception:
+                    pass
+
+            gap_terms: List[str] = []
+            if min_gap is not None:
+                gap_terms.append(f"gmin={min_gap:.2e}")
+            if gap_p01 is not None:
+                gap_terms.append(f"g01={gap_p01:.2e}")
+            if mean_gap is not None:
+                gap_terms.append(f"⟨gap⟩={mean_gap:.2e}")
+            gap_disp = " ".join(gap_terms) if gap_terms else "⟨gap⟩=--"
+
+            # Von Mises 应力及屈服比（若提供 yield_strength）
+            vm_phys_max = _get_stat_float("stress_vm_phys_max")
+            vm_pred_max = _get_stat_float("stress_vm_pred_max")
+            vm_ref = vm_phys_max if vm_phys_max is not None else vm_pred_max
+            if vm_phys_max is not None and vm_pred_max is not None:
+                vm_disp = f"σvm={vm_phys_max:.2e}(pred={vm_pred_max:.2e})"
+            elif vm_phys_max is not None:
+                vm_disp = f"σvm={vm_phys_max:.2e}"
+            elif vm_pred_max is not None:
+                vm_disp = f"σvm_pred={vm_pred_max:.2e}"
+            else:
+                vm_disp = ""
+            vm_ratio_disp = ""
+            if vm_ref is not None and getattr(self.cfg, "yield_strength", None):
+                y = float(self.cfg.yield_strength)
+                if y > 0:
+                    vm_ratio_disp = f"σvm/σy={vm_ref / y:.2f}"
 
             order_txt = ""
             if order is not None:
@@ -652,7 +790,7 @@ class Trainer:
             parts_disp = energy_disp or ""
             postfix = (
                 f"P=[{p1},{p2},{p3}]N{order_txt} Π={pin:.3e} | {parts_disp} {bolt_txt} "
-                f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp}"
+                f"| {grad_disp} {pen_disp} {stick_disp} {slip_disp} {gap_disp} {vm_disp} {vm_ratio_disp}"
             )
             return postfix, "已记录"
         except Exception:
@@ -1144,6 +1282,7 @@ class Trainer:
                     self.contact.build_from_cat(cat, extra_weights=None, auto_orient=True)
                     self._current_contact_cat = cat
                     self._contact_rar_cache = None
+                    self._init_contact_hardening()
                     total_pts = len(cmap)
                     src_txt = f"（{contact_source}）" if contact_source else ""
                     print(
@@ -1199,13 +1338,14 @@ class Trainer:
                 cfg.model_cfg.mixed_precision = cfg.mixed_precision
             self.model = create_displacement_model(cfg.model_cfg)
             
-            # DFEM: pre-build adjacency using node coordinates
-            if hasattr(self.model.field, 'dfem_mode') and self.model.field.dfem_mode:
-                if hasattr(self, 'elasticity') and self.elasticity is not None:
+            # Pre-build adjacency using mesh node coordinates (recommended for DFEM energy:
+            # ElasticityEnergy evaluates u on all nodes every step; caching avoids rebuilding kNN each call).
+            if hasattr(self, "elasticity") and self.elasticity is not None:
+                try:
                     X_nodes = self.elasticity.X_nodes_tf
                     self.model.field.prebuild_adjacency(X_nodes)
-                else:
-                    print("[trainer] WARNING: DFEM mode enabled but ElasticityEnergy not available")
+                except Exception as exc:
+                    print(f"[trainer] WARNING: 预构建全局邻接失败，将退回动态构图：{exc}")
                     
             # Legacy graph precompute (for non-DFEM mode)
             if getattr(cfg.model_cfg.field, "graph_precompute", False) and getattr(self, "elasticity", None):
@@ -1224,9 +1364,14 @@ class Trainer:
             pb.update(1)
 
             # 8) checkpoint
-            self.ckpt = tf.train.Checkpoint(encoder=self.model.encoder,
-                                            field=self.model.field, opt=self.optimizer)
-            self.ckpt_manager = tf.train.CheckpointManager(self.ckpt, directory=cfg.ckpt_dir, max_to_keep=3)
+            self.ckpt = tf.train.Checkpoint(
+                encoder=self.model.encoder,
+                field=self.model.field,
+                opt=self.optimizer,
+            )
+            self.ckpt_manager = tf.train.CheckpointManager(
+                self.ckpt, directory=cfg.ckpt_dir, max_to_keep=int(cfg.ckpt_max_to_keep)
+            )
             pb.update(1)
 
         # 预热网络，确保所有权重在进入梯度带之前已创建，从而可以被显式 watch
@@ -1270,6 +1415,94 @@ class Trainer:
         )
         return total
 
+    # ----------------- Contact hardening schedule -----------------
+
+    def _init_contact_hardening(self):
+        """Initialise soft→hard schedule targets and apply soft start values."""
+
+        if self.contact is None or not self.cfg.contact_hardening_enabled:
+            self._contact_hardening_targets = None
+            return
+
+        def _to_float(x, fallback: float) -> float:
+            try:
+                if hasattr(x, "numpy"):
+                    return float(x.numpy())
+                return float(x)
+            except Exception:
+                return float(fallback)
+
+        # Target (hard) values from config / operator
+        beta_t = _to_float(getattr(self.contact.normal, "beta", None), self.cfg.contact_cfg.normal.beta)
+        mu_n_t = _to_float(getattr(self.contact.normal, "mu_n", None), self.cfg.contact_cfg.normal.mu_n)
+        k_t_t = _to_float(getattr(self.contact.friction, "k_t", None), self.cfg.contact_cfg.friction.k_t)
+        mu_t_t = _to_float(getattr(self.contact.friction, "mu_t", None), self.cfg.contact_cfg.friction.mu_t)
+
+        # Soft start values (user override or 20% of target)
+        beta_s = float(self.cfg.contact_beta_start) if self.cfg.contact_beta_start is not None else 0.2 * beta_t
+        mu_n_s = float(self.cfg.contact_mu_n_start) if self.cfg.contact_mu_n_start is not None else 0.2 * mu_n_t
+        k_t_s = float(self.cfg.friction_k_t_start) if self.cfg.friction_k_t_start is not None else 0.2 * k_t_t
+        mu_t_s = float(self.cfg.friction_mu_t_start) if self.cfg.friction_mu_t_start is not None else 0.2 * mu_t_t
+
+        beta_s = max(beta_s, 1e-6)
+        mu_n_s = max(mu_n_s, 1e-6)
+        k_t_s = max(k_t_s, 0.0)
+        mu_t_s = max(mu_t_s, 1e-6)
+
+        # Apply soft start to operator variables
+        try:
+            self.contact.normal.beta.assign(beta_s)
+            self.contact.normal.mu_n.assign(mu_n_s)
+            self.contact.friction.k_t.assign(k_t_s)
+            self.contact.friction.mu_t.assign(mu_t_s)
+        except Exception:
+            pass
+
+        self._contact_hardening_targets = {
+            "beta_start": beta_s,
+            "beta_target": beta_t,
+            "mu_n_start": mu_n_s,
+            "mu_n_target": mu_n_t,
+            "k_t_start": k_t_s,
+            "k_t_target": k_t_t,
+            "mu_t_start": mu_t_s,
+            "mu_t_target": mu_t_t,
+        }
+        print(
+            "[contact] soft→hard schedule init: "
+            f"beta {beta_s:g}->{beta_t:g}, mu_n {mu_n_s:g}->{mu_n_t:g}, "
+            f"k_t {k_t_s:g}->{k_t_t:g}, mu_t {mu_t_s:g}->{mu_t_t:g}"
+        )
+
+    def _maybe_update_contact_hardening(self, step: int):
+        """Update contact penalty/ALM parameters according to training progress."""
+
+        if self._contact_hardening_targets is None or self.contact is None:
+            return
+        frac = float(np.clip(self.cfg.contact_hardening_fraction, 0.0, 1.0))
+        if frac <= 0.0:
+            return
+        ramp_steps = max(1, int(frac * max(1, self.cfg.max_steps)))
+        t = min(1.0, float(step) / float(ramp_steps))
+        # Smooth cosine ramp
+        s = 0.5 - 0.5 * math.cos(math.pi * t)
+
+        def _lerp(a: float, b: float) -> float:
+            return a + (b - a) * s
+
+        beta = _lerp(self._contact_hardening_targets["beta_start"], self._contact_hardening_targets["beta_target"])
+        mu_n = _lerp(self._contact_hardening_targets["mu_n_start"], self._contact_hardening_targets["mu_n_target"])
+        k_t = _lerp(self._contact_hardening_targets["k_t_start"], self._contact_hardening_targets["k_t_target"])
+        mu_t = _lerp(self._contact_hardening_targets["mu_t_start"], self._contact_hardening_targets["mu_t_target"])
+
+        try:
+            self.contact.normal.beta.assign(beta)
+            self.contact.normal.mu_n.assign(mu_n)
+            self.contact.friction.k_t.assign(k_t)
+            self.contact.friction.mu_t.assign(mu_t)
+        except Exception:
+            pass
+
     # ----------------- Contact-driven RAR -----------------
 
     def _update_contact_rar_cache(self):
@@ -1289,8 +1522,28 @@ class Trainer:
 
         imp: Optional[np.ndarray] = None
         if "gap" in metrics:
-            pen = np.maximum(-metrics["gap"], 0.0)
-            imp = pen
+            # Use the same smooth negative-part as the normal ALM (softplus),
+            # so near-contact (g≈0) points also get nonzero importance.
+            gap = np.asarray(metrics["gap"], dtype=np.float64).reshape(-1)
+            beta = None
+            try:
+                beta_var = getattr(getattr(self.contact, "normal", None), "beta", None)
+                if beta_var is not None and hasattr(beta_var, "numpy"):
+                    beta = float(beta_var.numpy())
+            except Exception:
+                beta = None
+            if beta is None:
+                try:
+                    beta = float(getattr(getattr(self.cfg, "contact_cfg", None), "normal", None).beta)  # type: ignore[attr-defined]
+                except Exception:
+                    beta = 50.0
+            beta = float(max(beta, 1e-6))
+            x = -beta * gap
+            phi = np.empty_like(gap, dtype=np.float64)
+            large = x > 50.0
+            phi[large] = x[large] / beta
+            phi[~large] = np.log1p(np.exp(x[~large])) / beta
+            imp = phi.astype(np.float32)
         if "fric_res" in metrics:
             fr = np.abs(metrics["fric_res"])
             if imp is None:
@@ -1304,6 +1557,15 @@ class Trainer:
             return
 
         imp = np.where(np.isfinite(imp), imp, 0.0)
+        # Clip extreme outliers to avoid a few samples dominating RAR.
+        try:
+            finite_imp = imp[np.isfinite(imp)]
+            if finite_imp.size > 0:
+                hi = float(np.quantile(finite_imp, 0.99))
+                if hi > 0:
+                    imp = np.minimum(imp, hi)
+        except Exception:
+            pass
         self._contact_rar_cache = {
             "importance": imp,
             "cat": self._current_contact_cat,
@@ -1433,13 +1695,29 @@ class Trainer:
             self._volume_rar_cache = None
             return
 
-        imp = np.full((total_cells,), float(self.cfg.volume_rar_floor), dtype=np.float32)
+        floor = float(self.cfg.volume_rar_floor)
         valid = (idx >= 0) & (idx < total_cells) & np.isfinite(psi)
         if not np.any(valid):
             self._volume_rar_cache = None
             return
-        np.add.at(imp, idx[valid], np.abs(psi[valid]).astype(np.float32))
-        imp = np.where(np.isfinite(imp), imp, float(self.cfg.volume_rar_floor))
+
+        sum_abs = np.zeros((total_cells,), dtype=np.float64)
+        counts = np.zeros((total_cells,), dtype=np.float64)
+        np.add.at(sum_abs, idx[valid], np.abs(psi[valid]).astype(np.float64))
+        np.add.at(counts, idx[valid], 1.0)
+
+        avg_abs = np.divide(sum_abs, np.maximum(counts, 1.0))
+        imp = (avg_abs + floor).astype(np.float32)
+        imp = np.where(np.isfinite(imp), imp, floor)
+
+        # EMA 平滑，减少单步噪声
+        decay = float(np.clip(getattr(self.cfg, "volume_rar_ema_decay", 0.0), 0.0, 0.999))
+        prev = None
+        if self._volume_rar_cache is not None:
+            prev = self._volume_rar_cache.get("importance")
+        if prev is not None and isinstance(prev, np.ndarray) and prev.shape == imp.shape and decay > 0:
+            imp = (decay * prev.astype(np.float32) + (1.0 - decay) * imp).astype(np.float32)
+
         self._volume_rar_cache = {"importance": imp}
 
     def _maybe_apply_volume_rar(self, step_index: int) -> Tuple[Optional[np.ndarray], str]:
@@ -1479,7 +1757,16 @@ class Trainer:
 
         rng = np.random.default_rng(self.cfg.seed + step_index * 23)
         probs = weights / (weights.sum() + 1e-12)
-        rar_indices = np.array(rng.choice(total_cells, size=n_rar, replace=True, p=probs), dtype=np.int64)
+        try:
+            rar_indices = np.array(
+                rng.choice(total_cells, size=n_rar, replace=False, p=probs),
+                dtype=np.int64,
+            )
+        except ValueError:
+            rar_indices = np.array(
+                rng.choice(total_cells, size=n_rar, replace=True, p=probs),
+                dtype=np.int64,
+            )
 
         if n_uniform > 0:
             uni_indices = rng.choice(total_cells, size=n_uniform, replace=False)
@@ -1563,10 +1850,58 @@ class Trainer:
         if self.loss_state is not None:
             if adaptive:
                 update_loss_weights(self.loss_state, parts, stats)
+            self._tie_preload_weight_to_internal()
             Pi = combine_loss(parts, self.loss_state)
         reg = tf.add_n(self.model.losses) if getattr(self.model, "losses", None) else 0.0
         loss = Pi + reg
         return loss, Pi, parts, stats
+
+    def _tie_preload_weight_to_internal(self) -> None:
+        """
+        Keep the external preload work term on the same scale as the internal energy term.
+
+        In the potential-energy formulation Π = U_int - W_pre, weighting W_pre independently
+        is equivalent to implicitly scaling the applied preload P.  We therefore keep
+        W_pre's weight in a fixed ratio to E_int's weight, and avoid using W_pre as a
+        driver term in adaptive weighting.
+        """
+
+        state = self.loss_state
+        if state is None:
+            return
+
+        focus_terms = getattr(state, "focus_terms", tuple()) or tuple()
+        if "W_pre" in focus_terms:
+            # User explicitly opted in to adapting W_pre; don't override.
+            return
+
+        if "E_int" not in state.current:
+            return
+
+        try:
+            base_int = float(state.base.get("E_int", 0.0) or 0.0)
+            base_pre = float(state.base.get("W_pre", 0.0) or 0.0)
+            cur_int = float(state.current.get("E_int", base_int) or 0.0)
+        except Exception:
+            return
+
+        if base_pre <= 0.0:
+            # Disabled preload term stays disabled.
+            state.current["W_pre"] = 0.0
+            return
+
+        ratio = 1.0
+        if abs(base_int) > 0.0:
+            ratio = base_pre / base_int
+
+        new_pre = max(0.0, cur_int * ratio)
+        min_w = getattr(state, "min_weight", None)
+        max_w = getattr(state, "max_weight", None)
+        if min_w is not None:
+            new_pre = max(float(min_w), new_pre)
+        if max_w is not None:
+            new_pre = min(float(max_w), new_pre)
+        state.current["W_pre"] = float(new_pre)
 
     # 请用此代码完全覆盖 src/train/trainer.py 中的 _train_step 方法
     def _train_step(self, total, preload_case: Dict[str, np.ndarray]):
@@ -1819,14 +2154,14 @@ class Trainer:
         if adaptive_enabled:
             scheme = getattr(self.cfg.total_cfg, "adaptive_scheme", "contact_only")
             focus_terms = getattr(self.cfg, "loss_focus_terms", tuple())
-            if focus_terms:
-                scheme = "focus"
             self.loss_state = LossWeightState.from_config(
                 base_weights=base_weights,
                 adaptive_scheme=scheme,
                 ema_decay=getattr(self.cfg, "loss_ema_decay", 0.95),
                 min_factor=getattr(self.cfg, "loss_min_factor", 0.25),
                 max_factor=getattr(self.cfg, "loss_max_factor", 4.0),
+                min_weight=getattr(self.cfg, "loss_min_weight", None),
+                max_weight=getattr(self.cfg, "loss_max_weight", None),
                 gamma=getattr(self.cfg, "loss_gamma", 2.0),
                 focus_terms=focus_terms,
                 update_every=getattr(self.cfg, "loss_update_every", 1),
@@ -1906,6 +2241,8 @@ class Trainer:
                     self._set_pbar_desc(p_step, f"step {step}: 前向/反传")
                     t0 = time.perf_counter()
                     preload_case = self._sample_preload_case()
+                    # 动态提升接触惩罚/ALM 参数（软→硬）
+                    self._maybe_update_contact_hardening(step)
                     vol_note = ""
                     if self.elasticity is not None and hasattr(self.elasticity, "set_sample_indices"):
                         vol_indices, vol_note = self._maybe_apply_volume_rar(step)
@@ -1988,7 +2325,7 @@ class Trainer:
                     )
                     p_step.update(1)
 
-                    # 4) 日志 & ckpt
+                    # 4) 日志/检查点
                     self._set_pbar_desc(p_step, f"step {step}: 日志/检查点")
                     t0 = time.perf_counter()
                     log_note = "跳过"
@@ -2019,9 +2356,13 @@ class Trainer:
                                 else float(parts["E_int"].numpy())
                             )
                             if metric_val < self.best_metric:
-                                self.best_metric = metric_val
-                                self.ckpt_manager.save(checkpoint_number=step)
-                                log_note += " | 已保存"
+                                ckpt_path = self._save_checkpoint_best_effort(step)
+                                if ckpt_path:
+                                    self.best_metric = metric_val
+                                    log_note += f" | 已保存 {os.path.basename(ckpt_path)}"
+                                else:
+                                    log_note += " | checkpoint 保存失败(已跳过)"
+
                     if (
                         self.cfg.log_every > 0
                         and not (step == 1 or step % self.cfg.log_every == 0)
@@ -2059,62 +2400,18 @@ class Trainer:
                         self._set_pbar_postfix(p_train, summary_note)
                     self._step_stage_times.clear()
 
-            # 训练结束：再存一次
-            self.ckpt_manager.save(checkpoint_number=self.cfg.max_steps)
+        # 训练结束：再存一次
+        if self.ckpt_manager is not None:
+            final_ckpt = self._save_checkpoint_best_effort(self.cfg.max_steps)
+            if final_ckpt:
+                print(f"[trainer] 训练结束已保存 checkpoint -> {final_ckpt}")
+            else:
+                print("[trainer] WARNING: 训练结束 checkpoint 保存失败(已跳过)")
 
         if self.cfg.lbfgs_enabled:
             self._run_lbfgs_stage(total, show_progress=True)
 
         self._visualize_after_training(n_samples=self.cfg.viz_samples_after_train)
-
-    # ----------------- Checkpoint utilities -----------------
-    def restore_checkpoint(self, checkpoint_path: Optional[str] = None,
-                           expect_partial: bool = True) -> str:
-        """Restore model/optimizer weights from a checkpoint.
-
-        Args:
-            checkpoint_path: Explicit checkpoint path. If ``None`` the latest
-                checkpoint managed by :class:`tf.train.CheckpointManager` is
-                used.
-            expect_partial: Whether partial restores are acceptable (useful
-                when optimizer slots are absent, e.g. when exporting models for
-                inference only).
-
-        Returns:
-            The path of the checkpoint that was restored.
-
-        Raises:
-            FileNotFoundError: If no checkpoint can be located.
-            RuntimeError: If ``build()`` has not been called yet.
-        """
-
-        if self.ckpt is None:
-            raise RuntimeError("Trainer.restore_checkpoint() called before build().")
-
-        ckpt_path = checkpoint_path
-        if ckpt_path is None:
-            if self.ckpt_manager is None:
-                raise RuntimeError("Checkpoint manager not initialised; call build() first.")
-            ckpt_path = self.ckpt_manager.latest_checkpoint
-
-        if not ckpt_path:
-            raise FileNotFoundError(
-                "No checkpoint found. Train the model first or pass an explicit path."
-            )
-
-        status = self.ckpt.restore(ckpt_path)
-        try:
-            if expect_partial:
-                status.expect_partial()
-            else:
-                status.assert_consumed()
-        except AssertionError:
-            # Fall back to the strongest available assertion; if it still
-            # fails TensorFlow will raise, which is what we want.
-            status.assert_existing_objects_matched()
-
-        print(f"[trainer] Restored checkpoint -> {ckpt_path}")
-        return ckpt_path
 
     def export_saved_model(self, export_dir: str) -> str:
         """Export the PINN displacement model as a TensorFlow SavedModel."""
@@ -2135,149 +2432,6 @@ class Trainer:
         tf.saved_model.save(module, export_dir, signatures={"serving_default": serving_fn})
         print(f"[trainer] SavedModel exported -> {export_dir}")
         return export_dir
-
-    def generate_deflection_map(
-        self,
-        preload: Any,
-        out_path: Optional[str] = None,
-        title_prefix: Optional[str] = None,
-        show: bool = False,
-        data_out_path: Optional[str] = "auto",
-        preload_order: Optional[Sequence[int]] = None,
-    ) -> str:
-        """Generate a mirror deflection contour for a user-specified preload.
-
-        Args:
-            preload: Iterable of three preload values (N) in the order
-                ``[P1, P2, P3]``.
-            out_path: Optional absolute/relative path to save the PNG. If
-                omitted the file is stored under ``cfg.out_dir`` with a name
-                derived from the preload values.
-            title_prefix: Optional custom title prefix for the figure.
-            show: If ``True`` call ``plt.show()`` instead of closing the
-                figure (useful when running interactively).
-            data_out_path: Text export path or ``"auto"``/``None`` for
-                automatic/disabled displacement dumps.
-            preload_order: Optional tightening sequence (either 0- or
-                1-based) used when staged preload is enabled. When omitted,
-                the natural 1-2-3 order is applied.
-
-        Returns:
-            The absolute/relative path where the image was written.
-        """
-
-        if self.asm is None or self.model is None:
-            raise RuntimeError("Trainer.generate_deflection_map() requires build()/restore().")
-
-        P = np.asarray(list(preload), dtype=np.float32).reshape(-1)
-        if P.size != 3:
-            raise ValueError("'preload' must contain exactly three values (for the three bolts).")
-
-        case: Dict[str, np.ndarray] = {"P": P}
-        if preload_order is not None and not self.cfg.preload_use_stages:
-            print("[viz] preload_order 被忽略：配置中未启用分阶段加载。")
-        if self.cfg.preload_use_stages:
-            nb = P.size
-            if preload_order is not None:
-                order_arr = self._normalize_order(preload_order, nb)
-            else:
-                order_arr = np.arange(nb, dtype=np.int32)
-            case["order"] = order_arr
-            case.update(self._build_stage_case(P, order_arr))
-            order_display = "-".join(str(int(o) + 1) for o in order_arr.tolist())
-        else:
-            order_arr = None
-            order_display = None
-        params_full = self._make_preload_params(case)
-        params = self._extract_final_stage_params(params_full, keep_context=True)
-        title = title_prefix or self.cfg.viz_title_prefix
-        if order_display:
-            title = f"{title}  (order={order_display})"
-
-        if out_path is None:
-            os.makedirs(self.cfg.out_dir, exist_ok=True)
-            p_int = [int(round(float(x))) for x in P]
-            ord_tag = f"_ord{order_display.replace('-', '')}" if order_display else ""
-            out_path = os.path.join(
-                self.cfg.out_dir,
-                f"deflection_manual_P{p_int[0]}_{p_int[1]}_{p_int[2]}{ord_tag}.png",
-            )
-
-        resolved_data_path: Optional[str]
-        if data_out_path is None:
-            resolved_data_path = None
-        else:
-            key = str(data_out_path).strip().lower()
-            if key == "auto":
-                if self.cfg.viz_write_data and out_path:
-                    resolved_data_path = os.path.splitext(out_path)[0] + ".txt"
-                else:
-                    resolved_data_path = None
-            elif key in {"", "none"}:
-                resolved_data_path = None
-            else:
-                resolved_data_path = data_out_path
-
-        resolved_mesh_path: Optional[str]
-        if self.cfg.viz_write_surface_mesh and out_path:
-            resolved_mesh_path = "auto"
-        else:
-            resolved_mesh_path = None
-
-        full_plot_enabled = bool(self.cfg.viz_plot_full_structure)
-        full_struct_out = "auto" if (full_plot_enabled and out_path) else None
-        full_struct_data = (
-            "auto" if (full_plot_enabled and self.cfg.viz_write_full_structure_data and out_path) else None
-        )
-
-        diag_out: Dict[str, Any] = {} if self.cfg.viz_diagnose_blanks else None
-
-        _, _, data_path = plot_mirror_deflection_by_name(
-            self.asm,
-            self.cfg.mirror_surface_name,
-            self.model.u_fn,
-            params,
-            P_values=tuple(float(x) for x in P),
-            out_path=out_path,
-            render_surface=self.cfg.viz_surface_enabled,
-            surface_source=self.cfg.viz_surface_source,
-            title_prefix=title,
-            units=self.cfg.viz_units,
-            levels=self.cfg.viz_levels,
-            symmetric=self.cfg.viz_symmetric,
-            show=show,
-            data_out_path=resolved_data_path,
-            surface_mesh_out_path=resolved_mesh_path,
-            plot_full_structure=full_plot_enabled,
-            full_structure_out_path=full_struct_out,
-            full_structure_data_out_path=full_struct_data,
-            full_structure_part=self.cfg.viz_full_structure_part,
-            style=self.cfg.viz_style,
-            cmap=self.cfg.viz_colormap,
-            draw_wireframe=self.cfg.viz_draw_wireframe,
-            refine_subdivisions=self.cfg.viz_refine_subdivisions,
-            refine_max_points=self.cfg.viz_refine_max_points,
-            use_shape_function_interp=self.cfg.viz_use_shape_function_interp,
-            retriangulate_2d=self.cfg.viz_retriangulate_2d,
-            eval_batch_size=self.cfg.viz_eval_batch_size,
-            eval_scope=self.cfg.viz_eval_scope,
-            diagnose_blanks=self.cfg.viz_diagnose_blanks,
-            auto_fill_blanks=self.cfg.viz_auto_fill_blanks,
-            # 强制启用可视化去除刚体位移，避免沿用 mirror_viz 的默认 False
-            remove_rigid=True,
-            diag_out=diag_out,
-        )
-
-        self.last_viz_diag = diag_out.get("blank_check") if diag_out is not None else None
-        self.last_viz_data_path = data_path
-        if self.cfg.viz_surface_enabled and data_path:
-            print(f"[viz] displacement data -> {data_path}")
-        if self.cfg.viz_surface_enabled and out_path:
-            if order_display:
-                print(f"[viz] saved -> {out_path}  (order={order_display})")
-            else:
-                print(f"[viz] saved -> {out_path}")
-        return out_path
 
     # ----------------- 可视化（鲁棒多签名） -----------------
     def _call_viz(self, P: np.ndarray, params: Dict[str, tf.Tensor], out_path: str, title: str):
@@ -2332,9 +2486,6 @@ class Trainer:
             remove_rigid=True,
             diag_out=diag_out,
         )
-
-        if diag_out is not None:
-            self.last_viz_diag = diag_out.get("blank_check")
         return result
 
     def _fixed_viz_preload_cases(self) -> List[Dict[str, np.ndarray]]:

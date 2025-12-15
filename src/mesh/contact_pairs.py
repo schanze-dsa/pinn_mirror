@@ -19,7 +19,6 @@ Author: you
 """
 
 from __future__ import annotations
-from mesh.surface_utils import resolve_surface_to_tris, compute_tri_geometry, sample_points_on_surface, project_points_onto_surface, build_contact_surfaces
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 import numpy as np
@@ -53,6 +52,10 @@ class ContactPairData:
     Arrays are np.float64 unless noted. Shapes:
       xs, xm, n, t1, t2 : (n, 3)
       w_area            : (n,)
+      xs_node_idx       : (n, 3) int32  global node indices for slave triangle vertices
+      xs_bary           : (n, 3) float32 barycentric weights for xs on slave triangles
+      xm_node_idx       : (n, 3) int32  global node indices for master triangle vertices
+      xm_bary           : (n, 3) float32 barycentric weights for xm on master triangles
       slave_tri_idx     : (n,) int64
       master_tri_idx    : (n,) int64
       dist              : (n,)  Euclidean distance from xs to xm
@@ -66,6 +69,10 @@ class ContactPairData:
     t1: np.ndarray
     t2: np.ndarray
     w_area: np.ndarray
+    xs_node_idx: np.ndarray
+    xs_bary: np.ndarray
+    xm_node_idx: np.ndarray
+    xm_bary: np.ndarray
     slave_tri_idx: np.ndarray
     master_tri_idx: np.ndarray
     dist: np.ndarray
@@ -91,12 +98,30 @@ class ContactMap:
         t1 = np.concatenate([p.t1 for p in self.pairs], axis=0)
         t2 = np.concatenate([p.t2 for p in self.pairs], axis=0)
         w  = np.concatenate([p.w_area for p in self.pairs], axis=0)
+        xs_node_idx = np.concatenate([p.xs_node_idx for p in self.pairs], axis=0)
+        xs_bary = np.concatenate([p.xs_bary for p in self.pairs], axis=0)
+        xm_node_idx = np.concatenate([p.xm_node_idx for p in self.pairs], axis=0)
+        xm_bary = np.concatenate([p.xm_bary for p in self.pairs], axis=0)
         sid = np.concatenate([p.slave_tri_idx for p in self.pairs], axis=0)
         mid = np.concatenate([p.master_tri_idx for p in self.pairs], axis=0)
         dist = np.concatenate([p.dist for p in self.pairs], axis=0)
         pid = np.concatenate([p.pair_id for p in self.pairs], axis=0)
-        return dict(xs=xs, xm=xm, n=n, t1=t1, t2=t2, w_area=w,
-                    slave_tri_idx=sid, master_tri_idx=mid, dist=dist, pair_id=pid)
+        return dict(
+            xs=xs,
+            xm=xm,
+            n=n,
+            t1=t1,
+            t2=t2,
+            w_area=w,
+            xs_node_idx=xs_node_idx,
+            xs_bary=xs_bary,
+            xm_node_idx=xm_node_idx,
+            xm_bary=xm_bary,
+            slave_tri_idx=sid,
+            master_tri_idx=mid,
+            dist=dist,
+            pair_id=pid,
+        )
 
     def __len__(self) -> int:
         return int(sum(p.xs.shape[0] for p in self.pairs))
@@ -152,6 +177,33 @@ def _compute_area_weights(tri_idx: np.ndarray, tri_areas: np.ndarray, n_samples:
 
 
 # ---------------------------------------------------------------------
+# Node-id -> global node index mapping (must match DFEM node ordering)
+# ---------------------------------------------------------------------
+
+def _sorted_node_ids(asm: AssemblyModel) -> np.ndarray:
+    return np.asarray(sorted(int(nid) for nid in asm.nodes.keys()), dtype=np.int64)
+
+
+def _map_node_ids_to_idx(sorted_node_ids: np.ndarray, node_ids: np.ndarray) -> np.ndarray:
+    """
+    Map Abaqus node IDs to 0-based indices under the DFEM ordering (sorted node IDs).
+    """
+    nid = np.asarray(node_ids, dtype=np.int64)
+    idx = np.searchsorted(sorted_node_ids, nid)
+    if idx.size == 0:
+        return idx.astype(np.int32)
+    bad = (
+        (idx < 0)
+        | (idx >= sorted_node_ids.shape[0])
+        | (sorted_node_ids[idx] != nid)
+    )
+    if np.any(bad):
+        missing = np.unique(nid[bad])[:10]
+        raise KeyError(f"Some node IDs are missing in asm.nodes (example: {missing}).")
+    return idx.astype(np.int32)
+
+
+# ---------------------------------------------------------------------
 # Core builders
 # ---------------------------------------------------------------------
 
@@ -178,6 +230,8 @@ def build_contact_pair_data(
     if rng is None:
         rng = np.random.default_rng()
 
+    sorted_node_ids = _sorted_node_ids(asm)
+
     # 解析两个接触面的部分和三角形表面
     part_s, ts_s, part_m, ts_m = build_contact_surfaces(asm, slave_key, master_key)
 
@@ -185,7 +239,15 @@ def build_contact_pair_data(
     xs, tri_idx_s, bary_s, n_s_dummy = sample_points_on_surface(part_s, ts_s, n_points, rng=rng)
 
     # 投影到主面
-    xm, n_m, tri_idx_m, dist = project_points_onto_surface(part_m, ts_m, xs, prefilter_k=prefilter_k, chunk=chunk)
+    xm, n_m, tri_idx_m, dist, bary_m = project_points_onto_surface(
+        part_m, ts_m, xs, prefilter_k=prefilter_k, chunk=chunk
+    )
+
+    # Interpolation metadata (tri vertices + barycentric weights)
+    xs_tri_node_ids = ts_s.tri_node_ids[tri_idx_s.astype(np.int64)]
+    xm_tri_node_ids = ts_m.tri_node_ids[tri_idx_m.astype(np.int64)]
+    xs_node_idx = _map_node_ids_to_idx(sorted_node_ids, xs_tri_node_ids)
+    xm_node_idx = _map_node_ids_to_idx(sorted_node_ids, xm_tri_node_ids)
 
     # 从主面法向量计算切向基底
     t1, t2 = _orthonormal_tangent_basis(n_m)
@@ -198,6 +260,10 @@ def build_contact_pair_data(
         slave_part=part_s.name,
         master_part=part_m.name,
         xs=xs, xm=xm, n=n_m, t1=t1, t2=t2, w_area=w,
+        xs_node_idx=xs_node_idx,
+        xs_bary=bary_s.astype(np.float32),
+        xm_node_idx=xm_node_idx,
+        xm_bary=bary_m.astype(np.float32),
         slave_tri_idx=tri_idx_s.astype(np.int64),
         master_tri_idx=tri_idx_m.astype(np.int64),
         dist=dist.astype(np.float64),
